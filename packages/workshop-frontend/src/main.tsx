@@ -21,6 +21,7 @@ import { applySiteFavicon, cacheBustSiteLogoUrl } from './siteLogoUtils'
 // ---------------------------------------------------------------------------
 async function devAutoLogin(stub: RpcStub<PublicApi>): Promise<void> {
   if (import.meta.env.VITE_DEV_AUTO_LOGIN !== 'true') return
+  if (import.meta.env.VITE_AUTH_ISSUER?.trim()) return
   if (localStorage.getItem('authToken')) return  // already logged in
 
   const username = import.meta.env.VITE_DEV_USERNAME ?? 'dev'

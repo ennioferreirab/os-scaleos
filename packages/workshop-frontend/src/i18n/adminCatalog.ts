@@ -16,6 +16,7 @@ const en = {
       general: 'General',
       gatekeepers: 'Gatekeepers',
       formats: 'Formats',
+      users: 'Users',
       access: 'Access',
       audit: 'Audit',
     },
@@ -27,6 +28,7 @@ const en = {
       saveLogoFailed: 'Failed to save logo',
       removeLogoFailed: 'Failed to remove logo',
       saveInstructionsFailed: 'Failed to save instructions',
+      loadUsersFailed: 'Failed to load organization users',
     },
     toasts: {
       announcementSaved: 'Announcement saved',
@@ -35,6 +37,8 @@ const en = {
       logoSaved: 'Logo saved',
       defaultLogoRestored: 'Default logo restored',
       instructionsSaved: 'System prompt instructions saved',
+      invitationCreated: 'Invitation created',
+      userStatusSaved: 'User status updated',
     },
     audit: {
       title: 'Administrative audit history',
@@ -45,6 +49,10 @@ const en = {
       empty: 'No audited administrative changes yet.',
       actions: {
         setSignupsEnabled: 'Sign-up availability changed',
+        bootstrapAdmin: 'First administrator bootstrapped',
+        inviteUser: 'User invited',
+        setUserRole: 'User role changed',
+        setUserStatus: 'User status changed',
       },
       change: '{{before}} → {{after}}',
       enabled: 'Enabled',
@@ -58,6 +66,16 @@ const en = {
     signups: {
       title: 'Allow new sign-ups',
       description: 'When off, existing users can still log in but no new accounts can be created.',
+    },
+    users: {
+      title: 'Organization users',
+      description: 'Invite, disable, and reactivate people without changing their organization or deleting content.',
+      invitationEmail: 'Invitation email',
+      invite: 'Invite user',
+      members: 'Members',
+      disable: 'Disable',
+      reactivate: 'Reactivate',
+      empty: 'No directory users found.',
     },
     siteName: {
       title: 'Site name',
@@ -152,6 +170,7 @@ const ptBR = {
       general: 'Geral',
       gatekeepers: 'Guardiões',
       formats: 'Formatos',
+      users: 'Usuários',
       access: 'Acesso',
       audit: 'Auditoria',
     },
@@ -163,6 +182,7 @@ const ptBR = {
       saveLogoFailed: 'Não foi possível salvar o logo',
       removeLogoFailed: 'Não foi possível remover o logo',
       saveInstructionsFailed: 'Não foi possível salvar as instruções',
+      loadUsersFailed: 'Não foi possível carregar os usuários da organização',
     },
     toasts: {
       announcementSaved: 'Aviso salvo',
@@ -171,6 +191,8 @@ const ptBR = {
       logoSaved: 'Logo salvo',
       defaultLogoRestored: 'Logo padrão restaurado',
       instructionsSaved: 'Instruções do prompt do sistema salvas',
+      invitationCreated: 'Convite criado',
+      userStatusSaved: 'Status do usuário atualizado',
     },
     audit: {
       title: 'Histórico de auditoria administrativa',
@@ -181,6 +203,10 @@ const ptBR = {
       empty: 'Ainda não há mudanças administrativas auditadas.',
       actions: {
         setSignupsEnabled: 'Disponibilidade de cadastros alterada',
+        bootstrapAdmin: 'Primeiro administrador inicializado',
+        inviteUser: 'Usuário convidado',
+        setUserRole: 'Função do usuário alterada',
+        setUserStatus: 'Status do usuário alterado',
       },
       change: '{{before}} → {{after}}',
       enabled: 'Ativado',
@@ -194,6 +220,16 @@ const ptBR = {
     signups: {
       title: 'Permitir novos cadastros',
       description: 'Quando desativado, os usuários existentes ainda podem entrar, mas novas contas não podem ser criadas.',
+    },
+    users: {
+      title: 'Usuários da organização',
+      description: 'Convide, desative e reative pessoas sem mudar a organização nem apagar conteúdo.',
+      invitationEmail: 'E-mail do convite',
+      invite: 'Convidar usuário',
+      members: 'Membros',
+      disable: 'Desativar',
+      reactivate: 'Reativar',
+      empty: 'Nenhum usuário encontrado no diretório.',
     },
     siteName: {
       title: 'Nome do site',

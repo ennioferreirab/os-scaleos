@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, type DirectoryUser } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -221,6 +221,7 @@ function makeUserStorage(storage: DurableObjectStorage) {
       //
       // null = password disabled (e.g. because some other auth mechanism is used)
       passwordHashHash: <Uint8Array | null>null,
+
     }
   });
 }
@@ -330,14 +331,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       // Create on first use.
       this.storage.created.put(true);
-      this.storage.profile.put({
-        type: "user",
-        name: email.split("@")[0],
-        id: email,
-      });
+      this.storage.profile.put({type: "user", name: email.split("@")[0], id: email});
       return true;
     }
-
     return false;
   }
 
@@ -362,7 +358,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!bytesEqual(passwordHashHash, actualHashHash)) {
       return null;
     }
-
     return this.#newSessionToken();
   }
 
@@ -386,14 +381,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
 
-    this.storage.created.put(true);
-    this.storage.profile.put({
-      type: "user",
-      name: displayName,
-      id: username,
-    });
-
     let passwordHashHash = new Uint8Array(await crypto.subtle.digest('SHA-256', passwordHash));
+    this.storage.created.put(true);
+    this.storage.profile.put({type: "user", name: displayName, id: username});
     this.storage.passwordHashHash.put(passwordHashHash);
 
     return this.#newSessionToken();
@@ -417,13 +407,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
-      this.storage.profile.put({
-        type: "user",
-        name: email.split("@")[0],
-        id: email,
-      });
+      this.storage.profile.put({type: "user", name: email.split("@")[0], id: email});
     }
     return this.#newSessionToken();
+  }
+
+  /** Initialize the deterministic Supabase User DO without treating profile data as credentials. */
+  loginFromSupabase(user: DirectoryUser): void {
+    if (!this.storage.created.get()) {
+      this.storage.transaction(() => {
+        this.storage.created.put(true);
+        this.storage.profile.put({type: "user", name: user.displayName, id: user.userId});
+        this.storage.passwordHashHash.put(null);
+      });
+      return;
+    }
+    if (this.storage.profile.get().id !== user.userId) {
+      throw new Error("Supabase subject does not match this OS account.");
+    }
   }
 
   /** Whether this account has a password set (false for gatekeeper sign-in accounts). */

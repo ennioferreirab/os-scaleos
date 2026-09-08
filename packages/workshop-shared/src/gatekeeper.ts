@@ -78,12 +78,17 @@ export type VendorDescription = {
   autoProvisionsAccount?: boolean;
 }
 
-/**
- * Per-open context the Workshop passes to GatekeeperUser.startAppUi(). `isAdmin` is supplied fresh
- * each time rather than baked into the account, since a user's admin status can change over time.
- */
+/** Live, narrow authority supplied to a gatekeeper management UI for every sensitive operation. */
+export interface AppUiAuthority extends RpcTarget {
+  /** Reject when the originating human session expired or the directory user is no longer active. */
+  requireActive(): Promise<void>;
+  /** Recheck the current directory role; never rely on the role observed when the UI was opened. */
+  isAdmin(): Promise<boolean>;
+}
+
+/** Per-open context the Workshop passes to GatekeeperUser.startAppUi(). */
 export type AppUiContext = {
-  isAdmin: boolean;
+  authority: RpcStub<AppUiAuthority>;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -665,8 +670,8 @@ export interface GatekeeperUser extends WorkerEntrypoint {
   getSingletonGatekeeperClass?(): Promise<DurableObjectClass<Gatekeeper<any>>>;
 
   /**
-   * The account's full-page management UI (iframe HTML + ui capability). `context.isAdmin` is passed
-   * fresh per open (not baked into the account) so admin-gated features reflect current status.
+   * The account's full-page management UI (iframe HTML + ui capability). `context.authority`
+   * rechecks the originating session and current directory role on each sensitive operation.
    */
   startAppUi?(context: AppUiContext): Promise<GatekeeperUiFrame>;
 

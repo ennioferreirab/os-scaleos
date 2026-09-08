@@ -14,28 +14,33 @@ also safe because the directory deduplicates the complete event by idempotency k
 
 ## Identity and access
 
-The browser supplies only the desired boolean and an opaque idempotency key. The backend passes the
-authenticated User Durable Object id to the directory, which assigns the installation's single MVP
-tenant and a canonical opaque directory user id. Email, username, actor, tenant, role, and resource
-identifiers are not accepted from the mutation or history-query arguments.
+For the retained signup-setting mutation, the browser supplies only the desired boolean and an
+opaque idempotency key. For T03 directory mutations it supplies the bounded requested value,
+explicit target Subject where applicable, and UUID `mutationId`. The actor and organization always
+come from the verified session and configured directory; e-mail never selects an existing user.
 
 Audit history is exposed only on the existing `AdminApi` capability. A non-admin receives `null`
-from `AuthenticatedApi.getAdminApi()` and cannot select or enumerate a tenant. The directory also
-rejects internal reads for any tenant other than its own singleton tenant.
+from `AuthenticatedApi.getAdminApi()` and cannot select or enumerate an organization. Every method
+on a retained admin capability rechecks access-token expiry and current active-admin status.
 
 ## Stored data and retention
 
 Each event contains stable event, mutation-correlation, and idempotency identifiers; server time;
-tenant and actor ids; installation resource; action; before/after policy versions; result and reason;
-and the bounded `signupsEnabled` boolean transition. It does not store passwords, cookies, tokens,
-prompts, documents, connector responses, or arbitrary configuration patches.
+tenant and actor ids; resource and action; before/after resource-policy versions; result and reason;
+and a bounded transition. T03 adds directory-local events for first-admin bootstrap, user
+invitation, role changes, and user deactivation/reactivation. The
+`AdminSettings` version and directory authorization version are intentionally separate clocks owned
+by their respective transactional authorities; event versions are interpreted with the resource.
+When another active admin resumes a provider mutation left pending, the single final event keeps
+the original `actorUserId` and records the current executor in optional `resumedByUserId`.
+No event stores invitation secrets, passwords, cookies, tokens, prompts, documents, connector
+responses, e-mail addresses, or arbitrary configuration patches.
 
 Events and matching idempotency receipts are retained for the lifetime of the deployment's Durable
-Object storage. T02 performs no automatic deletion and offers the newest 50 events by default (up
+Object storage. No automatic deletion is performed; the UI offers the newest 50 events by default (up
 to 200 per query). This deliberate local retention keeps late retries idempotent. A future retention
 or export policy must preserve retry detection separately before deleting event records.
 
-This is the reusable path for future administrative mutations: add a bounded action/change schema,
-commit it with the mutation in the `AdminSettings` outbox transaction, and deliver it idempotently
-to the organization directory. T02 does not add groups, invitations, user lifecycle, ACLs, a central
-collector, or Vault auditing.
+`AdminSettings` mutations use its durable outbox because their authority is a different DO.
+Directory-owned lifecycle mutations commit their state, receipt, and audit event directly in one
+directory transaction. Neither path adds a central collector; retention/export remains future work.

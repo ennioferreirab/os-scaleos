@@ -8,6 +8,15 @@ interface ImportMetaEnv {
   // In this mode, password-based login/signup is disabled and the app authenticates
   // via the CF Access JWT that Access injects into requests before they reach the server.
   readonly VITE_CF_ACCESS_MODE?: string;
+
+  // Public Supabase/OIDC settings. Secret/admin keys never use a VITE_ prefix.
+  readonly VITE_AUTH_ISSUER?: string;
+  readonly VITE_AUTH_PUBLIC_URL?: string;
+  readonly VITE_AUTH_OS_CLIENT_ID?: string;
+  readonly VITE_AUTH_VAULT_CLIENT_ID?: string;
+  readonly VITE_SUPABASE_PUBLISHABLE_KEY?: string;
+  readonly VITE_OS_PUBLIC_URL?: string;
+  readonly VITE_VAULT_PUBLIC_URL?: string;
 }
 
 interface ImportMeta {

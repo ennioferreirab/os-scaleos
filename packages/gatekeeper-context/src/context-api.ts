@@ -2,7 +2,9 @@
 // collections; admins also manage public collections. Everything is sharing-domain scoped.
 
 import { RpcTarget } from "capnweb";
+import type { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
@@ -60,7 +62,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     private env: Cloudflare.Env,
     private domain: string,
     private accountId: string,
-    private isAdmin: boolean,
+    private authority: NativeRpcStub<AppUiAuthority>,
     private collections: DurableObjectNamespace<ContextCollectionDurableObject>,
     private userLibraries: DurableObjectNamespace<UserLibraryDurableObject>,
     private registries: DurableObjectNamespace<LibraryRegistryDurableObject>,
@@ -87,6 +89,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   // Read: own private collections or any public collection.
   async #assertCanRead(collectionId: string): Promise<void> {
+    await this.authority.requireActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
@@ -98,12 +101,13 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   // Write: own private collections, or public collections for admins.
   async #assertCanWrite(collectionId: string): Promise<void> {
+    await this.authority.requireActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
     ]);
     if (owns) return;
-    if (isPublic && this.isAdmin) return;
+    if (isPublic && await this.authority.isAdmin()) return;
     throw new Error("Collection not found or you don't have access.");
   }
 
@@ -113,12 +117,17 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     }
   }
 
-  #assertAdmin(): void {
-    if (!this.isAdmin) throw new Error("Admin access required.");
+  async #assertAdmin(): Promise<void> {
+    await this.authority.requireActive();
+    if (!(await this.authority.isAdmin())) throw new Error("Admin access required.");
   }
 
   async getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }> {
-    return { isAdmin: this.isAdmin, supportsGitCollections: !!this.env.ARTIFACTS };
+    await this.authority.requireActive();
+    return {
+      isAdmin: await this.authority.isAdmin(),
+      supportsGitCollections: !!this.env.ARTIFACTS,
+    };
   }
 
   // --- Collection management ---
@@ -130,7 +139,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     icon?: string,
     source: ContextCollectionContent["source"] = "web",
   ): Promise<ContextCollectionMetadata> {
-    if (visibility === "public") this.#assertAdmin();
+    if (visibility === "public") await this.#assertAdmin();
+    else await this.authority.requireActive();
     if (source !== "web" && source !== "git") {
       throw new Error(`Unsupported collection source: ${source}`);
     }
@@ -213,6 +223,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   async getContextCollectionMetadata(collectionId: string): Promise<ContextCollectionMetadata | null> {
+    await this.authority.requireActive();
     try {
       let [meta, owns, isPublic] = await Promise.all([
         this.#collection(collectionId).getMetadata(),
@@ -258,14 +269,16 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   // --- Listing & access ---
 
   async listEnabledContextCollections(): Promise<EnabledCollectionInfo[]> {
+    await this.authority.requireActive();
     return loadEnabledContextCollections(this.env, this.domain, this.#userLib());
   }
 
   async canWriteContextCollection(collectionId: string): Promise<boolean> {
+    await this.authority.requireActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
     ]);
-    return owns || (isPublic && this.isAdmin);
+    return owns || (isPublic && await this.authority.isAdmin());
   }
 }

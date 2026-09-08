@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react'
 import { RpcStub } from 'capnweb'
 import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
-import { ClockCounterClockwise, Hexagon, ShieldWarning, UserPlus } from '@phosphor-icons/react'
+import { ClockCounterClockwise, Hexagon, ShieldWarning, UserPlus, Users } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, DirectoryUser, PendingUserLifecycle, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import { useLocale } from './i18n'
+import { hasPublicAuthConfig } from './auth/supabase'
 
 // Swatch background per banner color, matching AnnouncementBanner's accent styles.
 const BANNER_SWATCH: Record<BannerColor, string> = {
@@ -20,10 +21,36 @@ const BANNER_SWATCH: Record<BannerColor, string> = {
   brand: 'var(--color-accent-100)',
 }
 
+type PendingInviteMutation = {
+  email: string
+  displayName: string
+  mutationId: string
+}
+
+const pendingInviteStorageKey = (actorId: string) => `scaleos-admin-pending-invite:${actorId}`
+
+function readPendingInvite(actorId: string): PendingInviteMutation | null {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(pendingInviteStorageKey(actorId)) ?? 'null')
+    if (typeof value?.email !== 'string' || typeof value?.displayName !== 'string' ||
+        typeof value?.mutationId !== 'string') return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+function storePendingInvite(actorId: string, value: PendingInviteMutation | null) {
+  const key = pendingInviteStorageKey(actorId)
+  if (value) sessionStorage.setItem(key, JSON.stringify(value))
+  else sessionStorage.removeItem(key)
+}
+
 export default function AdminPage() {
-  const { authenticatedApi, isAdmin } = useAuthenticatedApi()
+  const { authenticatedApi, isAdmin, currentUser } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const { t, formatNumber } = useLocale()
+  const centralAuthEnabled = hasPublicAuthConfig()
   useDocumentTitle(t('adminArea.pageTitle'))
 
   // The admin capability (minted once via getAdminApi; null until loaded / for non-admins). Wrapped
@@ -70,6 +97,19 @@ export default function AdminPage() {
   const [loadingAudit, setLoadingAudit] = useState(false)
   const [auditLoadError, setAuditLoadError] = useState(false)
 
+  const [directoryUsers, setDirectoryUsers] = useState<DirectoryUser[]>([])
+  const [pendingUserLifecycle, setPendingUserLifecycle] = useState<PendingUserLifecycle[]>([])
+  const [invitationEmail, setInvitationEmail] = useState('')
+  const [invitationDisplayName, setInvitationDisplayName] = useState('')
+  const [inviteRetryPending, setInviteRetryPending] = useState(false)
+  const [loadingUsers, setLoadingUsers] = useState(false)
+  const [savingUser, setSavingUser] = useState<string | null>(null)
+  const pendingInviteMutation = useRef<PendingInviteMutation | null>(null)
+  const pendingStatusMutations = useRef(new Map<string, {
+    status: 'active' | 'disabled'
+    mutationId: string
+  }>())
+
   // Gatekeeper resource config, and the set of resource keys ("vendorId\u0000urlPattern") busy toggling.
   const [resourceVendors, setResourceVendors] = useState<AdminResourceVendor[]>([])
   const [resourceBusy, setResourceBusy] = useState<Set<string>>(new Set())
@@ -80,6 +120,22 @@ export default function AdminPage() {
   const [formats, setFormats] = useState<AdminFormat[]>([])
 
   const resourceKey = (vendorId: string, urlPattern: string) => `${vendorId}\u0000${urlPattern}`
+
+  const auditActionLabel = (action: AdminAuditEvent['action']) => {
+    switch (action) {
+      case 'bootstrapAdmin': return t('adminArea.audit.actions.bootstrapAdmin')
+      case 'inviteUser': return t('adminArea.audit.actions.inviteUser')
+      case 'setUserRole': return t('adminArea.audit.actions.setUserRole')
+      case 'setUserStatus': return t('adminArea.audit.actions.setUserStatus')
+      case 'setSignupsEnabled': return t('adminArea.audit.actions.setSignupsEnabled')
+    }
+  }
+
+  const auditValue = (value: AdminAuditEvent['change']['before']) => {
+    if (value === true) return t('adminArea.audit.enabled')
+    if (value === false) return t('adminArea.audit.disabled')
+    return value ?? '—'
+  }
 
   // Populate all editor state from a freshly-fetched settings view.
   const applySettings = (view: Awaited<ReturnType<RpcStub<AdminApi>['getSettings']>>) => {
@@ -284,8 +340,128 @@ export default function AdminPage() {
     }
   }
 
+  const loadDirectory = async () => {
+    if (!admin) return
+    setLoadingUsers(true)
+    try {
+      const [usersResult, pendingResult] = await Promise.all([
+        admin.api.listDirectoryUsers(),
+        admin.api.listPendingUserLifecycle(),
+      ])
+      setDirectoryUsers([...usersResult])
+      setPendingUserLifecycle([...pendingResult])
+      usersResult[Symbol.dispose]?.()
+      pendingResult[Symbol.dispose]?.()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('adminArea.errors.loadUsersFailed')
+      toasts.add({ title: message, variant: 'error' })
+    } finally {
+      setLoadingUsers(false)
+    }
+  }
+
+  useEffect(() => {
+    if (currentUser?.type !== 'user') return
+    const pending = readPendingInvite(currentUser.id)
+    pendingInviteMutation.current = pending
+    if (!pending) return
+    setInvitationEmail(pending.email)
+    setInvitationDisplayName(pending.displayName)
+    setInviteRetryPending(true)
+  }, [currentUser])
+
+  const handleCreateInvitation = async () => {
+    if (!admin || currentUser?.type !== 'user' ||
+        !invitationEmail.trim() || !invitationDisplayName.trim()) return
+    const email = invitationEmail.trim().toLowerCase()
+    const displayName = invitationDisplayName.trim()
+    const pending = pendingInviteMutation.current
+    const mutation = pending?.email === email && pending.displayName === displayName
+      ? pending
+      : { email, displayName, mutationId: crypto.randomUUID() }
+    pendingInviteMutation.current = mutation
+    storePendingInvite(currentUser.id, mutation)
+    setSavingUser('invite')
+    try {
+      await admin.api.inviteUser(mutation)
+      if (pendingInviteMutation.current === mutation) pendingInviteMutation.current = null
+      storePendingInvite(currentUser.id, null)
+      setInviteRetryPending(false)
+      setInvitationEmail('')
+      setInvitationDisplayName('')
+      toasts.add({ title: t('adminArea.toasts.invitationCreated'), variant: 'success' })
+      await loadDirectory()
+    } catch (err) {
+      setInviteRetryPending(true)
+      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
+      toasts.add({ title: message, variant: 'error' })
+    } finally {
+      setSavingUser(null)
+    }
+  }
+
+  const handleUserStatus = async (user: DirectoryUser) => {
+    if (!admin) return
+    const status: DirectoryUser['status'] = user.status === 'active' ? 'disabled' : 'active'
+    const pending = pendingStatusMutations.current.get(user.userId)
+    const mutation = pending?.status === status
+      ? pending
+      : { status, mutationId: crypto.randomUUID() }
+    pendingStatusMutations.current.set(user.userId, mutation)
+    setSavingUser(user.userId)
+    try {
+      await admin.api.setUserStatus({userId: user.userId, ...mutation})
+      if (pendingStatusMutations.current.get(user.userId) === mutation) {
+        pendingStatusMutations.current.delete(user.userId)
+      }
+      toasts.add({ title: t('adminArea.toasts.userStatusSaved'), variant: 'success' })
+      await loadDirectory()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
+      toasts.add({ title: message, variant: 'error' })
+    } finally {
+      setSavingUser(null)
+    }
+  }
+
+  const handleResumeUserStatus = async (pending: PendingUserLifecycle) => {
+    if (!admin) return
+    setSavingUser(pending.userId)
+    try {
+      await admin.api.resumeUserStatus(pending)
+      pendingStatusMutations.current.delete(pending.userId)
+      toasts.add({ title: t('adminArea.toasts.userStatusSaved'), variant: 'success' })
+      await loadDirectory()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
+      toasts.add({ title: message, variant: 'error' })
+    } finally {
+      setSavingUser(null)
+    }
+  }
+
+  const handleUserRole = async (user: DirectoryUser) => {
+    if (!admin) return
+    setSavingUser(user.userId)
+    try {
+      await admin.api.setUserRole({
+        userId: user.userId,
+        role: user.role === 'admin' ? 'member' : 'admin',
+        mutationId: crypto.randomUUID(),
+      })
+      toasts.add({ title: 'Papel atualizado.', variant: 'success' })
+      await loadDirectory()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
+      toasts.add({ title: message, variant: 'error' })
+    } finally {
+      setSavingUser(null)
+    }
+  }
+
   useEffect(() => {
     if (activeTab === 'audit' && admin) void loadAuditEvents()
+    if (activeTab === 'users' && admin) void loadDirectory()
   }, [activeTab, admin])
 
   const handleSaveSiteName = async () => {
@@ -397,10 +573,119 @@ export default function AdminPage() {
           { value: 'general', label: t('adminArea.tabs.general') },
           { value: 'gatekeepers', label: t('adminArea.tabs.gatekeepers') },
           { value: 'formats', label: t('adminArea.tabs.formats') },
-          { value: 'access', label: t('adminArea.tabs.access') },
+          { value: 'users', label: t('adminArea.tabs.users') },
+          ...(!centralAuthEnabled
+            ? [{ value: 'access', label: t('adminArea.tabs.access') }]
+            : []),
           { value: 'audit', label: t('adminArea.tabs.audit') },
         ]}
       />
+
+      {activeTab === 'users' && (
+        <div className="space-y-6">
+          <section className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <Users size={20} className="text-kumo-subtle" />
+              <div>
+                <h2 className="text-lg font-semibold text-kumo-strong">{t('adminArea.users.title')}</h2>
+                <p className="text-sm text-kumo-subtle">{t('adminArea.users.description')}</p>
+              </div>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <Input
+                className="flex-1"
+                label="Nome"
+                value={invitationDisplayName}
+                onChange={(event) => setInvitationDisplayName(event.target.value)}
+                disabled={savingUser !== null || inviteRetryPending}
+              />
+              <Input
+                className="flex-1"
+                label={t('adminArea.users.invitationEmail')}
+                type="email"
+                value={invitationEmail}
+                onChange={(event) => setInvitationEmail(event.target.value)}
+                disabled={savingUser !== null || inviteRetryPending}
+              />
+              <Button
+                className="self-end"
+                onClick={handleCreateInvitation}
+                loading={savingUser === 'invite'}
+                disabled={!invitationEmail.trim() || !invitationDisplayName.trim()}
+              >
+                {t('adminArea.users.invite')}
+              </Button>
+            </div>
+          </section>
+
+          <section className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-kumo-strong">{t('adminArea.users.members')}</h2>
+              <Button size="sm" variant="secondary" onClick={loadDirectory} loading={loadingUsers}>
+                {t('adminArea.audit.refresh')}
+              </Button>
+            </div>
+            <div className="space-y-3">
+              {directoryUsers.map((user) => (
+                <article key={user.userId} className="flex items-center gap-4 rounded-lg border border-kumo-line bg-kumo-base p-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium text-kumo-strong truncate">{user.displayName}</p>
+                    <p className="text-xs text-kumo-subtle truncate">{user.email}</p>
+                    <p className="text-xs text-kumo-subtle break-all">{user.userId}</p>
+                    <p className="text-xs text-kumo-subtle">{user.role} · {user.status}</p>
+                    {pendingUserLifecycle.some(pending => pending.userId === user.userId) && (
+                      <p className="text-xs font-medium text-kumo-warning">
+                        Mudança de status pendente
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={savingUser === user.userId}
+                      disabled={user.status !== 'active'}
+                      onClick={() => handleUserRole(user)}
+                    >
+                      {user.role === 'admin' ? 'Tornar membro' : 'Tornar admin'}
+                    </Button>
+                    {(() => {
+                      const pending = pendingUserLifecycle.find(item => item.userId === user.userId)
+                      return pending ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={savingUser === user.userId}
+                          disabled={pending.status === 'disabled' && currentUser?.id === user.userId}
+                          onClick={() => handleResumeUserStatus(pending)}
+                        >
+                          Retomar mudança
+                        </Button>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={savingUser === user.userId}
+                          disabled={user.status === 'active' && currentUser?.id === user.userId}
+                          onClick={() => handleUserStatus(user)}
+                        >
+                          {user.status === 'active'
+                            ? t('adminArea.users.disable')
+                            : t('adminArea.users.reactivate')}
+                        </Button>
+                      )
+                    })()}
+                  </div>
+                </article>
+              ))}
+              {!loadingUsers && directoryUsers.length === 0 && (
+                <p className="text-sm text-kumo-subtle">{t('adminArea.users.empty')}</p>
+              )}
+            </div>
+          </section>
+
+        </div>
+      )}
 
       {/* Standard output formats */}
       {activeTab === 'formats' && admin && (
@@ -439,7 +724,7 @@ export default function AdminPage() {
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 text-sm font-medium text-kumo-strong">
                     <ClockCounterClockwise size={17} className="text-kumo-subtle" />
-                    {t('adminArea.audit.actions.setSignupsEnabled')}
+                    {auditActionLabel(event.action)}
                   </div>
                   <time className="text-xs text-kumo-subtle" dateTime={event.occurredAt}>
                     {event.occurredAt}
@@ -447,8 +732,8 @@ export default function AdminPage() {
                 </div>
                 <p className="mt-2 text-sm text-kumo-default">
                   {t('adminArea.audit.change', {
-                    before: event.change.before ? t('adminArea.audit.enabled') : t('adminArea.audit.disabled'),
-                    after: event.change.after ? t('adminArea.audit.enabled') : t('adminArea.audit.disabled'),
+                    before: auditValue(event.change.before),
+                    after: auditValue(event.change.after),
                   })}
                 </p>
                 <dl className="mt-3 grid gap-2 text-xs text-kumo-subtle sm:grid-cols-2">

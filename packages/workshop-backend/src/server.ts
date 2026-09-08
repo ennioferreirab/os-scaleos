@@ -1,4 +1,12 @@
-import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
+import {
+  RpcSession,
+  RpcStub,
+  RpcTarget,
+  WebSocketTransport,
+  newHttpBatchRpcResponse,
+  type RpcSessionOptions,
+  type RpcTransport,
+} from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
 import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
@@ -6,6 +14,12 @@ import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
+import { HumanSessionGuard } from "./auth/human-session.js";
+import {
+  hasSupabaseAuthSettings,
+  requireSubject,
+  verifyHumanAccessToken,
+} from "./auth/supabase.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
 import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
@@ -13,7 +27,7 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
-import { GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import { AppUiAuthority, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
@@ -22,7 +36,7 @@ import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput
 import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback, TransientStubLoopback } from "./overseer";
 import { ExternalMessageGateway } from "./external-message-gateway";
-import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -74,24 +88,93 @@ type Env = Cloudflare.Env & {
   FLAGS?: Flagship;
 }
 
+const DIRECTORY_USER_PATH = "/api/internal/directory/users";
+
+async function serviceTokensEqual(provided: string, expected: string): Promise<boolean> {
+  let encoder = new TextEncoder();
+  let [providedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  let left = new Uint8Array(providedHash);
+  let right = new Uint8Array(expectedHash);
+  let difference = 0;
+  for (let index = 0; index < left.length; index++) difference |= left[index] ^ right[index];
+  return difference === 0;
+}
+
+async function handleDirectoryUserRequest(
+    request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", {status: 405});
+  let expectedToken = env.DIRECTORY_SERVICE_TOKEN;
+  if (!expectedToken) {
+    return Response.json({error: "Directory service is unavailable."}, {status: 503});
+  }
+  let authorization = request.headers.get("Authorization") ?? "";
+  let providedToken = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  if (!providedToken || !(await serviceTokensEqual(providedToken, expectedToken))) {
+    return Response.json({error: "Unauthorized"}, {status: 401});
+  }
+  let userId: string;
+  try {
+    userId = requireSubject(new URL(request.url).searchParams.get("userId") ?? "");
+  } catch {
+    return Response.json({error: "Invalid userId."}, {status: 400});
+  }
+  try {
+    const user = await ctx.exports.OrganizationDirectoryDurableObject.getByName("")
+        .getDirectoryUser(userId);
+    if (!user) return Response.json({error: "Not found."}, {status: 404});
+    return Response.json({
+      userId: user.userId,
+      email: user.email,
+      displayName: user.displayName,
+      status: user.status,
+      role: user.role,
+    });
+  } catch {
+    return Response.json({error: "Directory service is unavailable."}, {status: 503});
+  }
+}
+
 // =======================================================================================
+
+class AppUiAuthorityImpl extends NativeRpcTarget implements AppUiAuthority {
+  constructor(
+      private requireActiveCallback: () => Promise<void>,
+      private isAdminCallback: () => Promise<boolean>) {
+    super();
+  }
+
+  requireActive(): Promise<void> {
+    return this.requireActiveCallback();
+  }
+
+  isAdmin(): Promise<boolean> {
+    return this.isAdminCallback();
+  }
+}
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void) {
+      private abortSession: (reason: Error) => void,
+      private guard: HumanSessionGuard,
+      private centralAuthMode: boolean) {
     super();
 
     this.#userId = userId;
     this.overseers = this.ctx.exports.OverseerDurableObject;
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
+    this.organizationDirectory = this.ctx.exports.OrganizationDirectoryDurableObject;
   }
 
   private overseers: DurableObjectNamespace<OverseerDurableObject>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
+  private organizationDirectory: DurableObjectNamespace<OrganizationDirectoryDurableObject>;
 
   #userId: DurableObjectId;
 
@@ -101,80 +184,94 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return wrapDoStubForTelemetry(this.users.get(this.#userId));
   }
 
-  #isAdmin(): boolean {
-    let name = this.#userId.name;
-    let admins = this.env.ADMINS;
-
-    if (!name || !admins) return false;
-
-    if (typeof admins === "string") {
-      // Admins should be a JSON binding of array type, but `.env` doesn't actually let you
-      // specify JSON bindings, so we also support a string that parses as JSON array.
-      admins = JSON.parse(admins);
-    }
-
-    if (!Array.isArray(admins)) {
-      throw new TypeError("ADMINS must be configured as an array of usernames.");
-    }
-
-    return admins.includes(name);
+  async #requireActive(): Promise<void> {
+    this.guard.assertValid();
+    if (!this.centralAuthMode) return;
+    await this.organizationDirectory.getByName("").requireActiveUser(this.guard.subject);
   }
 
-  whoami(): Promise<AiChatAuthorInfo> {
+  async #isAdmin(): Promise<boolean> {
+    if (!this.centralAuthMode) {
+      let admins = this.env.ADMINS;
+      if (typeof admins === "string") admins = JSON.parse(admins);
+      return Array.isArray(admins) && !!this.#userId.name && admins.includes(this.#userId.name);
+    }
+    try {
+      this.guard.assertValid();
+      await this.organizationDirectory.getByName("").requireAdminUser(this.guard.subject);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async whoami(): Promise<AiChatAuthorInfo> {
+    await this.#requireActive();
     // Pure-read delegations retry once across a user-DO reset (see retryOnDoReset); writes never do.
     return retryOnDoReset(() => this.#user.whoami());
   }
-  setOwnDisplayName(name: string): Promise<void> {
-    return this.#user.setOwnDisplayName(name);
+  async setOwnDisplayName(name: string): Promise<void> {
+    await this.#requireActive();
+    await this.#user.setOwnDisplayName(name);
+    if (this.centralAuthMode) {
+      await this.organizationDirectory.getByName("").setOwnDisplayName(this.guard.subject, name);
+    }
   }
-  changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
-    return this.#user.changePassword(oldHash, newHash);
-  }
-  hasPasswordLogin(): Promise<boolean> {
-    return retryOnDoReset(() => this.#user.hasPasswordLogin());
-  }
-  listModels(): Promise<AiChatAuthorInfo[]> {
+  async listModels(): Promise<AiChatAuthorInfo[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listModels());
   }
-  addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+  async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+    await this.#requireActive();
     return this.#user.addModel(profile, config);
   }
-  deleteModel(id: string): Promise<void> {
+  async deleteModel(id: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.deleteModel(id);
   }
-  setQuickModel(id: string | null): Promise<void> {
+  async setQuickModel(id: string | null): Promise<void> {
+    await this.#requireActive();
     return this.#user.setQuickModel(id);
   }
-  getQuickModel(): Promise<null | string> {
+  async getQuickModel(): Promise<null | string> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.getQuickModel());
   }
 
-  getPreferredModel(): Promise<string | null> {
+  async getPreferredModel(): Promise<string | null> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.getPreferredModel());
   }
-  setPreferredModel(id: string | null): Promise<void> {
+  async setPreferredModel(id: string | null): Promise<void> {
+    await this.#requireActive();
     return this.#user.setPreferredModel(id);
   }
-  isOnboardingCompleted(): Promise<boolean> {
+  async isOnboardingCompleted(): Promise<boolean> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.isOnboardingCompleted());
   }
-  completeOnboarding(): Promise<void> {
+  async completeOnboarding(): Promise<void> {
+    await this.#requireActive();
     return this.#user.completeOnboarding();
   }
 
-  getCloudflareUsage(): Promise<CloudflareUsageInfo> {
+  async getCloudflareUsage(): Promise<CloudflareUsageInfo> {
+    await this.#requireActive();
     return getUsageInfo(this.env, this.#user);
   }
 
-  listCloudflareAccounts(): Promise<CloudflareAccountOption[]> {
+  async listCloudflareAccounts(): Promise<CloudflareAccountOption[]> {
+    await this.#requireActive();
     return listConnectedAccounts(this.env, this.#user);
   }
 
-  selectCloudflareAccount(accountId: string): Promise<void> {
+  async selectCloudflareAccount(accountId: string): Promise<void> {
+    await this.#requireActive();
     return selectAccount(this.env, this.#user, accountId);
   }
 
   async setAvatar(data: Uint8Array | null): Promise<void> {
+    await this.#requireActive();
     if (data) {
       if (data.byteLength > 100 * 1024) {
         throw new Error("Avatar too large (max 100 KB)");
@@ -196,32 +293,36 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     }
   }
   async getAvatar(userId: string): Promise<Uint8Array | null> {
+    await this.#requireActive();
     let result = await this.env.AVATARS.get(userId, "arrayBuffer");
     if (!result) return null;
     return new Uint8Array(result);
   }
 
-  getAiConfig(): Promise<AiGatewayInfo> {
+  async getAiConfig(): Promise<AiGatewayInfo> {
+    await this.#requireActive();
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
-      return Promise.resolve({
+      return {
         enabled: true,
         enabledProviders: [...gwConfig.providers] as AiModelProvider[],
-      });
+      };
     } else {
-      return Promise.resolve({ enabled: false });
+      return { enabled: false };
     }
   }
 
-  getUiFeatureFlags(): Promise<UiFeatureFlags> {
-    return resolveUiFeatureFlags(this.env, this.#userId.name!);
+  async getUiFeatureFlags(): Promise<UiFeatureFlags> {
+    await this.#requireActive();
+    return resolveUiFeatureFlags(this.env, this.guard.subject);
   }
 
   async #openGadgetInternal(id: string, shareKey?: string,
                             configureObservers?: RpcStub<ObserverConfigCallback>)
       : Promise<NativeRpcStub<Overseer>> {
+    await this.#requireActive();
     let userId = this.#userId.toString();
-    let profileId = this.#userId.name!;
+    let profileId = this.guard.subject;
     let overseerId;
     try {
       overseerId = this.overseers.idFromString(id);
@@ -256,7 +357,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     let result;
     try {
-      result = await overseer.open(userId, profileId, notifyClosed, shareKey, configureObservers);
+      result = await overseer.open(
+          userId, profileId, notifyClosed, this.guard.expiresAtMs, shareKey, configureObservers);
     } catch (err) {
       // A denial proves this user's listing for the workspace is stale: revocation tries to drop it
       // (refreshAffectedCollaboratorListings), but that push is best-effort. Only catches entries
@@ -285,6 +387,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async newGadget(): Promise<RpcStub<Overseer>> {
+    await this.#requireActive();
     let id = this.overseers.newUniqueId().toString();
     await this.#user.newGadget(id, "Untitled Workspace");
     recordAnalytics(this.ctx, this.env, {
@@ -301,101 +404,124 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listGadgets());
   }
 
-  listOutputs(): Promise<ListOutputsResult> {
+  async listOutputs(): Promise<ListOutputsResult> {
+    await this.#requireActive();
     return this.#user.listOutputs();
   }
 
   async listOutputFormats(): Promise<OutputFormatOffer[]> {
+    await this.#requireActive();
     let offers = await listFormatOffers(this.env, await readAdminConfig(this.env));
     // Neither the agent's hint nor the binding details are part of what a user is offered here.
     return offers.map(({agentHint: _agentHint, bindings: _bindings, ...offer}) => offer);
   }
 
-  listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]> {
+  async listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listGatekeeperVendors(filter));
   }
 
-  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
+  async connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
+    await this.#requireActive();
     return this.#user.connectAccount(vendorId, resourceUrlPatterns);
   }
 
-  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+  async ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+    await this.#requireActive();
     return this.#user.ensureAccountResources(accountId, resourceUrlPatterns);
   }
 
-  listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
+  async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listAddableGatekeepers());
   }
 
-  provisionAmbientAccount(vendorId: string): Promise<void> {
+  async provisionAmbientAccount(vendorId: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.provisionAmbientAccount(vendorId);
   }
 
-  subscribeConnectedAccounts(
+  async subscribeConnectedAccounts(
       subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
       : Promise<RpcStub<{}>> {
+    await this.#requireActive();
     return this.#user.subscribeConnectedAccounts(subscriber, filter);
   }
 
-  disconnectAccount(accountId: number): Promise<void> {
+  async disconnectAccount(accountId: number): Promise<void> {
+    await this.#requireActive();
     return this.#user.disconnectAccount(accountId);
   }
 
-  reconnectAccount(accountId: number): Promise<{url: string}> {
+  async reconnectAccount(accountId: number): Promise<{url: string}> {
+    await this.#requireActive();
     return this.#user.reconnectAccount(accountId);
   }
 
-  startResourceConfigurator(
+  async startResourceConfigurator(
       accountId: number,
       resourceUrlPattern: string) {
+    await this.#requireActive();
     return this.#user.startResourceConfigurator(accountId, resourceUrlPattern);
   }
 
   async dismissSharedGadget(gadgetId: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.forgetSharedGadget(gadgetId);
   }
 
   async listOwnBlueprints(): Promise<BlueprintUserSummary[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listBlueprints());
   }
 
   async getOwnBlueprint(blueprintId: string): Promise<BlueprintUserSummary | null> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.getBlueprint(blueprintId));
   }
 
   async listLibraryBlueprints(): Promise<BlueprintLibrarySummary[]> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.listLibraryBlueprints());
   }
 
   async setBlueprintPinned(blueprintId: string, pinned: boolean): Promise<void> {
+    await this.#requireActive();
     return this.#user.setBlueprintPinned(blueprintId, pinned);
   }
 
   async isBlueprintPinned(blueprintId: string): Promise<boolean> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.isBlueprintPinned(blueprintId));
   }
 
   async listFeaturedBlueprints(): Promise<BlueprintPublicInfo[]> {
+    await this.#requireActive();
     return (await listFeaturedBlueprintsFromKv(this.env)).map(
         blueprint => publicBlueprintInfo(blueprint.id, blueprint.metadata));
   }
 
   async addBlueprintToLibrary(blueprintId: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.addBlueprintToLibrary(blueprintId);
   }
 
   async removeBlueprintFromLibrary(blueprintId: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.removeBlueprintFromLibrary(blueprintId);
   }
 
-  isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null> {
+  async isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null> {
+    await this.#requireActive();
     return retryOnDoReset(() => this.#user.isBlueprintInLibrary(blueprintId));
   }
 
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
+    await this.#requireActive();
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
     let blueprintId = randomBlueprintId();
@@ -438,6 +564,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     blueprintId: string,
     bindings: Record<string, BlueprintBindingAssignment>
   ): Promise<RpcStub<Overseer>> {
+    await this.#requireActive();
     // 1. Read blueprint from KV.
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
@@ -554,6 +681,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async deleteOrphanedBlueprint(blueprintId: string): Promise<void> {
+    await this.#requireActive();
     return this.#user.deleteOwnedBlueprint(blueprintId);
   }
 
@@ -564,6 +692,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // vendor id, e.g. "context"), so each app is hosted at /gatekeepers/<vendorId>. UI-providing
   // accounts are auto-provisioned singletons (one per vendor), so the vendor id identifies them.
   async listGatekeeperApps(): Promise<GatekeeperAppInfo[]> {
+    await this.#requireActive();
     // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
     // appear in the nav even before the user opens a gadget — in a single round trip.
     let accounts = await this.#user.listProvidedAccounts();
@@ -577,32 +706,39 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
+    await this.#requireActive();
     // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
     // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
     let user = this.#user;  // one stub for both calls
     let accounts = await user.listProvidedAccounts();
     let app = accounts.find((account: (typeof accounts)[number]) => account.vendorId === id && account.description.providesUi);
     if (!app) return null;
-    // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
-    return user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+    return user.startAccountAppUi(app.accountId, {
+      authority: new AppUiAuthorityImpl(
+          () => this.#requireActive(),
+          () => this.#isAdmin()),
+    });
   }
 
   // --- Deployment admin ---
 
   async amIAdmin(): Promise<boolean> {
+    await this.#requireActive();
     return this.#isAdmin();
   }
 
   async getAdminApi(): Promise<RpcStub<AdminApi> | null> {
-    if (!this.#isAdmin()) return null;
+    await this.#requireActive();
+    if (!(await this.#isAdmin())) return null;
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface for this admin.
-    let adminUserId = this.#userId.name!;
+    let adminUserId = this.guard.subject;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(
-        this.adminSettings.getByName(""), adminUserId, this.#userId.toString());
+    return new AdminApiImpl(this.adminSettings.getByName(""),
+        this.organizationDirectory.getByName(""), adminUserId, this.#userId.toString(), this.guard);
   }
+
 }
 
 async function serveBlueprintScreenshot(env: Env, blueprintId: string): Promise<Response> {
@@ -640,9 +776,12 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
 @validateRpc()
 class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
+  #humanSessionGuard: HumanSessionGuard | undefined;
+  #authenticatingHuman = false;
 
   constructor(private ctx: ExecutionContext, private env: Env,
       private abortSession: (reason: Error) => void,
+      private publishHumanSessionGuard: (guard: HumanSessionGuard) => void,
       private accessPayload?: JWTPayload) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
@@ -654,7 +793,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     return getServerConfig(this.env);
   }
 
-  async startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }> {
+  async startGatekeeperLogin(vendorId: string)
+      : Promise<{ url: string; attempt: RpcStub<LoginAttempt> }> {
+    if (hasSupabaseAuthSettings(this.env)) throw createAuthError(AUTH_ERROR_CODES.forbidden);
     if (!getAuthGatekeeperAllowlist(this.env).includes(vendorId)) {
       throw new Error(`Sign-in via "${vendorId}" is not enabled on this deployment.`);
     }
@@ -667,8 +808,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // invocation. The client never sees its id — we hand back an `attempt` stub instead.
     const pendingId = this.ctx.exports.PendingLogin.newUniqueId();
     const pending = this.ctx.exports.PendingLogin.get(pendingId);
-    const callback = this.ctx.exports.LoginConnectCallbackImpl(
-        { props: { pendingId: pendingId.toString(), vendorId } });
+    const callback = this.ctx.exports.LoginConnectCallbackImpl({
+      props: {pendingId: pendingId.toString(), vendorId},
+    });
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is
     // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare is
     // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests and
@@ -683,6 +825,39 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 
   async authenticate(token: string): Promise<AuthenticatedApi> {
+    if (hasSupabaseAuthSettings(this.env)) {
+      if (this.#humanSessionGuard || this.#authenticatingHuman) {
+        throw createAuthError(AUTH_ERROR_CODES.unauthenticated);
+      }
+      this.#authenticatingHuman = true;
+      try {
+        const identity = await verifyHumanAccessToken(token, this.env);
+        const guard = new HumanSessionGuard(identity.subject, identity.expiresAtMs);
+        guard.assertValid();
+        const userId = this.users.idFromName(`supabase:${identity.subject}`);
+        const user = await this.ctx.exports.OrganizationDirectoryDurableObject.getByName("")
+            .authenticateHuman(identity.subject, userId.toString(), identity.verifiedEmail);
+        await this.users.get(userId).loginFromSupabase(user);
+        this.#humanSessionGuard = guard;
+        this.publishHumanSessionGuard(guard);
+        const remaining = Math.max(0, identity.expiresAtMs - Date.now());
+        if (remaining <= 2_147_483_647) {
+          setTimeout(() => {
+            this.abortSession(createAuthError(AUTH_ERROR_CODES.unauthenticated));
+          }, remaining);
+        }
+        recordAnalytics(this.ctx, this.env, {
+          event_name: "user_authenticated",
+          user_id: identity.subject,
+          source: "supabase_oauth",
+        });
+        return new AuthenticatedApiImpl(
+            this.ctx, this.env, userId, this.abortSession, guard, true);
+      } finally {
+        this.#authenticatingHuman = false;
+      }
+    }
+
     let split = token.split(':');
     if (split.length !== 2) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
@@ -695,10 +870,12 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession,
+        new HumanSessionGuard(split[0], Number.MAX_SAFE_INTEGER), false);
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
+    if (hasSupabaseAuthSettings(this.env)) throw createAuthError(AUTH_ERROR_CODES.forbidden);
     if (!this.accessPayload) {
       throw createAuthError(AUTH_ERROR_CODES.notAuthenticatedWithAccess);
     }
@@ -706,8 +883,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let email = this.accessPayload.email as string;
     let userId = this.users.idFromName(email);
     let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    let accountCreated =
-        await this.users.get(userId).authenticateFromCfAccess(email, signupsEnabled);
+    let accountCreated = await this.users.get(userId).authenticateFromCfAccess(
+        email, signupsEnabled);
     if (accountCreated) {
       recordAnalytics(this.ctx, this.env, {
         event_name: "account_created",
@@ -720,10 +897,12 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession,
+        new HumanSessionGuard(email, Number.MAX_SAFE_INTEGER), false);
   }
 
   async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
+    if (hasSupabaseAuthSettings(this.env)) throw createAuthError(AUTH_ERROR_CODES.forbidden);
     if (this.env.CF_ACCESS_AUD) {
       throw new Error("This deployment requires Cloudflare Access authentication.");
     }
@@ -748,6 +927,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
 
   async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
       : Promise<string | null> {
+    if (hasSupabaseAuthSettings(this.env)) throw createAuthError(AUTH_ERROR_CODES.forbidden);
     if (this.env.CF_ACCESS_AUD) {
       throw new Error("This deployment requires Cloudflare Access authentication.");
     }
@@ -799,6 +979,10 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     let url = new URL(req.url);
+
+    if (url.pathname === DIRECTORY_USER_PATH) {
+      return handleDirectoryUserRequest(req, env, ctx);
+    }
 
     if (url.pathname === SITE_LOGO_PATH) {
       return serveSiteLogo(req, env.BLUEPRINT_CONTENT);
@@ -867,10 +1051,16 @@ export default {
         logger.warn("aborting api session", { event: "session.abort", error: reason });
         abortController.abort(reason);
       };
+      let humanSessionGuard: HumanSessionGuard | undefined;
 
       return await newWorkersRpcResponse(req,
-          new PublicApiImpl(ctx, env, abortSession, accessPayload),
-          { abortSignal: abortController.signal });
+          new PublicApiImpl(ctx, env, abortSession, guard => {
+            humanSessionGuard ??= guard;
+          }, accessPayload),
+          {
+            abortSignal: abortController.signal,
+            getHumanSessionGuard: () => humanSessionGuard,
+          });
     }
 
     return new Response("Not Found", {status: 404});
@@ -885,7 +1075,32 @@ export default {
 type ExtendedRpcSessionOptions = RpcSessionOptions & {
   // Abort WebSocket sessions when this AbortSignal is aborted. (No effect on HTTP batch sessions.)
   abortSignal: AbortSignal;
+  /** Current immutable human authority for this socket, once authenticate() succeeds. */
+  getHumanSessionGuard?: () => HumanSessionGuard | undefined;
 };
+
+class GuardedWebSocketTransport implements RpcTransport {
+  readonly #transport: WebSocketTransport;
+
+  constructor(webSocket: WebSocket,
+      private getHumanSessionGuard?: () => HumanSessionGuard | undefined) {
+    this.#transport = new WebSocketTransport(webSocket);
+  }
+
+  send(message: string): void | Promise<void> {
+    return this.#transport.send(message);
+  }
+
+  async receive(): Promise<string> {
+    const message = await this.#transport.receive();
+    this.getHumanSessionGuard?.()?.assertValid();
+    return message;
+  }
+
+  abort(reason: unknown): void {
+    this.#transport.abort(reason);
+  }
+}
 
 // Clone of newWorkersRpcResponse() from Cap'n Web, except the `options` has been extended with
 // `abortSignal`.
@@ -915,7 +1130,8 @@ function newWorkersWebSocketRpcResponse(
   let pair = new WebSocketPair();
   let server = pair[0];
   server.accept()
-  let stub = newWebSocketRpcSession(server, localMain, options);
+  const transport = new GuardedWebSocketTransport(server, options?.getHumanSessionGuard);
+  const stub = new RpcSession(transport, localMain, options).getRemoteMain();
 
   // -- ADDED FOR GADGETS --
   if (options?.abortSignal) {
