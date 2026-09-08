@@ -853,6 +853,60 @@ export const MAX_SITE_LOGO_BYTES = 256 * 1024;
 /** Maximum width or height of an admin-uploaded site logo in pixels. */
 export const MAX_SITE_LOGO_DIMENSION = 512;
 
+/** Result returned after an audited administrative mutation is durably confirmed. */
+export type AdminMutationReceipt = {
+  /** Stable identifier for this mutation, preserved when its idempotency key is retried. */
+  mutationId: string;
+  /** Monotonic version of the deployment policy after the mutation. */
+  policyVersion: number;
+  /** Server-side instant at which the mutation and its durable audit outbox were committed. */
+  confirmedAt: string;
+};
+
+/** A bounded, non-sensitive description of one field changed by an administrative mutation. */
+export type AdminAuditChange = {
+  /** Stable field name from the administrative resource schema. */
+  field: "signupsEnabled";
+  /** Value before the mutation. */
+  before: boolean;
+  /** Value after the mutation. */
+  after: boolean;
+};
+
+/** A durable local audit event for a deployment administrative mutation. */
+export type AdminAuditEvent = {
+  /** Stable event identifier, preserved across delivery retries. */
+  eventId: string;
+  /** Server-side instant at which the mutation and audit outbox were committed. */
+  occurredAt: string;
+  /** Canonical organization identifier assigned by the deployment directory. */
+  tenantId: string;
+  /** Canonical directory user identifier resolved from the authenticated OS account. */
+  actorUserId: string;
+  /** Optional executor principal for future product adapters; absent for local OS administration. */
+  executorPrincipalId?: string;
+  /** Stable kind of resource affected by the event. */
+  resourceType: "adminConfig";
+  /** Backend-owned identifier of the affected OS installation. */
+  resourceId: string;
+  /** Stable administrative operation name. */
+  action: "setSignupsEnabled";
+  /** Policy version before the mutation. */
+  beforeVersion: number;
+  /** Policy version after the mutation. */
+  afterVersion: number;
+  /** Outcome of the durably committed mutation. */
+  result: "succeeded";
+  /** Stable reason describing the outcome without carrying private content. */
+  reasonCode: "ADMIN_CONFIG_UPDATED";
+  /** Backend-generated identifier for correlating this event with its mutation receipt. */
+  correlationId: string;
+  /** Caller-generated operation key used only for idempotent retry detection. */
+  idempotencyKey: string;
+  /** Bounded change data; arbitrary patches and private administrative text are never stored here. */
+  change: AdminAuditChange;
+};
+
 /** All admin-managed deployment settings, returned by AdminApi.getSettings() for the admin UI. */
 export type AdminSettingsView = {
   /** Whether new account signups are allowed. */
@@ -921,16 +975,26 @@ export type AdminFormat = {
 /**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions, and
- * which gatekeeper connectors/resources are offered — NOT authentication config (that's env-var
- * driven). Each setter throws on invalid input.
+ * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
+ * local administrative audit history, and which gatekeeper connectors/resources are offered — NOT
+ * authentication config (that's env-var driven). Each setter throws on invalid input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
 
-  /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
-  setSignupsEnabled(enabled: boolean): Promise<void>;
+  /**
+   * Enable or disable new account signups. Existing users can still log in while signups are closed.
+   * `idempotencyKey` must be reused when retrying the same operation; a retry returns the original
+   * receipt without applying the change or recording the event again.
+   */
+  setSignupsEnabled(enabled: boolean, idempotencyKey: string): Promise<AdminMutationReceipt>;
+
+  /**
+   * Return the newest local administrative audit events for this deployment's organization. The
+   * admin capability supplies authorization and tenant scope; callers cannot select another tenant.
+   */
+  listAuditEvents(limit?: number): Promise<AdminAuditEvent[]>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.

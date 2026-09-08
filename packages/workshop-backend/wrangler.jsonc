@@ -56,6 +56,11 @@
       // login back to the waiting browser.
       "tag": "v2",
       "new_sqlite_classes": [ "PendingLogin" ]
+    },
+    {
+      // Single-tenant organization identity and durable local administrative audit history.
+      "tag": "v3",
+      "new_sqlite_classes": [ "OrganizationDirectoryDurableObject" ]
     }
   ],
 

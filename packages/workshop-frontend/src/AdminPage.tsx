@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react'
 import { RpcStub } from 'capnweb'
 import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
-import { Hexagon, ShieldWarning, UserPlus } from '@phosphor-icons/react'
+import { ClockCounterClockwise, Hexagon, ShieldWarning, UserPlus } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
@@ -61,6 +61,14 @@ export default function AdminPage() {
   // Whether new account signups are allowed.
   const [signupsEnabled, setSignupsEnabled] = useState(true)
   const [savingSignups, setSavingSignups] = useState(false)
+  // Preserve the operation key after an uncertain failure so an explicit retry cannot duplicate the
+  // administrative change or its event.
+  const pendingSignupMutation = useRef<{ enabled: boolean; idempotencyKey: string } | null>(null)
+
+  // Local administrative audit history is fetched only when its tab is opened.
+  const [auditEvents, setAuditEvents] = useState<AdminAuditEvent[]>([])
+  const [loadingAudit, setLoadingAudit] = useState(false)
+  const [auditLoadError, setAuditLoadError] = useState(false)
 
   // Gatekeeper resource config, and the set of resource keys ("vendorId\u0000urlPattern") busy toggling.
   const [resourceVendors, setResourceVendors] = useState<AdminResourceVendor[]>([])
@@ -243,16 +251,42 @@ export default function AdminPage() {
     if (!admin) return
     setSavingSignups(true)
     setSignupsEnabled(enabled) // optimistic
+    const pending = pendingSignupMutation.current
+    const mutation = pending?.enabled === enabled
+      ? pending
+      : { enabled, idempotencyKey: crypto.randomUUID() }
+    pendingSignupMutation.current = mutation
     try {
-      await admin.api.setSignupsEnabled(enabled)
+      await admin.api.setSignupsEnabled(enabled, mutation.idempotencyKey)
+      if (pendingSignupMutation.current === mutation) pendingSignupMutation.current = null
     } catch (err) {
-      setSignupsEnabled(!enabled) // revert
+      setSignupsEnabled(!enabled) // revert; retrying this target reuses the same operation key
       const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
       toasts.add({ title: message, variant: 'error' })
     } finally {
       setSavingSignups(false)
     }
   }
+
+  const loadAuditEvents = async () => {
+    if (!admin) return
+    setLoadingAudit(true)
+    setAuditLoadError(false)
+    try {
+      const events = await admin.api.listAuditEvents()
+      setAuditEvents([...events])
+      events[Symbol.dispose]?.()
+    } catch (err) {
+      console.error('Failed to load administrative audit history:', err)
+      setAuditLoadError(true)
+    } finally {
+      setLoadingAudit(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === 'audit' && admin) void loadAuditEvents()
+  }, [activeTab, admin])
 
   const handleSaveSiteName = async () => {
     if (!admin) return
@@ -364,6 +398,7 @@ export default function AdminPage() {
           { value: 'gatekeepers', label: t('adminArea.tabs.gatekeepers') },
           { value: 'formats', label: t('adminArea.tabs.formats') },
           { value: 'access', label: t('adminArea.tabs.access') },
+          { value: 'audit', label: t('adminArea.tabs.audit') },
         ]}
       />
 
@@ -374,6 +409,58 @@ export default function AdminPage() {
           formats={formats}
           onChanged={async () => { setFormats((await admin.api.getSettings()).formats) }}
         />
+      )}
+
+      {/* Local administrative audit history */}
+      {activeTab === 'audit' && (
+        <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+          <div className="flex items-start justify-between gap-4 mb-5">
+            <div>
+              <h2 className="text-lg font-semibold text-kumo-strong mb-1">{t('adminArea.audit.title')}</h2>
+              <p className="text-sm text-kumo-subtle">{t('adminArea.audit.description')}</p>
+            </div>
+            <Button variant="secondary" size="sm" onClick={loadAuditEvents} loading={loadingAudit}>
+              {t('adminArea.audit.refresh')}
+            </Button>
+          </div>
+
+          {auditLoadError && (
+            <p className="text-sm text-kumo-danger">{t('adminArea.audit.loadError')}</p>
+          )}
+          {!auditLoadError && loadingAudit && auditEvents.length === 0 && (
+            <p className="text-sm text-kumo-subtle">{t('adminArea.audit.loading')}</p>
+          )}
+          {!auditLoadError && !loadingAudit && auditEvents.length === 0 && (
+            <p className="text-sm text-kumo-subtle">{t('adminArea.audit.empty')}</p>
+          )}
+          <div className="space-y-3">
+            {auditEvents.map((event) => (
+              <article key={event.eventId} className="rounded-lg border border-kumo-line bg-kumo-base p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-kumo-strong">
+                    <ClockCounterClockwise size={17} className="text-kumo-subtle" />
+                    {t('adminArea.audit.actions.setSignupsEnabled')}
+                  </div>
+                  <time className="text-xs text-kumo-subtle" dateTime={event.occurredAt}>
+                    {event.occurredAt}
+                  </time>
+                </div>
+                <p className="mt-2 text-sm text-kumo-default">
+                  {t('adminArea.audit.change', {
+                    before: event.change.before ? t('adminArea.audit.enabled') : t('adminArea.audit.disabled'),
+                    after: event.change.after ? t('adminArea.audit.enabled') : t('adminArea.audit.disabled'),
+                  })}
+                </p>
+                <dl className="mt-3 grid gap-2 text-xs text-kumo-subtle sm:grid-cols-2">
+                  <div><dt className="font-medium">{t('adminArea.audit.actor')}</dt><dd className="break-all">{event.actorUserId}</dd></div>
+                  <div><dt className="font-medium">{t('adminArea.audit.tenant')}</dt><dd className="break-all">{event.tenantId}</dd></div>
+                  <div><dt className="font-medium">{t('adminArea.audit.result')}</dt><dd>{t('adminArea.audit.succeeded')}</dd></div>
+                  <div><dt className="font-medium">{t('adminArea.audit.eventId')}</dt><dd className="break-all">{event.eventId}</dd></div>
+                </dl>
+              </article>
+            ))}
+          </div>
+        </div>
       )}
 
       {/* Sign-ups */}
