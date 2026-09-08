@@ -31,6 +31,13 @@ OS is a public OAuth client using Authorization Code with PKCE S256 and scopes
 central Supabase SDK session uses the `scaleos-central-auth` storage key. When refresh is absent or
 silent renewal fails, OS clears its app session and returns to the central login.
 
+The root route owns the central authentication lifecycle. Blueprint pages reuse its auth context
+instead of authenticating the same RPC socket again. Callback processing is shared while in flight;
+canceled React effects cannot install a capability or remove a newer OIDC session. Reloading the
+Admin or blueprint page preserves a valid app session. RPC dependency failures do not erase that
+OIDC session; invalid authentication still clears it. Cleanup disposes the old capability when the
+socket changes or its owning effect unmounts.
+
 The backend accepts only an access token issued for `AUTH_OS_CLIENT_ID`. It verifies the configured
 issuer, ES256 signature through remote JWKS, `aud=authenticated`, expiry, UUID subject, and exact
 `client_id`. Invalid credentials are `UNAUTHENTICATED`; unavailable or malformed provider/JWKS
@@ -124,6 +131,15 @@ bootstrap/onboarding, and entry into the OS home. Reusing the same central brows
 allowed the Vault entry flow to recover directory identity without asking for a second password.
 The backend, frontend, and Context typechecks passed; the backend unit suite passed 534 tests, the
 frontend suite passed 306 tests, and the focused process-tree tests passed in the runtime image.
+
+Later that day, Ennio confirmed successful invitation e-mail/recovery, administrator role transfer,
+denial of administrator self-deactivation, and another user's disable/reactivate cycle with stable
+identity and blocked access while disabled. These are user-reported functional results. The
+supervisor reproduced a session loss on Admin reload, then verified the focused frontend fix with
+real central login, Admin reload, authenticated blueprint navigation and blueprint reload. The
+session remained authenticated and no authentication error was observed in those exercised
+transitions. Independent review approved the fix; the 10 existing focused frontend tests and
+frontend typecheck passed. Refresh/expiry integration remains scoped to T08.
 
 This T03 increment does not implement T04 authorization policies, connector-grant cleanup, a
 central audit exporter, or immediate push revocation. Directory status and role are rechecked at
