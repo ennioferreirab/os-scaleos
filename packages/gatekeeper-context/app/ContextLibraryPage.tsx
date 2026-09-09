@@ -1331,6 +1331,8 @@ function CollectionSharingModal({
 }) {
   const context = useContextApi();
   const toasts = useKumoToastManager();
+  const toastsRef = useRef(toasts);
+  toastsRef.current = toasts;
   const { presenting, onOpenChangeComplete } = usePresentWhileOpen(open);
   const [targets, setTargets] = useState<DirectoryAudienceTargets | null>(null);
   const [grants, setGrants] = useState<CollectionGrant[]>([]);
@@ -1354,11 +1356,11 @@ function CollectionSharingModal({
     } catch {
       setTargets(null);
       setGrants([]);
-      toasts.add({ title: "Sharing is unavailable", variant: "error" });
+      toastsRef.current.add({ title: "Sharing is unavailable", variant: "error" });
     } finally {
       setLoading(false);
     }
-  }, [collectionId, context, open, toasts]);
+  }, [collectionId, context, open]);
 
   useEffect(() => {
     if (open) {
@@ -1394,10 +1396,10 @@ function CollectionSharingModal({
         mutationId,
       });
       mutationIds.current.delete(selectedMutationKey);
-      toasts.add({ title: "Access updated", variant: "success" });
+      toastsRef.current.add({ title: "Access updated", variant: "success" });
       await loadAccess();
     } catch {
-      toasts.add({ title: "Failed to update access", variant: "error" });
+      toastsRef.current.add({ title: "Failed to update access", variant: "error" });
     } finally {
       setSaving(false);
     }
@@ -1417,10 +1419,10 @@ function CollectionSharingModal({
         mutationId,
       });
       mutationIds.current.delete(mutationKey);
-      toasts.add({ title: "Access removed", variant: "success" });
+      toastsRef.current.add({ title: "Access removed", variant: "success" });
       await loadAccess();
     } catch {
-      toasts.add({ title: "Failed to remove access", variant: "error" });
+      toastsRef.current.add({ title: "Failed to remove access", variant: "error" });
     } finally {
       setSaving(false);
     }
