@@ -303,13 +303,19 @@ export type SlackConversationTypeFilter = SlackConversationKind;
 
 export class SlackApi {
   #getToken: () => Promise<string>;
+  #assertAppAccess?: () => Promise<void>;
   // Per-client cache for author and mention resolution.
   #userCache = new Map<string, SlackUser>();
   // Empty string records a failed workspace-host lookup.
   #host?: string;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, assertAppAccess?: () => Promise<void>) {
     this.#getToken = getToken;
+    this.#assertAppAccess = assertAppAccess;
+  }
+
+  withAppAccessGuard(assertAppAccess: () => Promise<void>): SlackApi {
+    return new SlackApi(this.#getToken, assertAppAccess);
   }
 
   // auth.test needs no extra scope, so permalink construction works for scoped tokens.
@@ -345,7 +351,9 @@ export class SlackApi {
     }
 
     for (let attempt = 0; ; attempt++) {
+      await this.#assertAppAccess?.();
       let token = await this.#getToken();
+      await this.#assertAppAccess?.();
       let response = await fetch(url.toString(), {
         headers: { "Authorization": `Bearer ${token}` },
       });

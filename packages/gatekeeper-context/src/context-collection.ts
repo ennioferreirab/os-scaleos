@@ -1,16 +1,19 @@
-// One collection's metadata and documents. Metadata changes update the private owner library or the
-// public domain registry.
+// One collection's metadata and documents. Metadata changes update the all-collection registry and
+// owner-summary projection; the Collection DO remains the authorization authority.
 
 import { DurableObject } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
+import type {
+  Audience, ContextAuthorityCapability,
+} from "@gadgets/workshop-shared/gatekeeper";
 import {
-  ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
-  ContextDocument, ContextDocumentSummary,
-  ContextGitTokenCreateResult, ContextGitTokenList,
+  CollectionGrant, ContextAccessEvent, ContextCollectionContent, ContextCollectionMetadata,
+  ContextCollectionRole, ContextCollectionSummary, ContextCollectionVisibility,
+  ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
+  ContextGrantRole, ContextGrantTargetType, ContextMutationReceipt, EnabledCollectionInfo,
   DEFAULT_DOCUMENT_CONTENT_TYPE, DEFAULT_GIT_BRANCH, MAX_DOCUMENT_BODY_BYTES,
   contentTypeFromPath, isTextContentType, VENDOR_ID,
 } from "./context-types.js";
-import { metadataToSummary } from "./collection-kv.js";
 import { domainName } from "./domain.js";
 import {
   readArtifactRepoDocuments, type ArtifactContextDocument,
@@ -38,6 +41,57 @@ const GIT_BRANCH_RE = /^(?!\/)(?!.*\/$)[A-Za-z0-9/._-]{1,255}$/;
 // Older collections build this path list on first use. Increase the version when parsing rules
 // change.
 const SKILL_INDEX_VERSION = 1;
+
+const CONTEXT_NOT_FOUND = "NOT_FOUND";
+const CONTEXT_CONFLICT = "CONFLICT";
+const CONTEXT_FORBIDDEN = "FORBIDDEN";
+const CONTEXT_INVALID_INPUT = "INVALID_INPUT";
+const MAX_ACCESS_EVENT_LIMIT = 200;
+
+
+function codedError(code: string, message: string): Error & {code: string} {
+  return Object.assign(new Error(message), {code});
+}
+
+function notFoundError(): Error & {code: string} {
+  return codedError(CONTEXT_NOT_FOUND, "Collection not found or you don't have access.");
+}
+
+function conflictError(message: string): Error & {code: string} {
+  return codedError(CONTEXT_CONFLICT, message);
+}
+
+function forbiddenError(message = "Collection access denied."): Error & {code: string} {
+  return codedError(CONTEXT_FORBIDDEN, message);
+}
+
+function invalidInputError(message: string): Error & {code: string} {
+  return codedError(CONTEXT_INVALID_INPUT, message);
+}
+function requireAuthority(authority: ContextAuthorityCapability): ContextAuthorityCapability {
+  if (!authority) throw forbiddenError("Context authority is required.");
+  return authority;
+}
+function grantKey(targetType: ContextGrantTargetType, targetId: string): string {
+  return `${targetType}:${targetId}`;
+}
+
+
+function eventId(collectionId: string, action: string, mutationId: string): string {
+  return `${collectionId}:${action}:${mutationId}`;
+}
+
+function metadataToSummary(metadata: ContextCollectionMetadata): ContextCollectionSummary {
+  return {
+    id: metadata.id,
+    title: metadata.title,
+    description: metadata.description,
+    icon: metadata.icon,
+    visibility: "private",
+    documentCount: metadata.documentCount,
+    lastUpdated: metadata.lastUpdated,
+  };
+}
 
 // Validate a document path before using it as a storage key.
 function validateDocumentPath(path: string): void {
@@ -103,15 +157,24 @@ type StoredContextCollectionMetadata = Omit<ContextCollectionMetadata, "content"
 function makeContextCollectionStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
-      documents: collection<ContextRecord>()({ primaryKey: "path" }),
+      documents: collection<ContextRecord>()({primaryKey: "path"}),
       // Data needed to list skills without loading document bodies.
-      skillIndex: collection<SkillIndexEntry>()({ primaryKey: "path" }),
+      skillIndex: collection<SkillIndexEntry>()({primaryKey: "path"}),
+      accessGrants: collection<CollectionGrant>()({primaryKey: "key"}),
+      accessMutations: collection<{
+        key: string;
+        requestHash: string;
+        receipt: ContextMutationReceipt;
+      }>()({primaryKey: "key"}),
+      accessEvents: collection<ContextAccessEvent>()({primaryKey: "eventId"}),
     },
     singletons: {
       // Sharing domain for cross-DO references.
       sharingDomain: "",
-      // Private owner account id; empty for public collections.
+      // Legacy connection index only. It is never used for human authorization.
       ownerAccountId: "",
+      ownerSubject: "",
+      accessVersion: 0,
       metadata: <StoredContextCollectionMetadata>{
         id: "",
         title: "",
@@ -120,13 +183,12 @@ function makeContextCollectionStorage(storage: DurableObjectStorage) {
         created: new Date(0),
         lastUpdated: new Date(0),
         documentCount: 0,
-        content: { source: "web" },
+        content: {source: "web"},
       },
       skillIndexVersion: 0,
     },
   });
 }
-
 type ContextCollectionStorage = ReturnType<typeof makeContextCollectionStorage>;
 
 export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env> {
@@ -140,12 +202,13 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     this.storage = makeContextCollectionStorage(ctx.storage);
   }
 
-  // Sharing domain for all cross-DO/KV references.
+  // Sharing domain for all cross-DO references.
   #domain(): string {
     return this.storage.sharingDomain.get();
   }
 
-  // The owner's UserLibraryDurableObject (private collections only), within this collection's domain.
+  // The UserLibrary projection remains routed by the stable Context connection account. It is not
+  // an identity or authorization source; ownerSubject below is the sole human owner.
   #ownerLibrary() {
     let ns = this.ctx.exports.UserLibraryDurableObject;
     return ns.get(ns.idFromName(domainName(this.#domain(), this.storage.ownerAccountId.get())));
@@ -182,15 +245,117 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     return created.remote;
   }
 
+  #metadata(): ContextCollectionMetadata {
+    let meta = this.storage.metadata.get();
+    // Old storage records won't have `content` set, so default those values at the API boundary.
+    return {...meta, content: meta.content ?? {source: "web"}};
+  }
+
+  #requireMetadata(): ContextCollectionMetadata {
+    let metadata = this.#metadata();
+    if (!metadata.id) throw notFoundError();
+    return metadata;
+  }
+
+  async #actor(authority: ContextAuthorityCapability): Promise<{
+    subject: string; isOrgAdmin: boolean;
+  }> {
+    authority = requireAuthority(authority);
+    await authority.assertAppAccess();
+    let actor = await authority.getActor();
+    if (!actor || typeof actor.subject !== "string" || !actor.subject) {
+      throw forbiddenError("Context authority returned no Subject.");
+    }
+    return actor;
+  }
+  async #resolveRoleForActor(
+      authority: ContextAuthorityCapability, actor: {subject: string; isOrgAdmin: boolean}):
+      Promise<{role: ContextCollectionRole; sources: string[]}> {
+    this.#requireMetadata();
+    let ownerSubject = this.storage.ownerSubject.get();
+    if (ownerSubject && ownerSubject === actor.subject) {
+      return {role: "owner", sources: ["owner"]};
+    }
+
+    let editorAudience: Audience = {everyone: false, userIds: [], groupIds: []};
+    let readerAudience: Audience = {everyone: false, userIds: [], groupIds: []};
+    for (let grant of this.storage.accessGrants.list()) {
+      let audience = grant.role === "editor" ? editorAudience : readerAudience;
+      if (grant.targetType === "everyone") audience.everyone = true;
+      else if (grant.targetType === "user") audience.userIds.push(grant.targetId);
+      else audience.groupIds.push(grant.targetId);
+    }
+
+    if (editorAudience.everyone || editorAudience.userIds.length > 0 ||
+        editorAudience.groupIds.length > 0) {
+      let resolved = await authority.resolveAudience(editorAudience);
+      if (resolved.allowed) {
+        return {role: "editor", sources: [...new Set(resolved.sources)].toSorted()};
+      }
+    }
+    if (readerAudience.everyone || readerAudience.userIds.length > 0 ||
+        readerAudience.groupIds.length > 0) {
+      let resolved = await authority.resolveAudience(readerAudience);
+      if (resolved.allowed) {
+        return {role: "reader", sources: [...new Set(resolved.sources)].toSorted()};
+      }
+    }
+    return {role: "none", sources: []};
+  }
+
+  async resolveCollectionRole(authority: ContextAuthorityCapability): Promise<{
+    role: ContextCollectionRole; sources: string[];
+  }> {
+    let trustedAuthority = requireAuthority(authority);
+    let actor = await this.#actor(trustedAuthority);
+    return this.#resolveRoleForActor(trustedAuthority, actor);
+  }
+  async getAuthorizedSummary(
+      authority: ContextAuthorityCapability): Promise<EnabledCollectionInfo | null> {
+    let access = await this.resolveCollectionRole(authority);
+    if (access.role === "none") return null;
+    let metadata = this.#requireMetadata();
+    return {
+      id: metadata.id,
+      title: metadata.title,
+      description: metadata.description,
+      icon: metadata.icon,
+      role: access.role,
+      sources: access.sources,
+      lastUpdated: metadata.lastUpdated,
+    };
+  }
+
+  async getMetadata(authority: ContextAuthorityCapability): Promise<ContextCollectionMetadata> {
+    await this.#assertRole(authority, "reader");
+    return this.#requireMetadata();
+  }
+
   /**
-   * Initialize a new collection. Private collections pass an owner; public collections pass "".
-   * Rejects re-initialization so a (vanishingly unlikely) id reuse can't clobber existing content.
+   * Initialize a private collection from a trusted authority. Subject and ownership are obtained
+   * from the authority, never accepted as caller-provided identity.
    */
-  async initialize(metadata: ContextCollectionMetadata, sharingDomain: string, ownerAccountId: string): Promise<ContextCollectionMetadata> {
-    if (this.getMetadata().id) {
-      throw new Error("Collection already exists.");
+  async initialize(
+      metadata: ContextCollectionMetadata, sharingDomain: string,
+      authority: ContextAuthorityCapability, ownerAccountId: string): Promise<ContextCollectionMetadata> {
+    let actor = await this.#actor(authority);
+    if (metadata.visibility !== "private") {
+      throw invalidInputError("Context collections must be private.");
+    }
+    let existing = this.#metadata();
+    if (existing.id) {
+      if (this.storage.ownerSubject.get() !== actor.subject ||
+          this.storage.ownerAccountId.get() !== ownerAccountId ||
+          existing.title !== metadata.title ||
+          existing.description !== metadata.description ||
+          existing.icon !== metadata.icon ||
+          existing.content.source !== metadata.content.source) {
+        throw conflictError("Collection already exists with a different owner or payload.");
+      }
+      return existing;
     }
     this.storage.sharingDomain.put(sharingDomain);
+    this.storage.ownerSubject.put(actor.subject);
     this.storage.ownerAccountId.put(ownerAccountId);
     if (metadata.content.source === "git") {
       metadata.content = {
@@ -203,14 +368,315 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     this.storage.metadata.put(metadata);
     // A new collection starts with an up-to-date empty path list.
     this.storage.skillIndexVersion.put(SKILL_INDEX_VERSION);
+    this.storage.accessVersion.put(0);
     return metadata;
   }
 
-  getMetadata(): ContextCollectionMetadata {
-    let meta = this.storage.metadata.get();
-    // Old storage records won't have `content` set, so we need to default these values in
-    // at the API layer.
-    return { ...meta, content: meta.content ?? { source: "web" } };
+  /**
+   * One-time migration of a legacy private collection. The account id is only a trusted connection
+   * index supplied by ContextAccount; the new owner is always the current authority Subject.
+   */
+  async claimLegacyOwner(
+      authority: ContextAuthorityCapability, accountId: string): Promise<boolean> {
+    let actor = await this.#actor(authority);
+    let metadata = this.#requireMetadata();
+    if (this.storage.ownerSubject.get()) {
+      return this.storage.ownerSubject.get() === actor.subject;
+    }
+    if (metadata.visibility !== "private" || !this.storage.ownerAccountId.get() ||
+        this.storage.ownerAccountId.get() !== accountId) {
+      return false;
+    }
+    this.storage.ownerSubject.put(actor.subject);
+    return true;
+  }
+
+  async #assertRole(
+      authority: ContextAuthorityCapability, required: "reader" | "editor" | "owner"): Promise<{
+    role: ContextCollectionRole; sources: string[];
+  }> {
+    let trustedAuthority = requireAuthority(authority);
+    let actor = await this.#actor(trustedAuthority);
+    let access = await this.#resolveRoleForActor(trustedAuthority, actor);
+    if (access.role === "none") throw notFoundError();
+    let rank: Record<ContextCollectionRole, number> = {
+      none: 0, reader: 1, editor: 2, owner: 3,
+    };
+    if (rank[access.role] < rank[required]) {
+      throw forbiddenError("The current role cannot perform this collection operation.");
+    }
+    return access;
+  }
+
+  async #assertOwner(authority: ContextAuthorityCapability): Promise<{
+    actor: {subject: string; isOrgAdmin: boolean};
+    access: {role: ContextCollectionRole; sources: string[]};
+  }> {
+    let trustedAuthority = requireAuthority(authority);
+    let actor = await this.#actor(trustedAuthority);
+    let access = await this.#resolveRoleForActor(trustedAuthority, actor);
+    if (access.role === "none") throw notFoundError();
+    if (access.role !== "owner") {
+      throw forbiddenError("Only the collection owner may perform this operation.");
+    }
+    return {actor, access};
+  }
+
+  async #validateAccessTarget(
+      authority: ContextAuthorityCapability,
+      targetType: ContextGrantTargetType,
+      targetId: string,
+      role: ContextGrantRole,
+  ): Promise<void> {
+    if (targetType === "everyone") {
+      if (targetId !== "" || role !== "reader") {
+        throw invalidInputError("Everyone grants require an empty targetId and reader role.");
+      }
+      return;
+    }
+    if (typeof targetId !== "string" || targetId.length === 0) {
+      throw invalidInputError("A user or group targetId is required.");
+    }
+    let targets = await requireAuthority(authority).listAudienceTargets();
+    if (targetType === "user") {
+      if (!targets.users.some(target => target.userId === targetId)) {
+        throw invalidInputError("Access target must be an active directory user.");
+      }
+      return;
+    }
+    if (targetType === "group") {
+      if (!targets.groups.some(target => target.groupId === targetId)) {
+        throw invalidInputError("Access target must be an active directory group.");
+      }
+      return;
+    }
+    throw invalidInputError("Unsupported access target type.");
+  }
+
+  async listAccess(authority: ContextAuthorityCapability): Promise<CollectionGrant[]> {
+    await this.#assertOwner(authority);
+    return [...this.storage.accessGrants.list()]
+        .toSorted((left, right) => left.key.localeCompare(right.key));
+  }
+
+  async setAccess(input: {
+    authority: ContextAuthorityCapability;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    role: ContextGrantRole;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt> {
+    let authority = requireAuthority(input.authority);
+    let owner = await this.#assertOwner(authority);
+    if (typeof input.mutationId !== "string" || !input.mutationId) {
+      throw invalidInputError("mutationId is required.");
+    }
+    if (input.targetType !== "everyone" && input.targetType !== "user" &&
+        input.targetType !== "group") {
+      throw invalidInputError("Unsupported access target type.");
+    }
+    if (input.role !== "reader" && input.role !== "editor") {
+      throw invalidInputError("Unsupported access role.");
+    }
+
+    // The mutation identity is actor + id. Include the operation in the payload hash so an id
+    // cannot be reused for a different operation.
+    let key = `${owner.actor.subject}\u0000${input.mutationId}`;
+    let requestHash = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(JSON.stringify({
+          action: "setAccess",
+          targetType: input.targetType,
+          targetId: input.targetId,
+          role: input.role,
+        }))).then(bytes => new Uint8Array(bytes).toHex());
+    let completed = this.storage.accessMutations.get(key);
+    if (completed) {
+      if (completed.requestHash !== requestHash) {
+        throw conflictError("mutationId was already used with a different access payload.");
+      }
+      return completed.receipt;
+    }
+
+    // Validate only new mutations. A replay must return its original receipt even if a referenced
+    // directory group has since been deleted or disabled.
+    await this.#validateAccessTarget(authority, input.targetType, input.targetId, input.role);
+    let collectionId = this.#requireMetadata().id;
+    let targetKey = grantKey(input.targetType, input.targetId);
+    let receipt!: ContextMutationReceipt;
+    let replay: ContextMutationReceipt | undefined;
+    this.storage.transaction(() => {
+      let raced = this.storage.accessMutations.get(key);
+      if (raced) {
+        if (raced.requestHash !== requestHash) {
+          throw conflictError("mutationId was already used with a different access payload.");
+        }
+        replay = raced.receipt;
+        return;
+      }
+      let now = new Date().toISOString();
+      let accessVersion = this.storage.accessVersion.get() + 1;
+      let previous = this.storage.accessGrants.get(targetKey);
+      receipt = {
+        version: 1,
+        accessVersion,
+        mutationId: input.mutationId,
+        actorSubject: owner.actor.subject,
+        action: "setAccess",
+        collectionId,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        role: input.role,
+        confirmedAt: now,
+      };
+      let event: ContextAccessEvent = {
+        version: 1,
+        accessVersion,
+        eventId: eventId(collectionId, "setAccess", input.mutationId),
+        collectionId,
+        mutationId: input.mutationId,
+        actorSubject: owner.actor.subject,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        action: "setAccess",
+        role: input.role,
+        occurredAt: now,
+        receipt,
+      };
+      this.storage.accessGrants.put({
+        key: targetKey,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        role: input.role,
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      });
+      this.storage.accessVersion.put(accessVersion);
+      this.storage.accessMutations.put({key, requestHash, receipt});
+      this.storage.accessEvents.put(event);
+    });
+    return replay ?? receipt;
+  }
+
+  async removeAccess(input: {
+    authority: ContextAuthorityCapability;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt> {
+    let authority = requireAuthority(input.authority);
+    let owner = await this.#assertOwner(authority);
+    if (typeof input.mutationId !== "string" || !input.mutationId) {
+      throw invalidInputError("mutationId is required.");
+    }
+    if (input.targetType !== "everyone" && input.targetType !== "user" &&
+        input.targetType !== "group") {
+      throw invalidInputError("Unsupported access target type.");
+    }
+    if (input.targetType === "everyone" && input.targetId !== "") {
+      throw invalidInputError("Everyone grants require an empty targetId.");
+    }
+    if (input.targetType !== "everyone" &&
+        (typeof input.targetId !== "string" || !input.targetId)) {
+      throw invalidInputError("A user or group targetId is required.");
+    }
+
+    let key = `${owner.actor.subject}\u0000${input.mutationId}`;
+    let requestHash = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(JSON.stringify({
+          action: "removeAccess",
+          targetType: input.targetType,
+          targetId: input.targetId,
+        }))).then(bytes => new Uint8Array(bytes).toHex());
+    let completed = this.storage.accessMutations.get(key);
+    if (completed) {
+      if (completed.requestHash !== requestHash) {
+        throw conflictError("mutationId was already used with a different access payload.");
+      }
+      return completed.receipt;
+    }
+
+    let collectionId = this.#requireMetadata().id;
+    let targetKey = grantKey(input.targetType, input.targetId);
+    let receipt!: ContextMutationReceipt;
+    let replay: ContextMutationReceipt | undefined;
+    this.storage.transaction(() => {
+      let raced = this.storage.accessMutations.get(key);
+      if (raced) {
+        if (raced.requestHash !== requestHash) {
+          throw conflictError("mutationId was already used with a different access payload.");
+        }
+        replay = raced.receipt;
+        return;
+      }
+      let now = new Date().toISOString();
+      let accessVersion = this.storage.accessVersion.get() + 1;
+      let previous = this.storage.accessGrants.get(targetKey);
+      receipt = {
+        version: 1,
+        accessVersion,
+        mutationId: input.mutationId,
+        actorSubject: owner.actor.subject,
+        action: "removeAccess",
+        collectionId,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        ...(previous ? {role: previous.role} : {}),
+        confirmedAt: now,
+      };
+      let event: ContextAccessEvent = {
+        version: 1,
+        accessVersion,
+        eventId: eventId(collectionId, "removeAccess", input.mutationId),
+        collectionId,
+        mutationId: input.mutationId,
+        actorSubject: owner.actor.subject,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        action: "removeAccess",
+        ...(previous ? {role: previous.role} : {}),
+        occurredAt: now,
+        receipt,
+      };
+      this.storage.accessGrants.delete(targetKey);
+      this.storage.accessVersion.put(accessVersion);
+      this.storage.accessMutations.put({key, requestHash, receipt});
+      this.storage.accessEvents.put(event);
+    });
+    return replay ?? receipt;
+  }
+
+  async getMyAccess(authority: ContextAuthorityCapability): Promise<{
+    role: Exclude<ContextCollectionRole, "none">; sources: string[];
+  }> {
+    let access = await this.resolveCollectionRole(authority);
+    if (access.role === "none") throw notFoundError();
+    return access as {
+      role: Exclude<ContextCollectionRole, "none">; sources: string[];
+    };
+  }
+
+  async listAccessEvents(
+      authority: ContextAuthorityCapability,
+      limit = MAX_ACCESS_EVENT_LIMIT): Promise<ContextAccessEvent[]> {
+    let trustedAuthority = requireAuthority(authority);
+    let actor = await this.#actor(trustedAuthority);
+    if (!actor.isOrgAdmin) {
+      let access = await this.#resolveRoleForActor(trustedAuthority, actor);
+      if (access.role === "none") throw notFoundError();
+      if (access.role !== "owner") {
+        throw forbiddenError("Only the collection owner or an organization admin may view ACL events.");
+      }
+    }
+    let bounded = Number.isFinite(limit)
+      ? Math.max(1, Math.min(MAX_ACCESS_EVENT_LIMIT, Math.floor(limit)))
+      : MAX_ACCESS_EVENT_LIMIT;
+    return [...this.storage.accessEvents.list()]
+        .toSorted((left, right) =>
+          right.occurredAt.localeCompare(left.occurredAt) ||
+          right.eventId.localeCompare(left.eventId))
+        .slice(0, bounded);
   }
 
   #parseAgentSkill(record: ContextRecord) {
@@ -286,19 +752,22 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     });
   }
 
-  listAgentSkills(): SkillIndexEntry[] {
+  async listAgentSkills(authority: ContextAuthorityCapability): Promise<SkillIndexEntry[]> {
+    await this.#assertRole(authority, "reader");
     if (this.#isGitBased()) this.#startBackgroundArtifactRefresh();
     this.#ensureSkillIndex();
     return [...this.storage.skillIndex.list()];
   }
 
-  async updateMetadata(options: {
+  async updateMetadata(
+      authority: ContextAuthorityCapability, options: {
     title?: string;
     description?: string;
     icon?: string;
     branch?: string;
   }): Promise<void> {
-    let meta = this.getMetadata();
+    await this.#assertRole(authority, "owner");
+    let meta = this.#metadata();
     let changed = false;
 
     if (options.title !== undefined && options.title !== meta.title) { meta.title = options.title; changed = true; }
@@ -330,10 +799,12 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     }
   }
 
-  async listContextDocuments(prefix?: string): Promise<ContextDocumentSummary[]> {
+  async listContextDocuments(
+      authority: ContextAuthorityCapability, prefix?: string): Promise<ContextDocumentSummary[]> {
+    await this.#assertRole(authority, "reader");
     // Trigger git mirror revalidation in the background on reads.
     if (this.#isGitBased()) this.#startBackgroundArtifactRefresh();
-    let options = prefix ? { prefix } : undefined;
+    let options = prefix ? {prefix} : undefined;
     let result: ContextDocumentSummary[] = [];
     for (let record of this.storage.documents.list(options)) {
       let manifest = this.#parseAgentSkill(record);
@@ -350,7 +821,9 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   }
 
   /** Lenient read: bad/missing paths return null, not RPC errors. Mutations validate paths. */
-  async getContextDocument(path: string): Promise<ContextDocument | null> {
+  async getContextDocument(
+      authority: ContextAuthorityCapability, path: string): Promise<ContextDocument | null> {
+    await this.#assertRole(authority, "reader");
     // Trigger git mirror revalidation in the background on reads.
     if (this.#isGitBased()) this.#startBackgroundArtifactRefresh();
 
@@ -370,8 +843,9 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   }
 
   async putContextDocument(
-      path: string,
-      doc: { description: string; body: string; contentType?: string }): Promise<void> {
+      authority: ContextAuthorityCapability, path: string,
+      doc: {description: string; body: string; contentType?: string}): Promise<void> {
+    await this.#assertRole(authority, "editor");
     this.#assertWebWritable();
     validateDocumentPath(path);
     let contentType = doc.contentType || contentTypeFromPath(path);
@@ -380,7 +854,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       lastUpdated: new Date(),
     });
     let byteLength = record.body.byteLength + new TextEncoder().encode(
-      JSON.stringify({ ...record, body: "" }),
+      JSON.stringify({...record, body: ""}),
     ).byteLength;
     if (byteLength > MAX_DOCUMENT_BODY_BYTES) {
       throw new Error(`Document is too large (${byteLength} bytes; max ${MAX_DOCUMENT_BODY_BYTES}).`);
@@ -391,7 +865,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       // Use the file name from the path as the display name.
       this.#putDocument(record);
 
-      let meta = this.getMetadata();
+      let meta = this.#metadata();
       if (isNew) meta.documentCount++;
       meta.lastUpdated = record.lastUpdated;
       this.storage.metadata.put(meta);
@@ -399,7 +873,9 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     await this.#propagate();
   }
 
-  async deleteContextDocument(path: string): Promise<void> {
+  async deleteContextDocument(
+      authority: ContextAuthorityCapability, path: string): Promise<void> {
+    await this.#assertRole(authority, "editor");
     this.#assertWebWritable();
     // Mutations reject invalid paths; reads stay lenient.
     validateDocumentPath(path);
@@ -409,7 +885,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     this.storage.transaction(() => {
       this.#deleteDocument(path);
 
-      let meta = this.getMetadata();
+      let meta = this.#metadata();
       meta.documentCount = Math.max(0, meta.documentCount - 1);
       meta.lastUpdated = new Date();
       this.storage.metadata.put(meta);
@@ -417,7 +893,9 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     await this.#propagate();
   }
 
-  async moveContextDocument(from: string, to: string): Promise<void> {
+  async moveContextDocument(
+      authority: ContextAuthorityCapability, from: string, to: string): Promise<void> {
+    await this.#assertRole(authority, "editor");
     this.#assertWebWritable();
     validateDocumentPath(from);
     validateDocumentPath(to);
@@ -428,15 +906,15 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       throw new Error("Cannot move a folder into itself.");
     }
 
-    let moves: { record: ContextRecord; newPath: string }[] = [];
+    let moves: {record: ContextRecord; newPath: string}[] = [];
     let exact = this.storage.documents.get(from);
     if (exact) {
-      moves.push({ record: exact, newPath: to });
+      moves.push({record: exact, newPath: to});
     } else {
       let fromPrefix = from.endsWith("/") ? from : from + "/";
       let toPrefix = to.endsWith("/") ? to : to + "/";
-      for (let record of this.storage.documents.list({ prefix: fromPrefix })) {
-        moves.push({ record, newPath: toPrefix + record.path.slice(fromPrefix.length) });
+      for (let record of this.storage.documents.list({prefix: fromPrefix})) {
+        moves.push({record, newPath: toPrefix + record.path.slice(fromPrefix.length)});
       }
     }
 
@@ -468,7 +946,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         this.#putDocument(record);
       }
 
-      let meta = this.getMetadata();
+      let meta = this.#metadata();
       meta.lastUpdated = new Date();
       this.storage.metadata.put(meta);
     });
@@ -477,13 +955,16 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
 
   // --- Artifact-backed projection ---
 
-  async syncArtifactSource(): Promise<void> {
+  async syncArtifactSource(authority: ContextAuthorityCapability): Promise<void> {
+    await this.#assertRole(authority, "owner");
     if (!this.#isGitBased()) throw new Error("Collection is not git-based.");
     await this.#refreshArtifactSource();
   }
 
-  async createGitToken(): Promise<ContextGitTokenCreateResult> {
-    let meta = this.getMetadata();
+  async createGitToken(
+      authority: ContextAuthorityCapability): Promise<ContextGitTokenCreateResult> {
+    await this.#assertRole(authority, "owner");
+    let meta = this.#metadata();
     if (meta.content.source !== "git") throw new Error("Collection is not git-based.");
     let repo = await this.#artifacts().get(meta.id);
     let token = await repo.createToken("write", GIT_TOKEN_TTL_SECONDS);
@@ -494,9 +975,11 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     };
   }
 
-  async listGitTokens(): Promise<ContextGitTokenList> {
+  async listGitTokens(
+      authority: ContextAuthorityCapability): Promise<ContextGitTokenList> {
+    await this.#assertRole(authority, "owner");
     if (!this.#isGitBased()) throw new Error("Collection is not git-based.");
-    let meta = this.getMetadata();
+    let meta = this.#metadata();
     let repo = await this.#artifacts().get(meta.id);
     let result = await repo.listTokens();
     return {
@@ -512,27 +995,29 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     };
   }
 
-  async revokeGitToken(tokenId: string): Promise<boolean> {
+  async revokeGitToken(
+      authority: ContextAuthorityCapability, tokenId: string): Promise<boolean> {
+    await this.#assertRole(authority, "owner");
     if (!this.#isGitBased()) throw new Error("Collection is not git-based.");
-    let meta = this.getMetadata();
+    let meta = this.#metadata();
     let repo = await this.#artifacts().get(meta.id);
     return repo.revokeToken(tokenId);
   }
 
   #isGitBased(): boolean {
-    return this.getMetadata().content.source === "git";
+    return this.#metadata().content.source === "git";
   }
 
   #startBackgroundArtifactRefresh(): void {
     if (!this.env.ARTIFACTS) return;
-    let content = this.getMetadata().content;
+    let content = this.#metadata().content;
     if (content.source !== "git") return;
     if (Date.now() - content.lastRefreshedAt.getTime() < GIT_REFRESH_MIN_INTERVAL_MS) return;
 
     void this.#refreshArtifactSource().catch((err) => {
       logger.warn("failed to refresh git-based context collection in the background", {
         event: "context.collection.git.refresh.failed",
-        collectionId: this.getMetadata().id,
+        collectionId: this.#metadata().id,
         error: err,
       });
     });
@@ -558,7 +1043,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         this.#putDocument(doc);
       }
 
-      let meta = this.getMetadata();
+      let meta = this.#metadata();
       meta.documentCount = documents.length;
       meta.lastUpdated = new Date();
       if (meta.content.source !== "git") throw new Error("Collection must be git-based.");
@@ -576,7 +1061,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       }
       this.#clearSkillIndex();
 
-      let meta = this.getMetadata();
+      let meta = this.#metadata();
       meta.documentCount = 0;
       meta.lastUpdated = new Date();
       if (meta.content.source !== "git") throw new Error("Collection must be git-based.");
@@ -588,15 +1073,15 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   }
 
   async #loadArtifactSnapshot(): Promise<void> {
-    const meta = this.getMetadata();
+    const meta = this.#metadata();
     if (meta.content.source !== "git") throw new Error("Collection is not git-based.");
     const result = await readArtifactRepoDocuments(
         this.#artifacts(), meta.id, meta.content.remote, meta.content.branch, meta.content.commit);
     if (!result.changed) {
       // Nothing changed, just bump the refresh timestamp.
-      const latestMeta = this.getMetadata();
+      const latestMeta = this.#metadata();
       if (latestMeta.content.source !== "git") throw new Error("Collection is not git-based.");
-      latestMeta.content = { ...latestMeta.content, lastRefreshedAt: new Date() };
+      latestMeta.content = {...latestMeta.content, lastRefreshedAt: new Date()};
       this.storage.metadata.put(latestMeta);
       return;
     }
@@ -614,13 +1099,18 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   // --- Search ---
 
   /** Linear scan over one collection. Replace with an index if collection size makes it matter. */
-  async search(query: string, limit: number = 20): Promise<{ path: string; name: string; description: string; snippet?: string; score: number }[]> {
+  async search(
+      authority: ContextAuthorityCapability, query: string, limit: number = 20):
+      Promise<{path: string; name: string; description: string; snippet?: string; score: number}[]> {
+    await this.#assertRole(authority, "reader");
     if (this.#isGitBased()) this.#startBackgroundArtifactRefresh();
 
-    let tokens = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    let tokens = query.toLowerCase().split(/\s+/).filter(token => token.length > 0);
     if (tokens.length === 0) return [];
 
-    let results: { path: string; name: string; description: string; snippet?: string; score: number }[] = [];
+    let results: {
+      path: string; name: string; description: string; snippet?: string; score: number;
+    }[] = [];
 
     for (let record of this.storage.documents.list()) {
       let score = 0;
@@ -643,30 +1133,33 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
           if (!snippet) {
             let start = Math.max(0, bodyIdx - 40);
             let end = Math.min(body.length, bodyIdx + token.length + 80);
-            snippet = (start > 0 ? "..." : "") + body.slice(start, end) + (end < body.length ? "..." : "");
+            snippet = (start > 0 ? "..." : "") + body.slice(start, end) +
+              (end < body.length ? "..." : "");
           }
         }
       }
 
       if (score > 0) {
-        results.push({ path: record.path, name: record.name, description: record.description, snippet, score });
+        results.push({
+          path: record.path, name: record.name, description: record.description, snippet, score,
+        });
       }
     }
 
-    results.sort((a, b) => b.score - a.score);
+    results.sort((left, right) => right.score - left.score);
     return results.slice(0, limit);
   }
 
   // --- Deletion ---
 
-  async deleteSelf(): Promise<void> {
-    let meta = this.getMetadata();
+  async deleteSelf(authority: ContextAuthorityCapability): Promise<void> {
+    await this.#assertRole(authority, "owner");
+    let meta = this.#metadata();
     let id = meta.id;
 
     if (id) {
-      if (meta.visibility === "public") {
-        await this.#registry().removePublic(this.#domain(), id);
-      } else {
+      await this.#registry().removeCollection(id);
+      if (this.storage.ownerSubject.get()) {
         await this.#ownerLibrary().removeOwnedCollection(id);
       }
     }
@@ -684,31 +1177,15 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     await this.ctx.storage.deleteAll();
   }
 
-  /** Account revocation clears the whole user-library index separately; don't update it per item. */
-  async deleteForRevokedOwner(): Promise<void> {
-    let meta = this.getMetadata();
-    if (meta.content.source === "git" && meta.id && this.env.ARTIFACTS) {
-      await this.env.ARTIFACTS.delete(meta.id).catch((err) => {
-        logger.warn("failed to delete Artifacts repo while revoking context collection owner", {
-          event: "artifacts.repo.delete.for.revoked.owner.failed",
-          collectionId: meta.id,
-          error: err,
-        });
-      });
-    }
-    await this.ctx.storage.deleteAll();
-  }
 
   // --- Propagation ---
 
-  // Refresh this collection's denormalized summary in its index.
+  // Refresh this collection's denormalized summary in its all-collection registry and owner index.
   async #propagate(): Promise<void> {
-    let meta = this.getMetadata();
+    let meta = this.#metadata();
     let summary = metadataToSummary(meta);
-
-    if (meta.visibility === "public") {
-      await this.#registry().syncPublic(this.#domain(), summary);
-    } else {
+    await this.#registry().upsertCollection(summary);
+    if (this.storage.ownerSubject.get()) {
       await this.#ownerLibrary().updateOwnedCollection(meta.id, summary);
     }
   }

@@ -79,6 +79,7 @@ function facet(scope: ToolScope = {}) {
 }
 
 const queue = {
+  assertAppAccess() {},
   dup() { return this; },
   authorizeObservation() {},
 };
@@ -92,6 +93,19 @@ it("builds tool methods and falls back to the plain session when catalog loading
   const fallback = await subject.startSession(queue as never);
   expect("listIssues" in fallback).toBe(false);
   expect(log.warnings).toContain("starting session without per-tool methods");
+});
+
+it("denies session catalog loading before consulting the facet", async () => {
+  const subject = facet();
+  const appAccessError = new Error("app access denied");
+  const deniedQueue = {
+    assertAppAccess: async () => { throw appAccessError; },
+    dup() { return this; },
+    authorizeObservation() {},
+  };
+
+  await expect(subject.startSession(deniedQueue as never)).rejects.toBe(appAccessError);
+  expect(subject.catalogReads).toBe(0);
 });
 
 it("keeps facets owner-only using the connector's resource label", async () => {

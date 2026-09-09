@@ -95,6 +95,33 @@ describe("slash command helpers", () => {
     expect(lists).toHaveBeenCalledTimes(2);
   });
 
+  it("does not publish a catalog that loses app access while listing", async () => {
+    let {promise: commands, resolve: release} =
+        Promise.withResolvers<SlashCommandDescriptor[]>();
+    let {promise: listingStarted, resolve: markListingStarted} = Promise.withResolvers<void>();
+    let allowed = true;
+    let assertAccess = vi.fn(async () => {
+      if (!allowed) throw new Error("app disabled");
+    });
+    let guarded = {
+      ...source(1, "Context", gatekeeper({
+        commands: () => {
+          markListingStarted();
+          return commands;
+        },
+      })),
+      assertAccess,
+    };
+
+    let result = collectSlashCommands([guarded]);
+    await listingStarted;
+    allowed = false;
+    release([deploy]);
+
+    await expect(result).resolves.toEqual([]);
+    expect(assertAccess).toHaveBeenCalledTimes(3);
+  });
+
   it("forwards arguments and keeps the provider alive until invocation completes", async () => {
     let release!: (result: SlashCommandResult) => void;
     let invoked = vi.fn((_id: string, _message: string, _authorizer: unknown) =>
@@ -113,6 +140,30 @@ describe("slash command helpers", () => {
     release({skillName: "deploy", message: "Deploy production."});
     await expect(result).resolves.toEqual({skillName: "deploy", message: "Deploy production."});
     expect(invoked).toHaveBeenCalledWith("deploy", "prod now", authorizer);
+    expect(disposals).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not return an invocation result after app access is revoked", async () => {
+    let {promise: invocation, resolve: release} = Promise.withResolvers<SlashCommandResult>();
+    let invoked = vi.fn(() => invocation);
+    let disposals = vi.fn();
+    let allowed = true;
+    let assertAccess = vi.fn(async () => {
+      if (!allowed) throw new Error("app disabled");
+    });
+    let value = gatekeeper({invoke: invoked, onDispose: disposals});
+    let request = {
+      id: {gatekeeperId: 1, commandId: "deploy"},
+      args: "prod",
+    };
+
+    let result = invokeSlashCommand(value as never, request, {} as never, assertAccess);
+    await vi.waitFor(() => expect(invoked).toHaveBeenCalled());
+    allowed = false;
+    release({message: "completed"});
+
+    await expect(result).rejects.toThrow("app disabled");
+    expect(assertAccess).toHaveBeenCalledTimes(3);
     expect(disposals).toHaveBeenCalledTimes(1);
   });
 

@@ -227,10 +227,16 @@ export type QueryParams = Record<string, string | number | boolean | undefined>;
 export class ZoomInfoApi {
   #getToken: () => Promise<string>;
   #baseUrl: string;
+  #assertAppAccess?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>, baseUrl: string = DEFAULT_API_BASE_URL) {
+  constructor(
+    getToken: () => Promise<string>,
+    baseUrl: string = DEFAULT_API_BASE_URL,
+    assertAppAccess?: () => Promise<void>,
+  ) {
     this.#getToken = getToken;
     this.#baseUrl = stripTrailingSlashes(baseUrl);
+    this.#assertAppAccess = assertAppAccess;
   }
 
   async #request(
@@ -245,6 +251,7 @@ export class ZoomInfoApi {
       }
     }
 
+    await this.#assertAppAccess?.();
     const token = await this.#getToken();
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
@@ -259,6 +266,7 @@ export class ZoomInfoApi {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
     }
+    await this.#assertAppAccess?.();
 
     const response = await fetch(url.toString(), init);
 

@@ -25,13 +25,6 @@
     }
   ],
 
-  // Public-collections snapshot KV. preview_id preserves existing dev data.
-  "kv_namespaces": [
-    {
-      "binding": "CONTEXT_COLLECTIONS",
-      "preview_id": "gadgets-context-collections"
-    }
-  ],
 
   // Optional: add an Artifacts binding named ARTIFACTS to enable Git-backed collections.
   "observability": {

@@ -19,8 +19,8 @@ export type ContextObservationCheck = {
 type ObservedCollectionState = true | "pending" | "observed";
 
 /**
- * Strategy C observer state for the broad Context Library singleton. Collections are the data sets:
- * public collections are domain-wide, while each private collection belongs to one account.
+ * Strategy C observer state for the broad Context Library singleton. Collections are the data sets,
+ * and each observer is rechecked against the live collection authority.
  */
 export class ContextObserverTracker {
   constructor(private kv: ObserverKv, private sharingDomain: string) {}

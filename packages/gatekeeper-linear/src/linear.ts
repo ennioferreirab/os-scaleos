@@ -15,6 +15,8 @@ import {
   AccountDescription,
   SupportedResource,
   ResourceConfiguratorFrame,
+  type AppUiContext,
+  type GatekeeperVerifierContext,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   Cursor,
@@ -759,26 +761,32 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { class: this.ctx.exports.LinearGatekeeperImpl({ props }), resource };
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Linear app authority is unavailable.");
+    await authority.assertAppAccess();
     const account = this.#account();
     const getToken = () => account.getAccessToken();
 
     if (resourceUrlPattern === WORKSPACE_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_WORKSPACE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearWorkspaceConfiguratorUI(getToken)),
+        ui: new RpcStub(new LinearWorkspaceConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === TEAM_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_TEAM_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearTeamConfiguratorUI(getToken)),
+        ui: new RpcStub(new LinearTeamConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearIssueConfiguratorUI(getToken)),
+        ui: new RpcStub(new LinearIssueConfiguratorUI(getToken, authority)),
       };
     }
     throw new Error(`Unsupported Linear resource configurator type: ${resourceUrlPattern}`);
@@ -799,10 +807,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * prospective observer may read a bound team/issue (and, for workspace bindings, the workspace and
    * each accessed team). The verifier carries this user's own account id, so the access checks run
    * against the observer's *own* Linear token.
-   */
+  */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    const props: LinearVerifierProps = { userObjectId: this.ctx.props.userObjectId };
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    const props: LinearVerifierProps = {
+      userObjectId: this.ctx.props.userObjectId,
+      authority: context.authority,
+    };
     return this.ctx.exports.LinearVerifier({ props });
   }
 }
@@ -824,7 +835,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 // The overseer only ever hands this verifier back to a Linear gatekeeper, which may therefore trust
 // the boolean results.
 
-type LinearVerifierProps = {
+type LinearVerifierProps = GatekeeperVerifierContext & {
   userObjectId: string;
 };
 
@@ -854,7 +865,9 @@ export class LinearVerifier extends WorkerEntrypoint<Env, LinearVerifierProps>
   #api(): LinearApi {
     const account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
-    return new LinearApi(() => account.getAccessToken());
+    return new LinearApi(
+      () => account.getAccessToken(),
+    ).withBeforeRequest(() => this.ctx.props.authority.requireAppAccess());
   }
 
   // Memoized within this instance: the urlKey of the workspace the observer's token belongs to, or
@@ -875,11 +888,13 @@ export class LinearVerifier extends WorkerEntrypoint<Env, LinearVerifierProps>
   }
 
   async hasWorkspaceAccess(workspaceUrlKey: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     return (await this.#workspaceUrlKey()) === workspaceUrlKey;
   }
 
   async hasTeamAccess(workspaceUrlKey: string, teamKeyOrId: string): Promise<boolean> {
-    if (!(await this.hasWorkspaceAccess(workspaceUrlKey))) return false;
+    await this.ctx.props.authority.requireAppAccess();
+    if ((await this.#workspaceUrlKey()) !== workspaceUrlKey) return false;
     try {
       return (await this.#api().findTeam(teamKeyOrId)) !== null;
     } catch (error) {
@@ -889,7 +904,8 @@ export class LinearVerifier extends WorkerEntrypoint<Env, LinearVerifierProps>
   }
 
   async hasIssueAccess(workspaceUrlKey: string, issueRef: string): Promise<boolean> {
-    if (!(await this.hasWorkspaceAccess(workspaceUrlKey))) return false;
+    await this.ctx.props.authority.requireAppAccess();
+    if ((await this.#workspaceUrlKey()) !== workspaceUrlKey) return false;
     try {
       return (await this.#api().getIssue(issueRef)) !== null;
     } catch (error) {
@@ -957,10 +973,12 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     return this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
-
-  async #run<T>(fn: (api: LinearApi) => Promise<T>): Promise<T> {
+  async #run<T>(
+    fn: (api: LinearApi) => Promise<T>,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<T> {
     const account = this.#account();
-    const api = new LinearApi(() => account.getAccessToken());
+    const api = new LinearApi(() => account.getAccessToken(), beforeRequest);
     try {
       return await fn(api);
     } catch (error) {
@@ -1066,6 +1084,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     teamIds: string[],
     description: ObservationDescription,
   ): Promise<void> {
+    await queue.assertAppAccess();
     const check = this.ctx.props.resourceKind === "workspace" && teamIds.length > 0
       ? await this.#prepareTeamObservation(teamIds)
       : {pendingTeams: [], commit() {}};
@@ -1113,6 +1132,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     action: StoredActionDraft,
     description: ActionDescriptionDraft,
   ): Promise<void> {
+    await approvalQueue.assertAppAccess();
     const id = this.#nextCounter("action");
     this.ctx.storage.kv.put<StoredAction>(`action:${id}`, { ...action, id, status: "pending" } as StoredAction);
     this.#invalidatePendingActions();
@@ -1251,22 +1271,30 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 
   // ---- concrete observation methods (return raw data; sessions normalize + authorize) ----
 
-  async orgRaw(): Promise<RawOrganization> {
-    return await this.#run(api => api.getOrganization());
+  async orgRaw(beforeRequest?: () => Promise<void>): Promise<RawOrganization> {
+    return await this.#run(api => api.getOrganization(), beforeRequest);
   }
 
-  async teamsPage(after: string | undefined, first: number, includeArchived: boolean): Promise<RawConnection<RawTeam>> {
-    return await this.#run(api => api.listTeams({ first, after, includeArchived }));
+  async teamsPage(
+    after: string | undefined, first: number, includeArchived: boolean,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawTeam>> {
+    return await this.#run(
+      api => api.listTeams({ first, after, includeArchived }), beforeRequest);
   }
 
-  async findTeamRaw(keyOrId: string): Promise<RawTeam> {
-    const team = await this.#run(api => api.findTeam(keyOrId));
+  async findTeamRaw(keyOrId: string, beforeRequest?: () => Promise<void>): Promise<RawTeam> {
+    const team = await this.#run(api => api.findTeam(keyOrId), beforeRequest);
     if (!team) throw new Error(`Linear team not found: ${keyOrId}`);
     return team;
   }
 
-  async projectsPage(teamId: string | null, after: string | undefined, first: number, includeArchived: boolean): Promise<RawConnection<RawProject>> {
-    return await this.#run(api => api.listProjects(teamId ? { teamId } : {}, { first, after, includeArchived }));
+  async projectsPage(
+    teamId: string | null, after: string | undefined, first: number, includeArchived: boolean,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawProject>> {
+    return await this.#run(
+      api => api.listProjects(teamId ? { teamId } : {}, { first, after, includeArchived }), beforeRequest);
   }
 
   // Overlay pending edits onto a fetched page, drop pending-archived issues, and (on the first
@@ -1280,20 +1308,31 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     return { nodes: [...injected, ...nodes], pageInfo: conn.pageInfo };
   }
 
-  async issuesPage(args: IssuePageArgs, after: string | undefined, first: number): Promise<RawConnection<RawIssue>> {
+  async issuesPage(
+    args: IssuePageArgs, after: string | undefined, first: number,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawIssue>> {
     const { filter, orderBy } = buildIssueFilter(args);
-    const conn = await this.#run(api => api.listIssues({ first, after, filter, orderBy, includeArchived: args.includeArchived }));
+    const conn = await this.#run(
+      api => api.listIssues({ first, after, filter, orderBy, includeArchived: args.includeArchived }),
+      beforeRequest);
     return this.#simulatePage(conn, after, args.teamId ?? null, args.includeArchived, true);
   }
 
-  async searchPage(term: string, args: IssuePageArgs, after: string | undefined, first: number): Promise<RawConnection<RawIssue>> {
+  async searchPage(
+    term: string, args: IssuePageArgs, after: string | undefined, first: number,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawIssue>> {
     const { filter } = buildIssueFilter(args);
-    const conn = await this.#run(api => api.searchIssues({ term, first, after, filter, includeArchived: args.includeArchived }));
+    const conn = await this.#run(
+      api => api.searchIssues({ term, first, after, filter, includeArchived: args.includeArchived }),
+      beforeRequest);
     // No injection for search: synthetic issues can't be meaningfully matched against the query.
     return this.#simulatePage(conn, after, args.teamId ?? null, args.includeArchived, false);
   }
 
-  async issueRaw(ref: string): Promise<RawIssue> {
+  async issueRaw(ref: string, beforeRequest?: () => Promise<void>): Promise<RawIssue> {
+    await beforeRequest?.();
     // A provisional issue whose create hasn't been applied: return its synthetic, overlaid copy.
     if (ref.startsWith("~") && !this.#provisionalRealId(ref)) {
       const create = this.#pendingActions().find(
@@ -1302,19 +1341,24 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
       if (!create) throw new Error(`Linear issue not found: ${ref}`);
       return this.#overlayIssue(create.synthetic);
     }
-    const issue = await this.#run(api => api.getIssue(this.resolveIssueRef(ref)));
+    const issue = await this.#run(api => api.getIssue(this.resolveIssueRef(ref)), beforeRequest);
     if (!issue) throw new Error(`Linear issue not found: ${ref}`);
     return this.#overlayIssue(issue);
   }
 
-  async commentsPage(ref: string, after: string | undefined, first: number): Promise<RawConnection<RawComment>> {
+  async commentsPage(
+    ref: string, after: string | undefined, first: number,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawComment>> {
+    await beforeRequest?.();
     // A provisional issue whose create hasn't been applied: only pending comments exist.
     if (ref.startsWith("~") && !this.#provisionalRealId(ref)) {
       const nodes = after === undefined ? this.#pendingCommentsFor(ref, undefined, null) : [];
       return { nodes, pageInfo: { hasNextPage: false, endCursor: null } };
     }
     const id = this.resolveIssueRef(ref);
-    const conn = await this.#run(api => api.listComments(id, { first, after }));
+    const conn = await this.#run(
+      api => api.listComments(id, { first, after }), beforeRequest);
     // Comments are oldest-first, so append pending comments once the real pages are exhausted.
     if (!conn.pageInfo.hasNextPage) {
       const pending = this.#pendingCommentsFor(ref, id, null);
@@ -1325,45 +1369,52 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 
   // Short-TTL cache in DO storage for rarely-changing team metadata that sits on hot paths
   // (setState/addLabels/createIssue each resolve these). Avoids redundant GraphQL calls.
-  async #cachedFetch<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  async #cachedFetch<T>(
+    key: string, ttlMs: number, fetcher: (beforeRequest?: () => Promise<void>) => Promise<T>,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<T> {
+    await beforeRequest?.();
     const hit = this.ctx.storage.kv.get<{ data: T; expiresAt: number }>(key);
     if (hit && Date.now() < hit.expiresAt) return hit.data;
-    const data = await fetcher();
+    const data = await fetcher(beforeRequest);
     this.ctx.storage.kv.put(key, { data, expiresAt: Date.now() + ttlMs });
     return data;
   }
 
-  async workflowStatesRaw(teamId: string): Promise<RawWorkflowState[]> {
+  async workflowStatesRaw(teamId: string, beforeRequest?: () => Promise<void>): Promise<RawWorkflowState[]> {
     return await this.#cachedFetch(`cache:states:${teamId}`, METADATA_CACHE_TTL_MS,
-      () => this.#run(api => api.listWorkflowStates(teamId)));
+      request => this.#run(api => api.listWorkflowStates(teamId), request), beforeRequest);
   }
 
   /** Real labels only — used internally to resolve label names to real ids. */
-  async labelsRaw(teamId: string): Promise<RawLabel[]> {
+  async labelsRaw(teamId: string, beforeRequest?: () => Promise<void>): Promise<RawLabel[]> {
     return await this.#cachedFetch(`cache:labels:${teamId}`, METADATA_CACHE_TTL_MS,
-      () => this.#run(api => api.listLabels(teamId)));
+      request => this.#run(api => api.listLabels(teamId), request), beforeRequest);
   }
 
   /** Labels for display to the gadget: real labels plus pending-created ones. */
-  async labelsForDisplay(teamId: string): Promise<RawLabel[]> {
-    const real = await this.labelsRaw(teamId);
+  async labelsForDisplay(teamId: string, beforeRequest?: () => Promise<void>): Promise<RawLabel[]> {
+    const real = await this.labelsRaw(teamId, beforeRequest);
     return [...real, ...this.#pendingCreatedLabels(teamId)];
   }
 
-  async cyclesPage(teamId: string, after: string | undefined, first: number): Promise<RawConnection<RawCycle>> {
-    return await this.#run(api => api.listCycles(teamId, { first, after }));
+  async cyclesPage(
+    teamId: string, after: string | undefined, first: number,
+    beforeRequest?: () => Promise<void>,
+  ): Promise<RawConnection<RawCycle>> {
+    return await this.#run(api => api.listCycles(teamId, { first, after }), beforeRequest);
   }
 
-  async getProjectRaw(projectId: string): Promise<RawProject | null> {
-    return await this.#run(api => api.getProject(projectId));
+  async getProjectRaw(projectId: string, beforeRequest?: () => Promise<void>): Promise<RawProject | null> {
+    return await this.#run(api => api.getProject(projectId), beforeRequest);
   }
 
-  async teamMembersRaw(teamId: string): Promise<RawUser[]> {
+  async teamMembersRaw(teamId: string, beforeRequest?: () => Promise<void>): Promise<RawUser[]> {
     return await this.#cachedFetch(`cache:members:${teamId}`, METADATA_CACHE_TTL_MS,
-      () => this.#run(api => api.listTeamMembers(teamId)));
+      request => this.#run(api => api.listTeamMembers(teamId), request), beforeRequest);
   }
 
-  async findMembersRaw(query: string | undefined): Promise<RawUser[]> {
+  async findMembersRaw(query: string | undefined, beforeRequest?: () => Promise<void>): Promise<RawUser[]> {
     const filter = query
       ? { or: [
           { email: { containsIgnoreCase: query } },
@@ -1371,13 +1422,14 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           { name: { containsIgnoreCase: query } },
         ] }
       : undefined;
-    return await this.#run(api => api.listUsers({ first: 50, filter }));
+    return await this.#run(api => api.listUsers({ first: 50, filter }), beforeRequest);
   }
 
   /** Resolve an assignee string (email / display name / UUID) to a single member. */
-  async resolveMemberRaw(query: string): Promise<RawUser> {
+  async resolveMemberRaw(query: string, beforeRequest?: () => Promise<void>): Promise<RawUser> {
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(query)) {
-      const byId = await this.#run(api => api.listUsers({ first: 1, filter: { id: { eq: query } } }));
+      const byId = await this.#run(
+        api => api.listUsers({ first: 1, filter: { id: { eq: query } } }), beforeRequest);
       if (byId[0]) return byId[0];
     }
     const users = await this.#run(api => api.listUsers({
@@ -1387,7 +1439,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
         { displayName: { eqIgnoreCase: query } },
         { name: { eqIgnoreCase: query } },
       ] },
-    }));
+    }), beforeRequest);
     if (users.length === 0) throw new Error(`No workspace member matches "${query}".`);
     if (users.length > 1) {
       throw new Error(`"${query}" matches multiple members; use an email or UUID to disambiguate.`);
@@ -1444,6 +1496,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<LinearWorkspace | LinearTeam | LinearIssue> {
+    await approvalQueue.assertAppAccess();
     switch (this.ctx.props.resourceKind) {
       case "team":
         return new LinearTeamSessionImpl(this, approvalQueue.dup(), this.ctx.props.teamKeyOrId!);
@@ -1669,8 +1722,10 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           // Re-add the labels we removed.
           const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
           if (!issue) break;
-          const restore = action.labelIds.map(id => this.#resolveLabelId(id)).filter((id): id is string => !!id);
           const current = (issue.labels?.nodes ?? []).map(l => l.id);
+          const restore = action.labelIds
+            .map(id => this.#resolveLabelId(id))
+            .filter((id): id is string => !!id);
           await api.updateIssue(issue.id, { labelIds: [...new Set([...current, ...restore])] });
           break;
         }
@@ -1682,7 +1737,6 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           break;
         case "archive":
           await api.setIssueArchived(this.resolveIssueRef(action.issueRef), !action.archived);
-          break;
       }
     });
 
@@ -1698,7 +1752,10 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 
 class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
   #gk: LinearGatekeeperImpl;
-  #fetchPage: (after: string | undefined) => Promise<RawConnection<TRaw>>;
+  #fetchPage: (
+    after: string | undefined,
+    beforeRequest: () => Promise<void>,
+  ) => Promise<RawConnection<TRaw>>;
   #normalize: (raw: TRaw) => TOut;
   #queue: RpcStub<ApprovalQueue>;
   #describe: (items: TOut[]) => ObservationDescription;
@@ -1711,7 +1768,10 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
   constructor(
     gk: LinearGatekeeperImpl,
     queue: RpcStub<ApprovalQueue>,
-    fetchPage: (after: string | undefined) => Promise<RawConnection<TRaw>>,
+    fetchPage: (
+      after: string | undefined,
+      beforeRequest: () => Promise<void>,
+    ) => Promise<RawConnection<TRaw>>,
     normalize: (raw: TRaw) => TOut,
     describe: (items: TOut[]) => ObservationDescription,
     teamIdsOf: (rawItems: TRaw[]) => string[],
@@ -1724,10 +1784,10 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
     this.#describe = describe;
     this.#teamIdsOf = teamIdsOf;
   }
-
   async next(): Promise<TOut[] | null> {
     if (this.#done) return null;
-    const conn = await this.#fetchPage(this.#after);
+    await this.#queue.assertAppAccess();
+    const conn = await this.#fetchPage(this.#after, () => this.#queue.assertAppAccess());
     const items = conn.nodes.map(this.#normalize);
     // Authorize before advancing pagination state, so a denied page can be retried.
     await this.#gk.authorizeTeamObservation(this.#queue, this.#teamIdsOf(conn.nodes), this.#describe(items));
@@ -1740,7 +1800,6 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
     disposeStub(this.#queue);
   }
 }
-
 // ---------------------------------------------------------------------------
 // Session: Workspace
 
@@ -1760,9 +1819,9 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
   [Symbol.dispose](): void {
     disposeStub(this.#queue);
   }
-
   async getMetadata(): Promise<LinearWorkspaceMetadata> {
-    const org = await this.#gk.orgRaw();
+    await this.#queue.assertAppAccess();
+    const org = await this.#gk.orgRaw(() => this.#queue.assertAppAccess());
     // Workspace-level metadata is visible to any workspace member, so no team attribution is needed.
     await this.#gk.authorizeTeamObservation(this.#queue, [], {
       title: "Read workspace info",
@@ -1776,7 +1835,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
     return new StreamingCursor<RawTeam, LinearTeamSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.teamsPage(after, first, options?.includeArchived ?? false),
+      (after, beforeRequest) => this.#gk.teamsPage(after, first, options?.includeArchived ?? false, beforeRequest),
       raw => normTeamSummary(raw, this.#wsKey),
       items => ({ title: "List teams", description: `Listed ${items.length} team(s) in the workspace.` }),
       // Each listed team is itself a data set whose existence/metadata (incl. private teams) the
@@ -1784,8 +1843,8 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
       teams => teams.map(t => t.id),
     );
   }
-
   async getTeam(teamKeyOrId: string): Promise<LinearTeam> {
+    await this.#queue.assertAppAccess();
     return new LinearTeamSessionImpl(this.#gk, this.#queue.dup(), teamKeyOrId);
   }
 
@@ -1794,7 +1853,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
     return new StreamingCursor<RawProject, LinearProjectSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.projectsPage(null, after, first, options?.includeArchived ?? false),
+      (after, beforeRequest) => this.#gk.projectsPage(null, after, first, options?.includeArchived ?? false, beforeRequest),
       normProjectSummary,
       items => ({ title: "List projects", description: `Listed ${items.length} project(s) in the workspace.` }),
       // A project's access is gated by the team(s) it belongs to (populated by the workspace-wide
@@ -1809,7 +1868,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
     return new StreamingCursor<RawIssue, LinearIssueSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.issuesPage(args, after, first),
+      (after, beforeRequest) => this.#gk.issuesPage(args, after, first, beforeRequest),
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "List issues", description: `Listed ${items.length} issue(s) across the workspace.` }),
       issues => issues.map(i => i.team.id),
@@ -1822,23 +1881,23 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
     return new StreamingCursor<RawIssue, LinearIssueSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.searchPage(query.text, args, after, first),
+      (after, beforeRequest) => this.#gk.searchPage(query.text, args, after, first, beforeRequest),
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "Search issues", description: `Searched workspace issues for "${query.text}" (${items.length} result(s)).` }),
       issues => issues.map(i => i.team.id),
     );
   }
-
   async getIssue(id: string): Promise<LinearIssue> {
+    await this.#queue.assertAppAccess();
     return new LinearIssueImpl(this.#gk, this.#queue.dup(), id);
   }
-
   async createIssue(options: LinearCreateIssueOptions): Promise<LinearIssue> {
+    await this.#queue.assertAppAccess();
     return await createIssueViaQueue(this.#gk, this.#queue, options, { requireTeam: true });
   }
-
   async findMembers(query?: string): Promise<LinearUser[]> {
-    const users = await this.#gk.findMembersRaw(query);
+    await this.#queue.assertAppAccess();
+    const users = await this.#gk.findMembersRaw(query, () => this.#queue.assertAppAccess());
     // The workspace member directory is visible to any workspace member, so no team attribution.
     await this.#gk.authorizeTeamObservation(this.#queue, [], {
       title: "Find members",
@@ -1870,15 +1929,16 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   [Symbol.dispose](): void {
     disposeStub(this.#queue);
   }
-
-  #team(): Promise<RawTeam> {
+  async #team(): Promise<RawTeam> {
+    await this.#queue.assertAppAccess();
     if (!this.#teamPromise) {
-      this.#teamPromise = this.#gk.findTeamRaw(this.#teamKeyOrId).catch(err => {
+      this.#teamPromise = this.#gk.findTeamRaw(
+        this.#teamKeyOrId, () => this.#queue.assertAppAccess()).catch(err => {
         this.#teamPromise = undefined;
         throw err;
       });
     }
-    return this.#teamPromise;
+    return await this.#teamPromise;
   }
 
   async getMetadata(): Promise<LinearTeamMetadata> {
@@ -1897,7 +1957,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
     return new StreamingCursor<RawIssue, LinearIssueSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.issuesPage(args, after, first),
+      (after, beforeRequest) => this.#gk.issuesPage(args, after, first, beforeRequest),
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "List team issues", description: `Listed ${items.length} issue(s) in team ${team.key}.` }),
       () => [team.id],
@@ -1911,7 +1971,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
     return new StreamingCursor<RawIssue, LinearIssueSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.searchPage(query.text, args, after, first),
+      (after, beforeRequest) => this.#gk.searchPage(query.text, args, after, first, beforeRequest),
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "Search team issues", description: `Searched team ${team.key} for "${query.text}" (${items.length} result(s)).` }),
       () => [team.id],
@@ -1930,17 +1990,18 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
 
   async listWorkflowStates(): Promise<LinearWorkflowState[]> {
     const team = await this.#team();
-    const states = await this.#gk.workflowStatesRaw(team.id);
+    await this.#queue.assertAppAccess();
+    const states = await this.#gk.workflowStatesRaw(team.id, () => this.#queue.assertAppAccess());
     await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
       title: "List workflow states",
       description: `Listed ${states.length} workflow state(s) for team ${team.key}.`,
     });
     return states.map(normState).toSorted((a, b) => (a.position ?? 0) - (b.position ?? 0));
   }
-
   async listLabels(): Promise<LinearLabel[]> {
     const team = await this.#team();
-    const labels = await this.#gk.labelsForDisplay(team.id);
+    await this.#queue.assertAppAccess();
+    const labels = await this.#gk.labelsForDisplay(team.id, () => this.#queue.assertAppAccess());
     await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
       title: "List labels",
       description: `Listed ${labels.length} label(s) for team ${team.key}.`,
@@ -1952,7 +2013,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
     const team = await this.#team();
     // Check real labels and any pending-created ones, so two creates can't collide on the same
     // name (which would also collide on the `~label:<name>` provisional id).
-    const existing = await this.#gk.labelsForDisplay(team.id);
+    await this.#queue.assertAppAccess();
+    const existing = await this.#gk.labelsForDisplay(team.id, () => this.#queue.assertAppAccess());
     if (existing.some(l => l.name.toLowerCase() === name.toLowerCase())) {
       throw new Error(`A label named "${name}" already exists in team ${team.key}.`);
     }
@@ -1977,7 +2039,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
     return new StreamingCursor<RawProject, LinearProjectSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.projectsPage(team.id, after, first, options?.includeArchived ?? false),
+      (after, beforeRequest) => this.#gk.projectsPage(team.id, after, first, options?.includeArchived ?? false, beforeRequest),
       normProjectSummary,
       items => ({ title: "List team projects", description: `Listed ${items.length} project(s) for team ${team.key}.` }),
       // Team-scoped listing: the projects are reached through this team, so attribute to it.
@@ -1991,7 +2053,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
     return new StreamingCursor<RawCycle, LinearCycleSummary>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.cyclesPage(team.id, after, first),
+      (after, beforeRequest) => this.#gk.cyclesPage(team.id, after, first, beforeRequest),
       normCycle,
       items => ({ title: "List cycles", description: `Listed ${items.length} cycle(s) for team ${team.key}.` }),
       () => [team.id],
@@ -2000,7 +2062,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
 
   async listMembers(): Promise<LinearUser[]> {
     const team = await this.#team();
-    const members = await this.#gk.teamMembersRaw(team.id);
+    await this.#queue.assertAppAccess();
+    const members = await this.#gk.teamMembersRaw(team.id, () => this.#queue.assertAppAccess());
     await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
       title: "List team members",
       description: `Listed ${members.length} member(s) of team ${team.key}.`,
@@ -2034,10 +2097,10 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
   [Symbol.dispose](): void {
     disposeStub(this.#queue);
   }
-
-  // Fetch this issue, enforcing the team scope (if any) so a team grant can't reach other teams.
+  // Fetch this issue, enforcing the team scope (if any) so a team grant can't reach issues in other teams.
   async #requireIssue(): Promise<RawIssue> {
-    const issue = await this.#gk.issueRaw(this.#ref);
+    await this.#queue.assertAppAccess();
+    const issue = await this.#gk.issueRaw(this.#ref, () => this.#queue.assertAppAccess());
     if (this.#teamScope && issue.team.id !== this.#teamScope) {
       throw new Error(`Issue ${issue.identifier} is not in the team this connection is limited to.`);
     }
@@ -2080,7 +2143,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
 
   async setState(state: string): Promise<void> {
     const issue = await this.#requireIssue();
-    const states = await this.#gk.workflowStatesRaw(issue.team.id);
+    await this.#queue.assertAppAccess();
+    const states = await this.#gk.workflowStatesRaw(issue.team.id, () => this.#queue.assertAppAccess());
     const target = states.find(s => s.name.toLowerCase() === state.toLowerCase());
     if (!target) {
       throw new Error(`No workflow state named "${state}" in team ${issue.team.key}.`);
@@ -2102,7 +2166,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
     let assigneeUser: RawUser | null = null;
     let label = "Unassign";
     if (assignee !== null) {
-      assigneeUser = await this.#gk.resolveMemberRaw(assignee);
+      await this.#queue.assertAppAccess();
+      assigneeUser = await this.#gk.resolveMemberRaw(assignee, () => this.#queue.assertAppAccess());
       assigneeId = assigneeUser.id;
       label = `Assign to ${assigneeUser.displayName ?? assigneeUser.name}`;
     }
@@ -2132,9 +2197,11 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
 
   async addLabels(labels: string[]): Promise<void> {
     const issue = await this.#requireIssue();
+    await this.#queue.assertAppAccess();
     // Resolve against real labels *and* labels created earlier in this session that haven't been
     // applied yet — those are attachable too (their ids resolve to the real label at apply time).
-    const teamLabels = await this.#gk.labelsForDisplay(issue.team.id);
+    await this.#queue.assertAppAccess();
+    const teamLabels = await this.#gk.labelsForDisplay(issue.team.id, () => this.#queue.assertAppAccess());
     const byName = new Map(teamLabels.map(l => [l.name.toLowerCase(), l]));
     const resolved: RawLabel[] = [];
     for (const name of labels) {
@@ -2173,8 +2240,10 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
   }
 
   async setProject(projectId: string | null): Promise<void> {
+    await this.#queue.assertAppAccess();
     const issue = await this.#requireIssue();
-    const project = projectId ? await this.#gk.getProjectRaw(projectId) : null;
+    await this.#queue.assertAppAccess();
+    const project = projectId ? await this.#gk.getProjectRaw(projectId, () => this.#queue.assertAppAccess()) : null;
     if (projectId && !project) throw new Error(`Project not found: ${projectId}`);
     await this.#gk.enqueue(
       this.#queue,
@@ -2209,7 +2278,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
     let resolvedParentId: string | null = null;
     let parentOverlay: RawIssue["parent"] = null;
     if (parentId !== null) {
-      const parent = await this.#gk.issueRaw(parentId);
+      await this.#queue.assertAppAccess();
+      const parent = await this.#gk.issueRaw(parentId, () => this.#queue.assertAppAccess());
       if (this.#teamScope && parent.team.id !== this.#teamScope) {
         throw new Error(`Parent issue ${parent.identifier} is not in the team this connection is limited to.`);
       }
@@ -2238,7 +2308,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
     return new StreamingCursor<RawComment, LinearComment>(
       this.#gk,
       this.#queue.dup(),
-      after => this.#gk.commentsPage(ref, after, first),
+      (after, beforeRequest) => this.#gk.commentsPage(ref, after, first, beforeRequest),
       normComment,
       items => ({ title: `Read comments on ${ref}`, description: `Read ${items.length} comment(s) on issue ${ref}.` }),
       () => [teamId],
@@ -2322,7 +2392,8 @@ async function createIssueViaQueue(
   }
   const teamKeyOrId = options.teamId ?? options.teamKey;
   if (!teamKeyOrId) throw new Error("Could not determine which team to create the issue in.");
-  const team = await gk.findTeamRaw(teamKeyOrId);
+  await queue.assertAppAccess();
+  const team = await gk.findTeamRaw(teamKeyOrId, () => queue.assertAppAccess());
   const teamId = team.id;
 
   const input: IssueCreateInput = {
@@ -2337,7 +2408,8 @@ async function createIssueViaQueue(
   // Resolve display objects alongside the ids so the pending issue can be simulated faithfully.
   let stateObj: RawWorkflowState | null = null;
   if (options.state) {
-    const states = await gk.workflowStatesRaw(teamId);
+    await queue.assertAppAccess();
+    const states = await gk.workflowStatesRaw(teamId, () => queue.assertAppAccess());
     const target = states.find(s => s.name.toLowerCase() === options.state!.toLowerCase());
     if (!target) throw new Error(`No workflow state named "${options.state}" in this team.`);
     input.stateId = target.id;
@@ -2345,14 +2417,16 @@ async function createIssueViaQueue(
   }
   let assigneeObj: RawUser | null = null;
   if (options.assignee) {
-    assigneeObj = await gk.resolveMemberRaw(options.assignee);
+    await queue.assertAppAccess();
+    assigneeObj = await gk.resolveMemberRaw(options.assignee, () => queue.assertAppAccess());
     input.assigneeId = assigneeObj.id;
   }
   const labelObjs: RawLabel[] = [];
   if (options.labels && options.labels.length > 0) {
     // Resolve against real + pending-created labels, like addLabels; provisional `~label:` ids
     // are resolved to real ids in applyAction.
-    const teamLabels = await gk.labelsForDisplay(teamId);
+    await queue.assertAppAccess();
+    const teamLabels = await gk.labelsForDisplay(teamId, () => queue.assertAppAccess());
     const byName = new Map(teamLabels.map(l => [l.name.toLowerCase(), l]));
     for (const name of options.labels) {
       const found = byName.get(name.toLowerCase());
@@ -2363,11 +2437,13 @@ async function createIssueViaQueue(
   }
   let projectObj: RawProject | null = null;
   if (options.projectId) {
-    projectObj = await gk.getProjectRaw(options.projectId);
+    await queue.assertAppAccess();
+    projectObj = await gk.getProjectRaw(options.projectId, () => queue.assertAppAccess());
   }
   let parentObj: RawIssue["parent"] = null;
   if (options.parentId) {
-    const parent = await gk.issueRaw(options.parentId);
+    await queue.assertAppAccess();
+    const parent = await gk.issueRaw(options.parentId, () => queue.assertAppAccess());
     input.parentId = parent.id;
     parentObj = { id: parent.id, identifier: parent.identifier, url: parent.url, title: parent.title };
   }

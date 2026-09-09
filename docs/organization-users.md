@@ -55,7 +55,9 @@ singleton name. Its organization ID is the backend-configured `ORG_ID`. It store
 - the deterministic Subject-to-User-DO binding;
 - invitation admission and first-acceptance timestamps;
 - narrowly scoped pending invitation and lifecycle records;
-- idempotency receipts and bounded administrative audit events.
+- idempotency receipts and bounded administrative audit events;
+- registered gatekeeper app policies keyed by canonical vendor ID; an absent record is disabled with
+  an empty audience.
 
 On empty storage, only `BOOTSTRAP_ADMIN_SUB` may bootstrap. The directory confirms that UUID exists
 in Supabase Auth and has a confirmed e-mail before atomically creating the organization, first
@@ -67,6 +69,54 @@ Object name is deterministic from `supabase:<sub>`; the first admitted login cre
 profile projection, never a password or alternate credential. Confirmed e-mail claims may refresh
 the contact address. The existing self-service display-name edit is preserved and is not
 overwritten by later logins.
+
+## Registered app policy
+
+The directory's `appPolicies` collection is keyed by the exact canonical vendor ID of every
+registered `GATEKEEPER_*` binding, whether or not the vendor exposes a UI. `listAppPolicies()`
+supplies an implicit `disabled` policy with an empty audience and deterministic timestamp when no
+row exists. `setAppPolicy()` accepts only exact registered IDs, canonicalizes the audience, and
+rejects references to missing users or groups. `enabled` is valid only for vendors declaring
+`autoProvisionsAccount`; ordinary OAuth/resource vendors offer `disabled` and `optional`.
+
+`resolveAppAccess(subject, vendorId)` is the sole policy decision point in central-auth mode. It
+rereads the effective user status, mode, and T04 additive audience on every call. Missing policy,
+disabled app, missing/pending/disabled user, deleted group, or an audience miss denies access,
+including for administrators. The result names all current sources in stable order. Policy writes,
+previews, receipts, versions, and audit events are owned by the directory; audit summaries never
+contain audience IDs.
+
+The backend resolves this policy before vendor/account discovery and connection, optional opt-in,
+forced auto-provisioning, account UI or resource-configurator frames, singleton-class issuance,
+resource-class issuance, gatekeeper binding or session use, slash commands, observations/actions,
+and hook admission. `optional` lets only selected users connect or opt into an auto-provisioned
+vendor. `enabled` automatically provisions only selected users and cannot create OAuth credentials
+for anyone. Legacy-auth deployments keep their prior optional behavior and do not consult directory
+policy.
+
+Human management and resource-configurator frames retain a Subject-bound `ContextAuthority` minted
+by the kernel for the exact app and target. Every retained UI duplicates it and calls
+`assertAppAccess()` before processing an RPC, including validation-only paths. Context additionally
+uses the same capability to obtain the trusted actor and resolve current directory audiences; other
+vendors never receive or construct identity payloads.
+Persistent observer verifiers retain a separate attenuated authority bound to the exact Workshop
+user object, connected-account ID, and vendor. Every verifier use re-enters that user object and
+rejects a removed or mismatched account before resolving current directory policy. Workspace
+gatekeepers and hooks persist their trusted owner Subject from the kernel; ambient singleton use
+also rechecks the exact owner account ID recorded when its class was minted. Reconciliation may
+backfill a missing Subject only from an exact matching ambient account owner and matching vendor
+records; conflicting or unattributable legacy rows stay inert. Retained gatekeeper clients, binding
+loopbacks, approval queues, cursor capabilities, hook callbacks, and hook firings recheck current
+policy rather than treating possession as a permanent grant. A disabled app disappears on the next
+catalog/navigation load and direct URL/RPC use denies immediately; bytes already delivered are not
+recalled.
+
+Disabling policy does not revoke or delete an account, collection, gatekeeper record, binding,
+schedule, or hook. Denied accounts remain explicitly disconnectable, pending actions remain
+rejectable, and bindings and hooks remain listable for local cleanup, while operational methods
+stay inert. Re-enabling resumes only for the current audience; removing a direct or group grant is
+never reversed implicitly. The Admin **Gatekeepers** panel exposes the single mode plus
+everyone/user/group audience controls and a server-computed preview with additive sources.
 
 ## Invitations, roles, and lifecycle
 

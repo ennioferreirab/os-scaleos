@@ -85,6 +85,7 @@ class TestApprovalQueue extends RpcTarget {
       this.#releasePaused = undefined;
     }
   }
+  async assertAppAccess(): Promise<void> {}
 
   async submitAction(actionId: number, description: unknown): Promise<void> {
     this.#submissions.push({actionId, description});

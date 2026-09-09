@@ -305,17 +305,33 @@ export class CloudflareObservabilityApi {
     private readonly getToken: () => Promise<string | null>,
     accountId: string,
     private readonly workerName?: string,
+    private readonly beforeRequest?: () => Promise<void>,
   ) {
     this.accountId = assertCloudflareAccountId(accountId);
   }
 
+  withBeforeRequest(beforeRequest: () => Promise<void>): CloudflareObservabilityApi {
+    const existing = this.beforeRequest;
+    return new CloudflareObservabilityApi(
+      this.getToken,
+      this.accountId,
+      this.workerName,
+      async () => {
+        await existing?.();
+        await beforeRequest();
+      },
+    );
+  }
+
   async #request(path: string, body: unknown): Promise<unknown> {
+    await this.beforeRequest?.();
     const token = await this.getToken();
     if (!token) throw new CloudflareObservabilityApiError(401, "Cloudflare credentials have expired.");
 
     const url = `${API_BASE}/accounts/${encodeURIComponent(this.accountId)}` +
       `/workers/observability/telemetry/${path}`;
     for (let attempt = 1; attempt <= 2; attempt++) {
+      await this.beforeRequest?.();
       let response: Response | undefined;
       try {
         response = await fetch(url, {

@@ -3,11 +3,13 @@ import { RpcStub } from 'capnweb'
 import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
 import { ClockCounterClockwise, Hexagon, ShieldWarning, UserPlus, Users } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, DirectoryUser, PendingUserLifecycle, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminResourceVendor, DirectoryUser, PendingUserLifecycle, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
+import AdminGroupsPanel from './components/AdminGroupsPanel'
+import AdminAppPoliciesPanel from './components/AdminAppPoliciesPanel'
 import { useLocale } from './i18n'
 import { hasPublicAuthConfig } from './auth/supabase'
 
@@ -127,6 +129,11 @@ export default function AdminPage() {
       case 'inviteUser': return t('adminArea.audit.actions.inviteUser')
       case 'setUserRole': return t('adminArea.audit.actions.setUserRole')
       case 'setUserStatus': return t('adminArea.audit.actions.setUserStatus')
+      case 'createGroup': return t('adminArea.audit.actions.createGroup')
+      case 'renameGroup': return t('adminArea.audit.actions.renameGroup')
+      case 'replaceGroupMembers': return t('adminArea.audit.actions.replaceGroupMembers')
+      case 'deleteGroup': return t('adminArea.audit.actions.deleteGroup')
+      case 'setAppPolicy': return t('adminArea.audit.actions.setAppPolicy')
       case 'setSignupsEnabled': return t('adminArea.audit.actions.setSignupsEnabled')
     }
   }
@@ -226,49 +233,6 @@ export default function AdminPage() {
     }
   }
 
-  const handleGatekeeperToggle = async (vendorId: string, enabled: boolean) => {
-    if (!admin) return
-    const key = `gk\u0000${vendorId}`
-    setResourceBusy((prev) => new Set(prev).add(key))
-    setResourceVendors((prev) =>
-      prev.map((v) => (v.vendorId === vendorId && !v.autoProvisions ? { ...v, enabled } : v))
-    )
-    try {
-      await admin.api.setGatekeeperMode(vendorId, enabled ? 'enabled' : 'disabled')
-    } catch (err) {
-      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
-      toasts.add({ title: message, variant: 'error' })
-      await reloadResources().catch(() => {})
-    } finally {
-      setResourceBusy((prev) => {
-        const next = new Set(prev)
-        next.delete(key)
-        return next
-      })
-    }
-  }
-
-  const handleGatekeeperMode = async (vendorId: string, mode: AmbientGatekeeperMode) => {
-    if (!admin) return
-    const key = `gk\u0000${vendorId}`
-    setResourceBusy((prev) => new Set(prev).add(key))
-    setResourceVendors((prev) =>
-      prev.map((v) => (v.vendorId === vendorId && v.autoProvisions ? { ...v, ambientMode: mode } : v))
-    )
-    try {
-      await admin.api.setGatekeeperMode(vendorId, mode)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : t('adminArea.errors.updateFailed')
-      toasts.add({ title: message, variant: 'error' })
-      await reloadResources().catch(() => {})
-    } finally {
-      setResourceBusy((prev) => {
-        const next = new Set(prev)
-        next.delete(key)
-        return next
-      })
-    }
-  }
 
   const handleSaveAnnouncement = async () => {
     if (!admin) return
@@ -574,6 +538,7 @@ export default function AdminPage() {
           { value: 'gatekeepers', label: t('adminArea.tabs.gatekeepers') },
           { value: 'formats', label: t('adminArea.tabs.formats') },
           { value: 'users', label: t('adminArea.tabs.users') },
+          { value: 'groups', label: t('adminArea.tabs.groups') },
           ...(!centralAuthEnabled
             ? [{ value: 'access', label: t('adminArea.tabs.access') }]
             : []),
@@ -686,6 +651,8 @@ export default function AdminPage() {
 
         </div>
       )}
+
+      {activeTab === 'groups' && admin && <AdminGroupsPanel admin={admin.api} />}
 
       {/* Standard output formats */}
       {activeTab === 'formats' && admin && (
@@ -1099,182 +1066,61 @@ export default function AdminPage() {
       </div>
       )}
 
-      {/* Gatekeeper resources */}
-      {activeTab === 'gatekeepers' && (
-        <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">{t('adminArea.gatekeepers.title')}</h2>
-          <p className="text-sm text-kumo-subtle mb-5">
-            {t('adminArea.gatekeepers.description')}
-          </p>
-
-          {resourceVendors.length === 0 && (
-            <p className="text-sm text-kumo-subtle">
-              {t('adminArea.gatekeepers.noneInstalled')}
-            </p>
+      {/* Gatekeeper app policies and resource soft settings */}
+      {activeTab === 'gatekeepers' && admin && (
+        <>
+          {centralAuthEnabled && (
+            <AdminAppPoliciesPanel api={admin.api} vendors={resourceVendors} />
           )}
-
-          <div className="space-y-6">
-            {resourceVendors.map((vendor) => {
-              const gkKey = `gk\u0000${vendor.vendorId}`
-
-              // Auto-provisioned ("ambient") gatekeepers use a three-state mode and have no resources.
-              if (vendor.autoProvisions) {
-                const mode = vendor.ambientMode ?? 'optional'
-                const options: { value: AmbientGatekeeperMode; label: string; hint: string }[] = [
-                  {
-                    value: 'disabled',
-                    label: t('adminArea.gatekeepers.modes.disabled'),
-                    hint: t('adminArea.gatekeepers.modes.offForEveryone'),
-                  },
-                  {
-                    value: 'optional',
-                    label: t('adminArea.gatekeepers.modes.optional'),
-                    hint: t('adminArea.gatekeepers.modes.usersCanAdd'),
-                  },
-                  {
-                    value: 'enabled',
-                    label: t('adminArea.gatekeepers.modes.enabled'),
-                    hint: t('adminArea.gatekeepers.modes.onForEveryone'),
-                  },
-                ]
-                return (
-                  <div key={vendor.vendorId}>
-                    <div className="flex items-center gap-3 mb-2 px-3 py-2 rounded-lg bg-kumo-tint/50">
-                      {vendor.logo && (
-                        <img
-                          src={vendor.logo.url}
-                          alt=""
-                          className={`w-5 h-5 object-contain transition-[filter,opacity] ${mode === 'disabled' ? 'grayscale opacity-40' : ''}`}
-                        />
-                      )}
-                      <h3 className={`flex-1 text-sm font-semibold ${mode === 'disabled' ? 'text-kumo-subtle' : 'text-kumo-default'}`}>
-                        {vendor.displayName}
-                      </h3>
+          <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+            <h2 className="text-lg font-semibold text-kumo-strong mb-1">{t('adminArea.gatekeepers.resourcesTitle')}</h2>
+            <p className="text-sm text-kumo-subtle mb-5">{t('adminArea.gatekeepers.resourcesDescription')}</p>
+            {resourceVendors.length === 0 && (
+              <p className="text-sm text-kumo-subtle">{t('adminArea.gatekeepers.noneInstalled')}</p>
+            )}
+            <div className="space-y-6">
+              {resourceVendors.map((vendor) => (
+                <div key={vendor.vendorId}>
+                  <div className="flex items-center gap-3 mb-2 px-3 py-2 rounded-lg bg-kumo-tint/50">
+                    {vendor.logo && <img src={vendor.logo.url} alt="" className="w-5 h-5 object-contain" />}
+                    <h3 className="flex-1 text-sm font-semibold text-kumo-default">{vendor.displayName}</h3>
+                    {vendor.autoProvisions && (
                       <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-kumo-tint text-kumo-subtle border border-kumo-line">
                         {t('adminArea.gatekeepers.autoProvisioned')}
                       </span>
-                    </div>
-                    <div className="flex gap-2 px-3 py-1">
-                      {options.map((opt) => (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          disabled={resourceBusy.has(gkKey)}
-                          onClick={() => handleGatekeeperMode(vendor.vendorId, opt.value)}
-                          className={`flex-1 rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-50 ${
-                            mode === opt.value
-                              ? 'border-kumo-brand bg-kumo-brand/10'
-                              : 'border-kumo-line hover:bg-kumo-tint'
-                          }`}
-                        >
-                          <span className="block text-sm font-medium text-kumo-default">{opt.label}</span>
-                          <span className="block text-xs text-kumo-subtle mt-0.5">{opt.hint}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )
-              }
-
-              return (
-              <div key={vendor.vendorId}>
-                {/* The whole header row is a toggle target; the Switch stops propagation so it
-                    doesn't double-fire. */}
-                <div
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => !resourceBusy.has(gkKey) && handleGatekeeperToggle(vendor.vendorId, !vendor.enabled)}
-                  onKeyDown={(e) => {
-                    if (e.currentTarget !== e.target) return
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      if (!resourceBusy.has(gkKey)) handleGatekeeperToggle(vendor.vendorId, !vendor.enabled)
-                    }
-                  }}
-                  className="flex cursor-pointer items-center gap-3 mb-2 px-3 py-2 rounded-lg bg-kumo-tint/50 hover:bg-kumo-tint transition-colors"
-                >
-                  {vendor.logo && (
-                    <img
-                      src={vendor.logo.url}
-                      alt=""
-                      className={`w-5 h-5 object-contain transition-[filter,opacity] ${vendor.enabled ? '' : 'grayscale opacity-40'}`}
-                    />
-                  )}
-                  <h3 className={`flex-1 text-sm font-semibold ${vendor.enabled ? 'text-kumo-default' : 'text-kumo-subtle'}`}>
-                    {vendor.displayName}
-                    {!vendor.enabled && (
-                      <span className="ml-2 text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-kumo-tint text-kumo-subtle border border-kumo-line">
-                        {t('adminArea.gatekeepers.disabledBadge')}
+                    )}
+                    {vendor.unavailable && (
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-kumo-warning/10 text-kumo-subtle border border-kumo-line">
+                        {t('adminArea.gatekeepers.unavailable')}
                       </span>
                     )}
-                  </h3>
-                      <span className="text-xs text-kumo-subtle">
-                    {vendor.enabled
-                      ? t('adminArea.gatekeepers.modes.enabled')
-                      : t('adminArea.gatekeepers.off')}
-                  </span>
-                  <span onClick={(e) => e.stopPropagation()}>
-                    <Switch
-                      checked={vendor.enabled}
-                      disabled={resourceBusy.has(gkKey)}
-                      onCheckedChange={(enabled) => handleGatekeeperToggle(vendor.vendorId, enabled)}
-                    />
-                  </span>
-                </div>
-                {/* Resources are hidden while the gatekeeper is disabled — they can't be used
-                    until it's re-enabled. */}
-                {vendor.enabled ? (
+                  </div>
                   <div className="space-y-1">
                     {vendor.resources.map((resource) => {
                       const key = resourceKey(vendor.vendorId, resource.urlPattern)
                       return (
-                        <div
-                          key={resource.urlPattern}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => !resourceBusy.has(key) && handleResourceToggle(vendor.vendorId, resource.urlPattern, !resource.enabled)}
-                          onKeyDown={(e) => {
-                            if (e.currentTarget !== e.target) return
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault()
-                              if (!resourceBusy.has(key)) handleResourceToggle(vendor.vendorId, resource.urlPattern, !resource.enabled)
-                            }
-                          }}
-                          className="flex cursor-pointer items-center gap-4 px-3 py-2.5 rounded-lg hover:bg-kumo-tint transition-colors"
-                        >
+                        <div key={resource.urlPattern} className="flex items-center gap-4 px-3 py-2.5 rounded-lg hover:bg-kumo-tint transition-colors">
                           <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-kumo-default truncate">
-                              {resource.title}
-                            </p>
+                            <p className="text-sm font-medium text-kumo-default truncate">{resource.title}</p>
                             <p className="text-xs text-kumo-subtle mt-0.5">{resource.description}</p>
                           </div>
-                          <span onClick={(e) => e.stopPropagation()}>
-                            <Switch
-                              checked={resource.enabled}
-                              disabled={resourceBusy.has(key)}
-                              onCheckedChange={(enabled) =>
-                                handleResourceToggle(vendor.vendorId, resource.urlPattern, enabled)
-                              }
-                            />
-                          </span>
+                          <Switch
+                            checked={resource.enabled}
+                            disabled={resourceBusy.has(key) || !!vendor.unavailable}
+                            onCheckedChange={(enabled) => void handleResourceToggle(vendor.vendorId, resource.urlPattern, enabled)}
+                          />
                         </div>
                       )
                     })}
-                  </div>
-                ) : (
-                  <p className="text-xs text-kumo-subtle px-3 py-1">
-                    {t(
-                      vendor.resources.length === 1
-                        ? 'adminArea.gatekeepers.hiddenResourcesOne'
-                        : 'adminArea.gatekeepers.hiddenResourcesMany',
-                      { count: formatNumber(vendor.resources.length) },
+                    {vendor.resources.length === 0 && (
+                      <p className="text-xs text-kumo-subtle px-3 py-1">{t('adminArea.gatekeepers.noResources')}</p>
                     )}
-                  </p>
-                )}
-              </div>
-            )})}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+        </>
       )}
     </div>
   )

@@ -17,6 +17,40 @@
 // `Adapter` type is the root interface implemented by the service binding.
 
 import type { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
+/**
+ * Additive audience selector shared by gatekeeper resources that need directory authorization.
+ *
+ * Subjects are verified directory identities and group IDs are directory-generated identifiers.
+ * This is a value type: it carries no authority by itself and must always be resolved by a
+ * ContextAuthority.
+ */
+export type Audience = {
+  /** Whether every currently-active organization user is included. */
+  everyone: boolean;
+  /** Directly included verified directory Subjects. */
+  userIds: string[];
+  /** Included directory group IDs. */
+  groupIds: string[];
+};
+
+/** Minimal, live directory projection exposed to authenticated audience pickers. */
+export type DirectoryAudienceTargets = {
+  /** Currently effective-active users, without contact, role, status, or audit fields. */
+  users: Array<{
+    /** Verified directory Subject. */
+    userId: string;
+    /** Current directory display name. */
+    displayName: string;
+  }>;
+  /** Existing directory groups, without membership or audit fields. */
+  groups: Array<{
+    /** Server-generated immutable directory group ID. */
+    groupId: string;
+    /** Current group display name. */
+    name: string;
+  }>;
+};
+
 
 /**
  * A pagination cursor.
@@ -78,17 +112,52 @@ export type VendorDescription = {
   autoProvisionsAccount?: boolean;
 }
 
-/** Live, narrow authority supplied to a gatekeeper management UI for every sensitive operation. */
-export interface AppUiAuthority extends RpcTarget {
-  /** Reject when the originating human session expired or the directory user is no longer active. */
-  requireActive(): Promise<void>;
-  /** Recheck the current directory role; never rely on the role observed when the UI was opened. */
-  isAdmin(): Promise<boolean>;
+/** Subject-bound authority used by Context plus gatekeeper UI and request capabilities. */
+export interface ContextAuthority {
+  /** Return the trusted actor Subject and current organization-admin role. */
+  getActor(): Promise<{subject: string; isOrgAdmin: boolean}>;
+  /** Resolve an audience against current directory membership and activity. */
+  resolveAudience(audience: Audience): Promise<{allowed: boolean; sources: string[]}>;
+  /** Return current active users and groups for authoritative target selection. */
+  listAudienceTargets(): Promise<DirectoryAudienceTargets>;
+  /** Reject when current access to the bound vendor/app and target no longer permits the operation. */
+  assertAppAccess(): Promise<void>;
 }
 
-/** Per-open context the Workshop passes to GatekeeperUser.startAppUi(). */
+/**
+ * A live Context authority transported either as a request-scoped RPC target or a durable
+ * WorkerEntrypoint binding. Callers may retain entrypoint bindings directly; RPC stubs must be
+ * duplicated and disposed by the retaining object.
+ */
+export type ContextAuthorityCapability =
+  | RpcStub<RpcTarget & ContextAuthority>
+  | Fetcher<WorkerEntrypoint & ContextAuthority>;
+
+/** Optional request capability threaded through session, catalog, and slash-provider calls. */
+export type GatekeeperRequestContext = {
+  /** Kernel-minted authority for this exact session, catalog, or slash-provider call. */
+  authority: ContextAuthorityCapability;
+};
+
+/** Per-open context the Workshop passes to account management and resource-configuration UIs. */
 export type AppUiContext = {
-  authority: RpcStub<AppUiAuthority>;
+  /** Optional for non-Context vendors; Context management UIs require it at runtime. */
+  authority?: RpcStub<RpcTarget & ContextAuthority>;
+}
+
+/**
+ * Durable, attenuated authority retained by a vendor verifier. It is bound to one connected
+ * account and rechecks that account plus current directory app policy without retaining a human
+ * session or exposing the Workshop's user object.
+ */
+export interface VerifierAppAuthority extends WorkerEntrypoint {
+  requireAppAccess(): Promise<void>;
+}
+
+/** Context supplied when a connected account mints a persistent observer verifier. */
+export type GatekeeperVerifierContext = {
+  /** The verifier authority also exposes Context methods when the bound app supports them. */
+  authority: Fetcher<VerifierAppAuthority & ContextAuthority>;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -603,9 +672,12 @@ export interface GatekeeperUser extends WorkerEntrypoint {
   /**
    * Get the UI used to choose a specific resource.
    * `resourceUrlPattern` is the `urlPattern` associated with the supported resource.
+   * `context.authority` rechecks the originating session and current app policy on each sensitive
+   * operation performed through the retained configurator frame.
    */
   startResourceConfigurator(
     resourceUrlPattern: string,
+    context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame>;
 
   /**
@@ -635,9 +707,14 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    */
   getAuthenticatedEmail(): Promise<string | null>;
 
-  /** Get a `GatekeeperUserVerifier` representing this user. */
-  getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>>;
-
+  /**
+   * Get a `GatekeeperUserVerifier` representing this user. The returned persistent verifier must
+   * call `context.authority.requireAppAccess()` before every access check. Context's verifier
+   * authority also implements the live ContextAuthority contract.
+   */
+  getVerifier(
+    context: GatekeeperVerifierContext,
+  ): Promise<Fetcher<GatekeeperUserVerifier>>;
   /**
    * Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
    * on this account, expanding the grant if needed.
@@ -743,7 +820,10 @@ export interface Gatekeeper<Session> extends DurableObject {
    * simulation -- it is really up to the gatekeeper author to decide what is appropriate for the
    * particular API.
    */
-  startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session>;
+  startSession(
+    approvalQueue: RpcStub<ApprovalQueue>,
+    requestContext?: GatekeeperRequestContext,
+  ): Promise<Session>;
 
   /**
    * Bounded, user-specific metadata the agent uses to discover entries reachable through this
@@ -756,6 +836,7 @@ export interface Gatekeeper<Session> extends DurableObject {
    */
   getAgentCatalog?(
     authorizer: RpcStub<ObservationAuthorizer>,
+    requestContext?: GatekeeperRequestContext,
   ): Promise<AgentCatalog | null>;
 
   /**
@@ -803,7 +884,7 @@ export interface Gatekeeper<Session> extends DurableObject {
   removeObserver(id: string): Promise<void>;
 
   /** Returns the provider for describe().hasSlashCommands, if supported. */
-  getSlashCommandProvider?(): Promise<SlashCommandProvider>;
+  getSlashCommandProvider?(requestContext?: GatekeeperRequestContext): Promise<SlashCommandProvider>;
 
   // ---------------------------------------------------------------------------
   // Callbacks invoked by the overseer to apply (or reject) actions that were previously queued
@@ -940,10 +1021,16 @@ export interface SlashCommandProvider extends RpcTarget {
  * called before applying them.
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
+  /**
+   * Recheck the live app and caller access for this retained session before reading from the
+   * underlying service. This preflight must not be confused with authorizeObservation(), which is
+   * deliberately called after a successful read so its description can include returned data.
+   */
+  assertAppAccess(): Promise<void>;
+
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
   //   system should direct the user to the right UI to authorize the action.
-
   /**
    * Submit an action for approval.
    *

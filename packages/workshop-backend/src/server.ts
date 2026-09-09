@@ -9,7 +9,7 @@ import {
 } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, AiGatewayInfo, AiModelProvider, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, DirectoryAudienceTargets, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -27,16 +27,17 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
-import { AppUiAuthority, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import type { ContextAuthority, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { OrganizationDirectoryDurableObject } from "./organization-directory.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
-import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { DurableContextAuthority, ContextAuthorityImpl } from "./context-authority.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback, TransientStubLoopback } from "./overseer";
 import { ExternalMessageGateway } from "./external-message-gateway";
-import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
+import { RpcStub as NativeRpcStub, type RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -69,7 +70,8 @@ export { AdminSettings };
 export { OrganizationDirectoryDurableObject };
 
 // Re-export entrypoint types from user.ts.
-export { UserDurableObject, GatekeeperConnectCallbackImpl };
+export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority };
+export { DurableContextAuthority };
 
 // Re-export entrypoint types from overseer.ts.
 export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
@@ -139,21 +141,6 @@ async function handleDirectoryUserRequest(
 
 // =======================================================================================
 
-class AppUiAuthorityImpl extends NativeRpcTarget implements AppUiAuthority {
-  constructor(
-      private requireActiveCallback: () => Promise<void>,
-      private isAdminCallback: () => Promise<boolean>) {
-    super();
-  }
-
-  requireActive(): Promise<void> {
-    return this.requireActiveCallback();
-  }
-
-  isAdmin(): Promise<boolean> {
-    return this.isAdminCallback();
-  }
-}
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
@@ -203,6 +190,20 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     } catch {
       return false;
     }
+  }
+
+  /** Mint the single subject-bound authority shared by bound vendor/app UI capabilities. */
+  #contextAuthority(
+      vendorId: string | undefined,
+      assertAdditionalAccess: () => Promise<void>): NativeRpcStub<NativeRpcTarget & ContextAuthority> {
+    return new NativeRpcStub(new ContextAuthorityImpl({
+      subject: this.guard.subject,
+      vendorId,
+      directory: this.organizationDirectory.getByName(""),
+      centralAuthMode: this.centralAuthMode,
+      sessionGuard: this.guard,
+      assertAdditionalAccess,
+    }));
   }
 
   async whoami(): Promise<AiChatAuthorInfo> {
@@ -466,7 +467,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       accountId: number,
       resourceUrlPattern: string) {
     await this.#requireActive();
-    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern);
+    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern, {
+      authority: this.#contextAuthority(
+          undefined, () => this.#user.requireOptionalConnectedAccountAccess(accountId)),
+    });
   }
 
   async dismissSharedGadget(gadgetId: string): Promise<void> {
@@ -696,17 +700,31 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
     // appear in the nav even before the user opens a gadget — in a single round trip.
     let accounts = await this.#user.listProvidedAccounts();
-    return accounts
-        .filter((account: (typeof accounts)[number]) => account.description.providesUi)
-        .map((account: (typeof accounts)[number]) => ({
-          id: account.vendorId,
-          title: account.description.providesUi!.title,
-          icon: account.description.providesUi!.icon,
-        }));
+    let apps: GatekeeperAppInfo[] = [];
+    for (let account of accounts) {
+      let providesUi = account.description.providesUi;
+      if (!providesUi) continue;
+      if (this.centralAuthMode) {
+        let access = await this.organizationDirectory.getByName("")
+            .resolveAppAccess(this.guard.subject, account.vendorId);
+        if (!access.allowed) continue;
+      }
+      apps.push({
+        id: account.vendorId,
+        title: providesUi.title,
+        icon: providesUi.icon,
+      });
+    }
+    return apps;
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
     await this.#requireActive();
+    if (this.centralAuthMode) {
+      let access = await this.organizationDirectory.getByName("")
+          .resolveAppAccess(this.guard.subject, id);
+      if (!access.allowed) return null;
+    }
     // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
     // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
     let user = this.#user;  // one stub for both calls
@@ -714,10 +732,17 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let app = accounts.find((account: (typeof accounts)[number]) => account.vendorId === id && account.description.providesUi);
     if (!app) return null;
     return user.startAccountAppUi(app.accountId, {
-      authority: new AppUiAuthorityImpl(
-          () => this.#requireActive(),
-          () => this.#isAdmin()),
+      authority: this.#contextAuthority(
+          id, () => user.requireAccountAppUiAccess(app.accountId, id)),
     });
+  }
+
+  // --- Directory audiences ---
+
+  async listAudienceTargets(): Promise<DirectoryAudienceTargets> {
+    this.guard.assertValid();
+    return this.organizationDirectory.getByName("")
+        .listAudienceTargets(this.guard.subject);
   }
 
   // --- Deployment admin ---

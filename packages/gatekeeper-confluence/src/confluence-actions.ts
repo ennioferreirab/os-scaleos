@@ -85,6 +85,9 @@ export class ConfluenceStore {
     this.#kv = kv;
     this.#api = api;
   }
+  withBeforeRequest(beforeRequest: () => Promise<void>): ConfluenceStore {
+    return new ConfluenceStore(this.#kv, this.#api.withBeforeRequest(beforeRequest));
+  }
 
   get api(): ConfluenceApi {
     return this.#api;

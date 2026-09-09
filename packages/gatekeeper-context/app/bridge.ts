@@ -211,10 +211,17 @@ export function PresentationProvider({
     const requestEpoch = ++epoch.current
     const isStale = () => requestEpoch !== epoch.current || phase.current !== 'opening'
     phase.current = 'opening'
+    // Never leave the app controls inert if the host's layout acknowledgement is delayed (for
+    // example, a throttled animation frame in a background tab). The dialog remains usable inside
+    // the content pane; a prompt host acknowledgement still expands it normally.
+    fallbackTimer.current = window.setTimeout(() => {
+      if (!isStale()) commitOpen()
+    }, 250)
 
     setPresenting(true)
       .then((ack) => {
         if (isStale()) return
+        clearFallbackTimer()
         targetRect.current = ack.rect
         if (!ack.willResize || resizeSeen.current) {
           commitOpen()

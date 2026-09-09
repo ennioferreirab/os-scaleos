@@ -166,6 +166,7 @@ describe("ScheduleSessionImpl", () => {
   });
 
   it("authorizes workspace-scoped listing before returning schedules", async () => {
+    const assertAppAccess = vi.fn(async () => {});
     const authorizeObservation = vi.fn(async () => {});
     const driver = {
       listWorkspace: vi.fn(async () => [activeSummary("schedule-a")]),
@@ -173,14 +174,37 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: { assertAppAccess, authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
       controllerFactory: vi.fn(),
       driver,
     });
 
     await expect(session.list()).resolves.toEqual([activeSummary("schedule-a")]);
+    expect(assertAppAccess).toHaveBeenCalledOnce();
     expect(driver.listWorkspace).toHaveBeenCalledWith("workspace-a");
     expect(authorizeObservation).toHaveBeenCalledOnce();
+  });
+
+  it("does not read the driver when the retained-session preflight rejects", async () => {
+    const authorizationError = new Error("app access denied");
+    const assertAppAccess = vi.fn(async () => {
+      throw authorizationError;
+    });
+    const authorizeObservation = vi.fn(async () => {});
+    const driver = {
+      listWorkspace: vi.fn(async () => [activeSummary("schedule-a")]),
+    };
+    const session = new ScheduleSessionImpl({
+      accountId: "account-a",
+      workspaceId: "workspace-a",
+      approvalQueue: { assertAppAccess, authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
+      controllerFactory: vi.fn(),
+      driver,
+    });
+
+    await expect(session.list()).rejects.toBe(authorizationError);
+    expect(driver.listWorkspace).not.toHaveBeenCalled();
+    expect(authorizeObservation).not.toHaveBeenCalled();
   });
 
   it("does not bind a hook when schedule validation fails", async () => {
@@ -228,13 +252,14 @@ describe("ScheduleSessionImpl", () => {
 
   it("does not return schedules when observation authorization rejects", async () => {
     const authorizationError = new Error("authorization rejected");
+    const assertAppAccess = vi.fn(async () => {});
     const authorizeObservation = vi.fn(async () => {
       throw authorizationError;
     });
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: { assertAppAccess, authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
       controllerFactory: vi.fn(),
       driver: { listWorkspace: vi.fn(async () => [activeSummary("schedule-a")]) },
     });
@@ -311,14 +336,36 @@ describe("schedule hook controller", () => {
 });
 
 describe("ScheduleManagementApi", () => {
-  it("forwards only read-only list filters to the account driver", async () => {
+  it("rechecks the retained authority before every account read", async () => {
     const page = { schedules: [activeSummary("schedule-a")] };
     const listAccount = vi.fn(async () => page);
-    const api = new ScheduleManagementApi({ listAccount });
+    let allowed = true;
+    const assertAppAccess = vi.fn(async () => {
+      if (!allowed) throw new Error("App access denied.");
+    });
+    const dispose = vi.fn();
+    const authority = {
+      async assertAppAccess(): Promise<void> {
+        await assertAppAccess();
+      },
+      dup() {
+        return this;
+      },
+      [Symbol.dispose](): void {
+        dispose();
+      },
+    };
+    const api = new ScheduleManagementApi({ listAccount }, authority);
     const options = { query: "brief", statuses: ["active" as const] };
 
     await expect(api.list(options)).resolves.toBe(page);
-    expect(listAccount).toHaveBeenCalledWith(options);
+    allowed = false;
+    await expect(api.list(options)).rejects.toThrow("App access denied.");
+    expect(assertAppAccess).toHaveBeenCalledTimes(2);
+    expect(listAccount).toHaveBeenCalledTimes(1);
+
+    api[Symbol.dispose]();
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 });
 

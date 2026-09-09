@@ -1,73 +1,104 @@
-// Per-account management API exposed to the library iframe. Users manage their own private
-// collections; admins also manage public collections. Everything is sharing-domain scoped.
+// Per-account management API exposed to the library iframe. Collection DOs own all authorization;
+// this object only routes requests and coordinates discovery/projections.
 
 import { RpcTarget } from "capnweb";
 import type { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ContextAuthority, ContextAuthorityCapability, DirectoryAudienceTargets,
+} from "@gadgets/workshop-shared/gatekeeper";
 import {
-  ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
+  CollectionGrant, ContextApi, ContextCollectionContent, ContextCollectionMetadata,
   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
-  DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
+  ContextAccessEvent, ContextCollectionRole, ContextGrantRole, ContextGrantTargetType,
+  ContextMutationReceipt, DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
 } from "./context-types.js";
 import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import type { LibraryRegistryDurableObject } from "./registry-do.js";
-import {
-  listPublicCollectionsFromKv, metadataToSummary,
-} from "./collection-kv.js";
 import { domainName } from "./domain.js";
 
-/** Collections visible to this account's agents. */
-export async function loadEnabledContextCollections(
-    env: Pick<Cloudflare.Env, "CONTEXT_COLLECTIONS">,
-    domain: string,
-    userLibrary: DurableObjectStub<UserLibraryDurableObject>): Promise<EnabledCollectionInfo[]> {
-  let [owned, publicCollections] = await Promise.all([
-    userLibrary.listOwnedCollections(),
-    listPublicCollectionsFromKv(env, domain),
-  ]);
+type CollectionNamespace = DurableObjectNamespace<ContextCollectionDurableObject>;
+type UserLibraryNamespace = DurableObjectNamespace<UserLibraryDurableObject>;
+type RegistryNamespace = DurableObjectNamespace<LibraryRegistryDurableObject>;
 
-  let result: EnabledCollectionInfo[] = [];
-  let seen = new Set<string>();
-  for (let collection of owned) {
-    seen.add(collection.id);
-    result.push({
-      id: collection.id,
-      title: collection.title,
-      description: collection.description,
-      icon: collection.icon,
-      source: "private",
-      lastUpdated: collection.lastUpdated,
-    });
-  }
-  for (let collection of publicCollections) {
-    if (seen.has(collection.id)) continue;
-    seen.add(collection.id);
-    result.push({
-      id: collection.id,
-      title: collection.title,
-      description: collection.description,
-      icon: collection.icon,
-      source: "public",
-      lastUpdated: collection.lastUpdated,
-    });
-  }
-  return result;
+const CONTEXT_NOT_FOUND = "NOT_FOUND";
+
+function codedError(code: string, message: string): Error & {code: string} {
+  return Object.assign(new Error(message), {code});
+}
+
+function payloadHash(input: {
+  title: string;
+  description: string;
+  icon?: string;
+  source: ContextCollectionContent["source"];
+}): Promise<string> {
+  return crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(JSON.stringify(input)),
+  ).then(bytes => new Uint8Array(bytes).toHex());
+}
+
+function summaryForMetadata(metadata: ContextCollectionMetadata) {
+  return {
+    id: metadata.id,
+    title: metadata.title,
+    description: metadata.description,
+    icon: metadata.icon,
+    visibility: "private" as const,
+    documentCount: metadata.documentCount,
+    lastUpdated: metadata.lastUpdated,
+  };
+}
+
+async function liveCollectionSummaries(
+    registries: RegistryNamespace,
+    collections: CollectionNamespace,
+    domain: string,
+    authority: ContextAuthorityCapability,
+): Promise<EnabledCollectionInfo[]> {
+  let registry = registries.getByName(domain);
+  let indexed = await registry.listCollections();
+  let visible = await Promise.all(indexed.map(async summary => {
+    try {
+      return await collections
+        .get(collections.idFromName(domainName(domain, summary.id)))
+        .getAuthorizedSummary(authority);
+    } catch (error) {
+      if ((error as {code?: string})?.code === CONTEXT_NOT_FOUND) return null;
+      throw error;
+    }
+  }));
+  return visible.filter(summary => summary !== null);
+}
+
+/** Collections visible to this actor, resolved through each live Collection DO. */
+export async function loadEnabledContextCollections(
+    registries: RegistryNamespace,
+    collections: CollectionNamespace,
+    domain: string,
+    authority: ContextAuthorityCapability,
+): Promise<EnabledCollectionInfo[]> {
+  return liveCollectionSummaries(registries, collections, domain, authority);
 }
 
 @validateRpc()
 export class ContextApiImpl extends RpcTarget implements ContextApi {
+  private readonly authority: NativeRpcStub<RpcTarget & ContextAuthority>;
+
   constructor(
     private env: Cloudflare.Env,
     private domain: string,
     private accountId: string,
-    private authority: NativeRpcStub<AppUiAuthority>,
-    private collections: DurableObjectNamespace<ContextCollectionDurableObject>,
-    private userLibraries: DurableObjectNamespace<UserLibraryDurableObject>,
-    private registries: DurableObjectNamespace<LibraryRegistryDurableObject>,
+    authority: NativeRpcStub<RpcTarget & ContextAuthority>,
+    private collections: CollectionNamespace,
+    private userLibraries: UserLibraryNamespace,
+    private registries: RegistryNamespace,
   ) {
     super();
+    if (!authority) throw new Error("Context authority is required.");
+    this.authority = authority.dup();
   }
 
   #collection(id: string) {
@@ -75,40 +106,39 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   #userLib() {
-    return this.userLibraries.get(this.userLibraries.idFromName(domainName(this.domain, this.accountId)));
+    return this.userLibraries.get(
+        this.userLibraries.idFromName(domainName(this.domain, this.accountId)));
   }
 
   #registry() {
     return this.registries.getByName(this.domain);
   }
 
-  // Whether this account owns the private collection.
-  async #ownsPrivate(collectionId: string): Promise<boolean> {
-    return this.#userLib().hasOwned(collectionId);
+  async #assertActive(): Promise<void> {
+    await this.authority.assertAppAccess();
   }
 
-  // Read: own private collections or any public collection.
-  async #assertCanRead(collectionId: string): Promise<void> {
-    await this.authority.requireActive();
-    let [owns, isPublic] = await Promise.all([
-      this.#ownsPrivate(collectionId),
-      this.#registry().isPublic(collectionId),
-    ]);
-    if (!owns && !isPublic) {
-      throw new Error("Collection not found or you don't have access.");
-    }
+  async #actor(): Promise<{subject: string; isOrgAdmin: boolean}> {
+    await this.#assertActive();
+    let actor = await this.authority.getActor();
+    if (!actor?.subject) throw codedError("FORBIDDEN", "Context authority returned no Subject.");
+    return actor;
   }
 
-  // Write: own private collections, or public collections for admins.
-  async #assertCanWrite(collectionId: string): Promise<void> {
-    await this.authority.requireActive();
-    let [owns, isPublic] = await Promise.all([
-      this.#ownsPrivate(collectionId),
-      this.#registry().isPublic(collectionId),
-    ]);
-    if (owns) return;
-    if (isPublic && await this.authority.isAdmin()) return;
-    throw new Error("Collection not found or you don't have access.");
+  async #claimLegacy(collectionId: string): Promise<void> {
+    await this.#collection(collectionId).claimLegacyOwner(this.authority, this.accountId);
+  }
+
+  async #claimLegacyRows(): Promise<void> {
+    let indexed = await this.#registry().listCollections();
+    await Promise.all(indexed.map(async summary => {
+      try {
+        await this.#collection(summary.id).claimLegacyOwner(this.authority, this.accountId);
+      } catch (error) {
+        // A stale registry row is filtered by the live authorization lookup below.
+        if ((error as {code?: string})?.code !== CONTEXT_NOT_FOUND) throw error;
+      }
+    }));
   }
 
   #assertArtifactsAvailable(): void {
@@ -117,168 +147,206 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     }
   }
 
-  async #assertAdmin(): Promise<void> {
-    await this.authority.requireActive();
-    if (!(await this.authority.isAdmin())) throw new Error("Admin access required.");
-  }
-
-  async getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }> {
-    await this.authority.requireActive();
-    return {
-      isAdmin: await this.authority.isAdmin(),
-      supportsGitCollections: !!this.env.ARTIFACTS,
-    };
+  async getViewerInfo(): Promise<{isAdmin: boolean; supportsGitCollections: boolean}> {
+    let actor = await this.#actor();
+    return {isAdmin: actor.isOrgAdmin, supportsGitCollections: !!this.env.ARTIFACTS};
   }
 
   // --- Collection management ---
 
-  async createContextCollection(
-    title: string,
-    description: string,
-    visibility: ContextCollectionVisibility,
-    icon?: string,
-    source: ContextCollectionContent["source"] = "web",
-  ): Promise<ContextCollectionMetadata> {
-    if (visibility === "public") await this.#assertAdmin();
-    else await this.authority.requireActive();
+  async createCollection(input: {
+    title: string;
+    description: string;
+    icon?: string;
+    source?: ContextCollectionContent["source"];
+    mutationId: string;
+  }): Promise<{collectionId: string; receipt: ContextMutationReceipt}> {
+    let actor = await this.#actor();
+    let source = input.source ?? "web";
     if (source !== "web" && source !== "git") {
-      throw new Error(`Unsupported collection source: ${source}`);
+      throw codedError("INVALID_INPUT", `Unsupported collection source: ${source}`);
     }
-    if (source === "git" && !this.env.ARTIFACTS) {
-      throw new Error("Git-backed Context collections are not enabled.");
+    if (typeof input.mutationId !== "string" || !input.mutationId) {
+      throw codedError("INVALID_INPUT", "mutationId is required.");
+    }
+    if (typeof input.title !== "string" || typeof input.description !== "string") {
+      throw codedError("INVALID_INPUT", "title and description are required.");
     }
 
-    let id = crypto.randomUUID();
+    let hash = await payloadHash({
+      title: input.title,
+      description: input.description,
+      icon: input.icon,
+      source,
+    });
+    let reservation = await this.#userLib().reserveCollectionCreation(
+        actor.subject, input.mutationId, hash);
+    if (reservation.status === "complete" && reservation.receipt) {
+      return {collectionId: reservation.collectionId, receipt: reservation.receipt};
+    }
+    if (source === "git") this.#assertArtifactsAvailable();
+
+    let created = new Date(reservation.reservedAt);
     let metadata: ContextCollectionMetadata = {
-      id,
-      icon,
-      title,
-      description,
-      visibility,
-      created: new Date(),
-      lastUpdated: new Date(),
+      id: reservation.collectionId,
+      icon: input.icon,
+      title: input.title,
+      description: input.description,
+      visibility: "private",
+      created,
+      lastUpdated: created,
       documentCount: 0,
       content: source === "git"
-        ? { source, remote: "", branch: DEFAULT_GIT_BRANCH, lastRefreshedAt: new Date() }
-        : { source },
+        ? {source, remote: "", branch: DEFAULT_GIT_BRANCH, lastRefreshedAt: created}
+        : {source},
     };
+    metadata = await this.#collection(reservation.collectionId).initialize(
+        metadata, this.domain, this.authority, this.accountId);
 
-    // Initialize before indexing; if this fails, nothing is reachable yet.
-    metadata = await this.#collection(id).initialize(metadata, this.domain, visibility === "private" ? this.accountId : "");
-
-    // Private collections live in the owner's library; public ones live in the domain registry.
-    try {
-      if (visibility === "public") {
-        await this.#registry().addPublic(this.domain, metadataToSummary(metadata));
-      } else {
-        await this.#userLib().createOwnedCollection(id, title, description, icon);
-      }
-    } catch (err) {
-      // Indexing failed; delete the now-unreachable collection.
-      await this.#collection(id).deleteSelf().catch(() => {});
-      throw err;
+    // Registry confirmation precedes completion of the account-owned projection and success.
+    await this.#registry().upsertCollection(summaryForMetadata(metadata));
+    let completed = await this.#userLib().completeCollectionCreation(
+        actor.subject, input.mutationId, summaryForMetadata(metadata));
+    if (!completed.receipt) {
+      throw codedError("CONFLICT", "Collection creation completed without a receipt.");
     }
-    return metadata;
+    return {collectionId: completed.collectionId, receipt: completed.receipt};
   }
 
   async updateContextCollection(collectionId: string, options: {
     title?: string; description?: string; icon?: string; branch?: string;
   }): Promise<void> {
-    await this.#assertCanWrite(collectionId);
+    await this.#claimLegacy(collectionId);
     if (options.branch !== undefined) this.#assertArtifactsAvailable();
-    await this.#collection(collectionId).updateMetadata(options);
+    await this.#collection(collectionId).updateMetadata(this.authority, options);
   }
 
   async syncContextCollectionArtifactSource(collectionId: string): Promise<void> {
-    // Only collection owners/admins can manually trigger an artifact
-    // sync. Read requests from non-owners/admins may trigger a
-    // stale-while-revalidate sync in the background, but they do not
-    // have direct control over this.
-    await this.#assertCanWrite(collectionId);
+    await this.#claimLegacy(collectionId);
     this.#assertArtifactsAvailable();
-    await this.#collection(collectionId).syncArtifactSource();
+    await this.#collection(collectionId).syncArtifactSource(this.authority);
   }
 
   async createContextCollectionGitToken(collectionId: string): Promise<ContextGitTokenCreateResult> {
-    await this.#assertCanWrite(collectionId);
+    await this.#claimLegacy(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).createGitToken();
+    return this.#collection(collectionId).createGitToken(this.authority);
   }
 
   async listContextCollectionGitTokens(collectionId: string): Promise<ContextGitTokenList> {
-    await this.#assertCanWrite(collectionId);
+    await this.#claimLegacy(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).listGitTokens();
+    return this.#collection(collectionId).listGitTokens(this.authority);
   }
 
   async revokeContextCollectionGitToken(collectionId: string, tokenId: string): Promise<boolean> {
-    await this.#assertCanWrite(collectionId);
+    await this.#claimLegacy(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).revokeGitToken(tokenId);
+    return this.#collection(collectionId).revokeGitToken(this.authority, tokenId);
   }
 
   async deleteContextCollection(collectionId: string): Promise<void> {
-    await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).deleteSelf();
+    await this.#claimLegacy(collectionId);
+    await this.#collection(collectionId).deleteSelf(this.authority);
   }
 
   async getContextCollectionMetadata(collectionId: string): Promise<ContextCollectionMetadata | null> {
-    await this.authority.requireActive();
-    try {
-      let [meta, owns, isPublic] = await Promise.all([
-        this.#collection(collectionId).getMetadata(),
-        this.#ownsPrivate(collectionId),
-        this.#registry().isPublic(collectionId),
-      ]);
-      if (!meta.id || (!owns && !isPublic)) return null;
-      return meta;
-    } catch {
-      return null;
-    }
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).getMetadata(this.authority);
   }
 
   // --- Document editing ---
 
   async listContextDocuments(collectionId: string, prefix?: string): Promise<ContextDocumentSummary[]> {
-    await this.#assertCanRead(collectionId);
-    return this.#collection(collectionId).listContextDocuments(prefix);
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).listContextDocuments(this.authority, prefix);
   }
 
   async getContextDocument(collectionId: string, path: string): Promise<ContextDocument | null> {
-    await this.#assertCanRead(collectionId);
-    return this.#collection(collectionId).getContextDocument(path);
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).getContextDocument(this.authority, path);
   }
 
   async putContextDocument(collectionId: string, path: string, doc: {
     description: string; body: string; contentType?: string;
   }): Promise<void> {
-    await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).putContextDocument(path, doc);
+    await this.#claimLegacy(collectionId);
+    await this.#collection(collectionId).putContextDocument(this.authority, path, doc);
   }
 
   async deleteContextDocument(collectionId: string, path: string): Promise<void> {
-    await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).deleteContextDocument(path);
+    await this.#claimLegacy(collectionId);
+    await this.#collection(collectionId).deleteContextDocument(this.authority, path);
   }
 
   async moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void> {
-    await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).moveContextDocument(fromPath, toPath);
+    await this.#claimLegacy(collectionId);
+    await this.#collection(collectionId).moveContextDocument(this.authority, fromPath, toPath);
   }
 
-  // --- Listing & access ---
+  /** Active directory targets available to the authenticated Share picker. */
+  async listAccessTargets(): Promise<DirectoryAudienceTargets> {
+    await this.#assertActive();
+    return this.authority.listAudienceTargets();
+  }
+
+  async listAccess(collectionId: string): Promise<CollectionGrant[]> {
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).listAccess(this.authority);
+  }
+
+  async setAccess(input: {
+    collectionId: string;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    role: ContextGrantRole;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt> {
+    await this.#claimLegacy(input.collectionId);
+    return this.#collection(input.collectionId).setAccess({
+      authority: this.authority,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      role: input.role,
+      mutationId: input.mutationId,
+    });
+  }
+
+  async removeAccess(input: {
+    collectionId: string;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt> {
+    await this.#claimLegacy(input.collectionId);
+    return this.#collection(input.collectionId).removeAccess({
+      authority: this.authority,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      mutationId: input.mutationId,
+    });
+  }
+
+  async getMyAccess(collectionId: string): Promise<{
+    role: Exclude<ContextCollectionRole, "none">; sources: string[];
+  }> {
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).getMyAccess(this.authority);
+  }
+
+  async listAccessEvents(collectionId: string, limit?: number): Promise<ContextAccessEvent[]> {
+    await this.#claimLegacy(collectionId);
+    return this.#collection(collectionId).listAccessEvents(this.authority, limit);
+  }
 
   async listEnabledContextCollections(): Promise<EnabledCollectionInfo[]> {
-    await this.authority.requireActive();
-    return loadEnabledContextCollections(this.env, this.domain, this.#userLib());
+    await this.#assertActive();
+    await this.#claimLegacyRows();
+    return loadEnabledContextCollections(
+        this.registries, this.collections, this.domain, this.authority);
   }
 
-  async canWriteContextCollection(collectionId: string): Promise<boolean> {
-    await this.authority.requireActive();
-    let [owns, isPublic] = await Promise.all([
-      this.#ownsPrivate(collectionId),
-      this.#registry().isPublic(collectionId),
-    ]);
-    return owns || (isPublic && await this.authority.isAdmin());
+  [Symbol.dispose](): void {
+    this.authority[Symbol.dispose]();
   }
 }

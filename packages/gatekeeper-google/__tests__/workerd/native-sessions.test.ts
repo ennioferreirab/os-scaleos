@@ -23,6 +23,8 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
     this.observations.push(description);
   }
 
+  async assertAppAccess(): Promise<void> {}
+
   async submitAction(_action: number, _description: ActionDescription): Promise<void> {
     throw new Error("Unexpected action submission");
   }

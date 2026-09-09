@@ -4,6 +4,7 @@ import {
   GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, GatekeeperUserVerifier, VendorDescription,
   GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription,
   SupportedResource, ResourceConfiguratorFrame, ResourceDescription, ApprovalQueue, ActionKind,
+  type AppUiContext, type GatekeeperVerifierContext, type VerifierAppAuthority,
   stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -441,18 +442,23 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     };
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Cloudflare app authority is unavailable.");
     const getToken = () => this.#account().getAccessToken();
     if (resourceUrlPattern === ACCOUNT_OBSERVABILITY_RESOURCE.urlPattern) {
       return {
         iframeHtml: ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CloudflareAccountConfiguratorUI(getToken)),
+        ui: new RpcStub(new CloudflareAccountConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === WORKER_OBSERVABILITY_RESOURCE.urlPattern) {
       return {
         iframeHtml: WORKER_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken)),
+        ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken, authority)),
       };
     }
     throw new Error(`Unsupported Cloudflare resource configurator type: ${resourceUrlPattern}`);
@@ -470,9 +476,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.CloudflareVerifier({
-      props: { userObjectId: this.ctx.props.userObjectId },
+      props: {
+        userObjectId: this.ctx.props.userObjectId,
+        authority: context.authority,
+      },
     });
   }
 }
@@ -483,17 +492,23 @@ export interface CloudflareVerifierApi extends GatekeeperUserVerifier {
   hasObservabilityAccess(accountId: string, workerName?: string): Promise<boolean>;
 }
 
+type CloudflareVerifierProps = {
+  userObjectId: string;
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 /** Verifies an observer's access using that observer's own Cloudflare credentials. */
 @validateRpc()
-export class CloudflareVerifier extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
+export class CloudflareVerifier extends WorkerEntrypoint<Env, CloudflareVerifierProps>
     implements CloudflareVerifierApi {
   async hasObservabilityAccess(accountId: string, workerName?: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
     try {
       await new CloudflareObservabilityApi(
         () => account.getAccessToken(), accountId, workerName,
-      ).listKeys({ limit: 1 });
+      ).withBeforeRequest(() => this.ctx.props.authority.requireAppAccess()).listKeys({ limit: 1 });
       return true;
     } catch (error) {
       if (deniesAccess(error)) {

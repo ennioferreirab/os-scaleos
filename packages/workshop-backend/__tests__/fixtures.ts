@@ -76,6 +76,10 @@ export async function openFakeOverseer(
   let role = opts.role ?? "build";
   let ownerId = "owner-id";
   let userId = role === "build" ? ownerId : "viewer-id";
+  // In-process test storage has a deliberately partial shape; this names the single lost type.
+  const fixtureStorage = storage as {
+    boundHooks?: {get(id: number): {enabled: boolean} | undefined};
+  };
   let overseer = {
     open: OverseerDurableObject.prototype.open,
     impl: {
@@ -86,6 +90,14 @@ export async function openFakeOverseer(
       joinOutputsFanout: () => () => {},
       ensureObserver: async () => {},
       syncOutputsTo: async () => {},
+      assertHookAccess: async (id: number, requireEnabled = true) => {
+        let record = fixtureStorage.boundHooks?.get(id);
+        if (!record) throw new Error("Hook has been deleted.");
+        if (requireEnabled && !record.enabled) {
+          throw new Error("Hook has been deleted or disabled.");
+        }
+        return record;
+      },
       getGadgetRecord: (id: number) => {
         const record = (storage as {gadgets: {get(id: number): unknown}}).gadgets.get(id);
         if (!record) throw new Error(`No such gadget: ${id}`);

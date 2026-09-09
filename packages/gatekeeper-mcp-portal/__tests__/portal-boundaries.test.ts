@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
+
 import type { McpServerConfiguratorRpc } from
   "../src/configurator/server-configurator-types.js";
+
+type TestAuthority = Pick<ContextAuthority, "assertAppAccess"> & {
+  requireAppAccess(): Promise<void>;
+  dup(): TestAuthority;
+  [Symbol.dispose](): void;
+};
 
 const mocks = vi.hoisted(() => ({ withClient: vi.fn() }));
 
@@ -20,6 +28,7 @@ import portalHandler, {
   GatekeeperVendor,
   McpAccount,
   McpGatekeeperImpl,
+  McpPortalVerifier,
 } from "../src/portal.js";
 
 const ENDPOINT = "https://gw.example.com/mcp";
@@ -30,14 +39,20 @@ type FakeClient = {
   listMatchingToolSummaries: ReturnType<typeof vi.fn>;
 };
 
+type VerifierFactoryInput = {
+  props: { authority: TestAuthority };
+};
+
 function makeSubject(
   hiddenServerIds = "jira",
   auth = "oauth",
   vaultIdentity: { accountKey: string; credentialGeneration: number; label: string } | null = null,
 ): {
   user: GatekeeperUserImpl;
+  account: { getServer: ReturnType<typeof vi.fn> };
   client: FakeClient;
   gatekeeperFactory: ReturnType<typeof vi.fn>;
+  verifierFactory: ReturnType<typeof vi.fn>;
 } {
   const client: FakeClient = {
     callTool: vi.fn(async () => ({
@@ -66,6 +81,8 @@ function makeSubject(
     getVaultIdentity: vi.fn(async () => vaultIdentity),
   };
   const gatekeeperFactory = vi.fn(() => ({ kind: "gatekeeper" }));
+  const verifierFactory = vi.fn((input: VerifierFactoryInput) =>
+    new McpPortalVerifier(input as never, {} as never));
   const ctx = {
     props: { accountObjectId: "account-id" },
     exports: {
@@ -74,6 +91,7 @@ function makeSubject(
         get: vi.fn(() => account),
       },
       McpGatekeeperImpl: gatekeeperFactory,
+      McpPortalVerifier: verifierFactory,
     },
   };
   const env = {
@@ -82,11 +100,42 @@ function makeSubject(
     MCP_PORTAL_AUTH: auth,
     MCP_PORTAL_HIDDEN_SERVER_IDS: hiddenServerIds,
   };
-  return { user: new GatekeeperUserImpl(ctx as never, env as never), client, gatekeeperFactory };
+  return {
+    user: new GatekeeperUserImpl(ctx as never, env as never),
+    account,
+    client,
+    gatekeeperFactory,
+    verifierFactory,
+  };
 }
 
-async function configuratorFor(user: GatekeeperUserImpl): Promise<McpServerConfiguratorRpc> {
-  const frame = await user.startResourceConfigurator("https://gw.example.com/*");
+function makeAuthority() {
+  let allowed = true;
+  const checkAccess = async () => {
+    if (!allowed) throw new Error("App access denied.");
+  };
+  const assertAppAccess = vi.fn(checkAccess);
+  const requireAppAccess = vi.fn(checkAccess);
+  const authority: TestAuthority = {
+    assertAppAccess,
+    requireAppAccess,
+    dup() { return authority; },
+    [Symbol.dispose]: vi.fn(),
+  };
+  return {
+    authority,
+    deny: () => { allowed = false; },
+    assertAppAccess,
+    requireAppAccess,
+  };
+}
+
+async function configuratorFor(
+  user: GatekeeperUserImpl,
+  authority = makeAuthority().authority,
+): Promise<McpServerConfiguratorRpc> {
+  const frame = await user.startResourceConfigurator(
+    "https://gw.example.com/*", { authority } as never);
   return (frame.ui as unknown as { target: McpServerConfiguratorRpc }).target;
 }
 
@@ -122,6 +171,40 @@ describe("hidden portal server boundaries", () => {
     await expect(user.getGatekeeperClassFor(`${ENDPOINT}#server=jira`))
       .rejects.toThrow(/available through its native connector instead/);
     expect(mocks.withClient).not.toHaveBeenCalled();
+  });
+
+  it("rechecks retained configurator authority before reading portal data", async () => {
+    const { user, account } = makeSubject();
+    const live = makeAuthority();
+    const ui = await configuratorFor(user, live.authority);
+
+    await expect(ui.listServerOptions()).resolves.toHaveLength(1);
+    const serverReads = account.getServer.mock.calls.length;
+    const remoteReads = mocks.withClient.mock.calls.length;
+
+    live.deny();
+    await expect(ui.getEndpoint()).rejects.toThrow("App access denied.");
+    await expect(ui.listServerOptions()).rejects.toThrow("App access denied.");
+    await expect(ui.listToolOptions("gitlab")).rejects.toThrow("App access denied.");
+    await expect(ui.listToolOptions("")).rejects.toThrow("App access denied.");
+
+    expect(account.getServer).toHaveBeenCalledTimes(serverReads);
+    expect(mocks.withClient).toHaveBeenCalledTimes(remoteReads);
+    expect(live.assertAppAccess).toHaveBeenCalledTimes(5);
+  });
+
+  it("retains verifier authority and denies verification before local reads", async () => {
+    const { user, account, verifierFactory } = makeSubject();
+    const live = makeAuthority();
+    const verifier = await user.getVerifier({ authority: live.authority } as never);
+    expect(verifierFactory).toHaveBeenCalledWith({ props: { authority: live.authority } });
+
+    live.deny();
+    const verifierApi = verifier as unknown as { verify(): Promise<void> };
+    await expect(verifierApi.verify()).rejects.toThrow("App access denied.");
+    expect(account.getServer).not.toHaveBeenCalled();
+    expect(mocks.withClient).not.toHaveBeenCalled();
+    expect(live.requireAppAccess).toHaveBeenCalledOnce();
   });
 
   it("keeps an existing hidden-server facet usable", async () => {

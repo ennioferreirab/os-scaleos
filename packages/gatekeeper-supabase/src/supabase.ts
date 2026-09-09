@@ -4,10 +4,13 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type AppUiContext,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
+  type VerifierAppAuthority,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
@@ -632,17 +635,24 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     throw new Error(`Unsupported Supabase URL: ${url}`);
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Supabase app authority is unavailable.");
+    await authority.assertAppAccess();
     if (resourceUrlPattern === PROJECT_RESOURCE.urlPattern) {
       return {
         iframeHtml: SUPABASE_PROJECT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SupabaseProjectConfiguratorUI(this.#getToken)),
+        ui: new RpcStub(new SupabaseProjectConfiguratorUI(this.#getToken, authority.dup())),
       };
     }
     if (resourceUrlPattern === ORGANIZATION_RESOURCE.urlPattern) {
       return {
         iframeHtml: SUPABASE_ORGANIZATION_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SupabaseOrganizationConfiguratorUI(this.#getToken)),
+        ui: new RpcStub(new SupabaseOrganizationConfiguratorUI(
+          this.#getToken, authority.dup())),
       };
     }
     throw new Error(`Unsupported Supabase resource configurator type: ${resourceUrlPattern}`);
@@ -665,8 +675,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * against the observer's *own* Supabase token.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    const props: SupabaseVerifierProps = { userObjectId: this.ctx.props.userObjectId };
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    const props: SupabaseVerifierProps = {
+      userObjectId: this.ctx.props.userObjectId, authority: context.authority,
+    };
     return this.ctx.exports.SupabaseVerifier({ props });
   }
 }
@@ -685,6 +697,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
 type SupabaseVerifierProps = {
   userObjectId: string;
+  authority: Fetcher<VerifierAppAuthority>;
 };
 
 /**
@@ -710,10 +723,13 @@ export class SupabaseVerifier extends WorkerEntrypoint<Env, SupabaseVerifierProp
   #api(): SupabaseApi {
     const account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
-    return new SupabaseApi(async () => (await account.getAccessToken()).token);
+    return new SupabaseApi(
+      async () => (await account.getAccessToken()).token,
+      () => this.ctx.props.authority.requireAppAccess());
   }
 
   async hasProjectAccess(refs: string[]): Promise<boolean[]> {
+    await this.ctx.props.authority.requireAppAccess();
     if (refs.length === 0) return [];
     try {
       const projects = await this.#api().listProjects();
@@ -728,6 +744,7 @@ export class SupabaseVerifier extends WorkerEntrypoint<Env, SupabaseVerifierProp
   }
 
   async hasOrgAccess(slug: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     try {
       const orgs = await this.#api().listOrganizations();
       return orgs.some(org => org.slug === slug);
@@ -812,10 +829,9 @@ class SupabaseCache {
 // store. It is NOT an RpcTarget — it is captured privately by the session objects.
 
 class SupabaseSessionContext {
-  // A .dup() of the queue passed to startSession (so it outlives that call). We deliberately do not
-  // dispose it ourselves: disposing a stub schedules an RPC release, and doing that during isolate
-  // shutdown trips a fatal workerd assertion. Like the reference gatekeepers, we let the session's
-  // RPC connection teardown reclaim it.
+  // Each context owns a duplicated queue for exactly one retained capability. Child capabilities
+  // clone the context (and duplicate the queue) so disposing one capability never releases a queue
+  // still needed by another.
   readonly approvalQueue: RpcStub<ApprovalQueue>;
   #api: SupabaseApi;
   #cache: SupabaseCache;
@@ -842,6 +858,17 @@ class SupabaseSessionContext {
     this.#noteExpired = noteExpired;
     this.#projectObservationHook = projectObservationHook;
   }
+  dup(): SupabaseSessionContext {
+    let approvalQueue = this.approvalQueue.dup();
+    return new SupabaseSessionContext(
+      this.#api.withAppAccessGuard(() => approvalQueue.assertAppAccess()),
+      approvalQueue,
+      this.#cache,
+      this.#pending,
+      this.#noteExpired,
+      this.#projectObservationHook,
+    );
+  }
 
   // Authorize an observation that reveals data belonging to a specific project. For organization
   // bindings this also tracks the project as an observed data set and excludes any observers who
@@ -851,16 +878,20 @@ class SupabaseSessionContext {
     ref: string,
     description: { title: string; description: string },
   ): Promise<void> {
-    const check = this.#projectObservationHook
-      ? await this.#projectObservationHook(ref)
-      : {pendingProjects: [], commit() {}};
+    let check: ProjectObservationCheck;
+    if (this.#projectObservationHook) {
+      await this.approvalQueue.assertAppAccess();
+      check = await this.#projectObservationHook(ref);
+    } else {
+      check = {pendingProjects: [], commit() {}};
+    }
     await this.approvalQueue.authorizeObservation({
       ...description, excludeObservers: check.excludeObservers,
     });
     check.commit();
   }
 
-  async run<T>(fn: (api: SupabaseApi) => Promise<T>): Promise<T> {
+  async #runWithErrorHandling<T>(fn: (api: SupabaseApi) => Promise<T>): Promise<T> {
     try {
       return await fn(this.#api);
     } catch (error) {
@@ -877,11 +908,17 @@ class SupabaseSessionContext {
     }
   }
 
+  async run<T>(fn: (api: SupabaseApi) => Promise<T>): Promise<T> {
+    await this.approvalQueue.assertAppAccess();
+    return await this.#runWithErrorHandling(fn);
+  }
+
   // Returns a cached value if fresh, otherwise loads it (with auth handling) and caches it.
   async cached<T>(key: string, ttlMs: number, loader: (api: SupabaseApi) => Promise<T>): Promise<T> {
+    await this.approvalQueue.assertAppAccess();
     const hit = this.#cache.get<T>(key, ttlMs);
     if (hit !== undefined) return hit;
-    const value = await this.run(loader);
+    const value = await this.#runWithErrorHandling(loader);
     this.#cache.put(key, value);
     return value;
   }
@@ -890,6 +927,7 @@ class SupabaseSessionContext {
   // SupabaseGatekeeperImpl.applyAction() once approved. (The approval contract is between this
   // gatekeeper and the Workshop/approver and is intentionally invisible to the calling Gadget.)
   async submitExecute(ref: string, sql: string, params?: SupabaseValue[]): Promise<void> {
+    await this.approvalQueue.assertAppAccess();
     const action: StoredExecuteAction = { ref, sql, params, submittedAt: Date.now() };
     const actionId = this.#pending.submit(action);
     try {
@@ -911,6 +949,7 @@ class SupabaseSessionContext {
     }
   }
 }
+
 
 // ---------------------------------------------------------------------------
 // GatekeeperImpl DO — per-resource instance, runs as a facet of the Overseer.
@@ -961,9 +1000,10 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
     const projectObservationHook = this.ctx.props.resourceKind === "organization"
       ? (ref: string) => this.#prepareProjectObservation(ref)
       : undefined;
+    const sessionQueue = approvalQueue.dup();
     return new SupabaseSessionContext(
-      this.#makeApi(),
-      approvalQueue.dup(),
+      this.#makeApi().withAppAccessGuard(() => sessionQueue.assertAppAccess()),
+      sessionQueue,
       new SupabaseCache(this.ctx.storage.kv),
       new PendingActionStore(this.ctx.storage.kv),
       async () => { await this.#userAccount().noteCredentialsExpired(); },
@@ -1215,6 +1255,10 @@ class SupabaseOrganizationImpl extends RpcTarget implements SupabaseOrganization
     this.#ctx = ctx;
     this.#slug = slug;
   }
+  [Symbol.dispose](): void {
+    this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
 
   async getInfo(): Promise<SupabaseOrganizationInfo> {
     const info = await this.#ctx.cached(cacheKey("org", this.#slug), METADATA_CACHE_TTL_MS, async api => {
@@ -1238,7 +1282,6 @@ class SupabaseOrganizationImpl extends RpcTarget implements SupabaseOrganization
       const all = await api.listProjects();
       return all.filter(project => project.organization_slug === this.#slug).map(projectSummary);
     });
-
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "List Supabase projects",
       description:
@@ -1248,20 +1291,19 @@ class SupabaseOrganizationImpl extends RpcTarget implements SupabaseOrganization
   }
 
   async getProject(ref: string): Promise<SupabaseProject> {
-    // Authorize first: this performs an external read and would otherwise be an unlogged
-    // existence/membership oracle for arbitrary project refs.
-    await this.#ctx.authorizeProjectObservation(ref, {
-      title: "Open Supabase project",
-      description: `Look up Supabase project \`${ref}\` within organization \`${this.#slug}\`.`,
-    });
-
     // Verify the project belongs to this organization before handing out a capability for it.
     const project = await fetchProjectInfo(this.#ctx, ref);
     if (project.organizationSlug !== this.#slug) {
       throw new Error(`Project ${ref} is not part of organization ${this.#slug}.`);
     }
-    return new SupabaseProjectImpl(this.#ctx, ref);
+    await this.#ctx.authorizeProjectObservation(ref, {
+      title: "Open Supabase project",
+      description: `Look up Supabase project \`${ref}\` within organization \`${this.#slug}\`.`,
+    });
+    return new SupabaseProjectImpl(this.#ctx.dup(), ref);
+
   }
+
 }
 
 @validateRpc()
@@ -1274,6 +1316,10 @@ class SupabaseProjectImpl extends RpcTarget implements SupabaseProject {
     this.#ctx = ctx;
     this.#ref = ref;
   }
+  [Symbol.dispose](): void {
+    this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
 
   async getInfo(): Promise<SupabaseProjectInfo> {
     const info = await fetchProjectInfo(this.#ctx, this.#ref);
@@ -1287,7 +1333,8 @@ class SupabaseProjectImpl extends RpcTarget implements SupabaseProject {
 
   async getDatabase(): Promise<SupabaseDatabase> {
     // Returns a capability only; no external data is read here, so no observation is recorded.
-    return new SupabaseDatabaseImpl(this.#ctx, this.#ref);
+    return new SupabaseDatabaseImpl(this.#ctx.dup(), this.#ref);
+
   }
 
 
@@ -1368,6 +1415,9 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     this.#ctx = ctx;
     this.#ref = ref;
   }
+  [Symbol.dispose](): void {
+    this.#ctx.approvalQueue[Symbol.dispose]();
+  }
 
   async query(sql: string, params?: SupabaseValue[]): Promise<SupabaseQueryResult> {
     assertReadOnlyQuerySafe(sql);
@@ -1399,7 +1449,7 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     const schemas = await this.#ctx.cached(
       cacheKey("schemas", this.#ref),
       SCHEMA_CACHE_TTL_MS,
-      api => listSchemas(api, this.#ref),
+      api => listSchemas(api, this.#ref, () => this.#ctx.approvalQueue.assertAppAccess()),
     );
 
     await this.#ctx.authorizeProjectObservation(this.#ref, {
@@ -1417,7 +1467,8 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     const tables = await this.#ctx.cached(
       cacheKey("tables", this.#ref, schema, includeViews),
       SCHEMA_CACHE_TTL_MS,
-      api => listTables(api, this.#ref, { schema, includeViews }),
+      api => listTables(
+        api, this.#ref, { schema, includeViews }, () => this.#ctx.approvalQueue.assertAppAccess()),
     );
 
     await this.#ctx.authorizeProjectObservation(this.#ref, {
@@ -1432,7 +1483,7 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     const details = await this.#ctx.cached(
       cacheKey("table", this.#ref, schema, name),
       SCHEMA_CACHE_TTL_MS,
-      api => describeTable(api, this.#ref, schema, name),
+      api => describeTable(api, this.#ref, schema, name, () => this.#ctx.approvalQueue.assertAppAccess()),
     );
 
     await this.#ctx.authorizeProjectObservation(this.#ref, {

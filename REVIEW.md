@@ -24,17 +24,26 @@ through logs and errors, then everything else.
 
 ## Capability-based security
 
-- A resource becomes "ambient" (auto-injected) only through user or admin configuration. A
-  gatekeeper must never assert its own ambience.
-- `getGatekeeperClassFor()` in `packages/workshop-backend/src/user.ts` (not the same-named vendor
-  method each gatekeeper implements) is the single chokepoint where disabled gatekeepers and
-  resources are enforced before a capability is minted. Flag any new path that mints a gatekeeper
-  capability without going through it.
-- Authentication and authorization config (`AUTH_GATEKEEPERS`, `DISABLE_PASSWORD_AUTH`) is
-  deliberately env-var driven in `auth/config.ts` and must **not** move into `AdminConfig`, so a
-  compromised admin session cannot change it. Reject changes that relocate it.
-- `AdminSettings` is the only writer of the authoritative `AdminConfig`. Other code reads through
-  `readAdminConfig(env)`.
+- A resource becomes ambient only through kernel-controlled provisioning. A gatekeeper or iframe
+  must never assert its own ambience, Subject, audience membership, or admin role.
+- In central auth, `OrganizationDirectory.resolveAppAccess()` is the sole registered-vendor policy
+  decision. IDs are exact; absence is disabled. Reject any parallel vendor-availability field in
+  `AdminConfig`, client-side allow flag, or cached authorization snapshot.
+- Trace every new app path through discovery/connection, account provisioning, UI and singleton
+  issuance, resource-class issuance, workspace bindings, sessions, observations/actions, and hooks.
+  Policy must be checked before external/vendor RPC and again at every retained capability use.
+- App UI receives only the kernel-minted, Subject-bound `ContextAuthority`; non-Context vendors use
+  its `assertAppAccess()` method, while Context also resolves actors and audiences through it.
+  Long-lived hook state stores the trusted owner Subject plus workspace/hook identity, never a
+  human JWT or `HumanSessionGuard`; callback and approval-queue use must revalidate live owner,
+  app, workspace, hook, and target state.
+- App denial preserves account/content, gatekeeper records, bindings, schedules, and hooks. Local
+  cleanup can remain reachable; re-enabling must not recreate a deleted audience grant.
+- Resource-specific `AdminConfig.disabledResources` remains a separate check after app access.
+- Authentication configuration (`AUTH_GATEKEEPERS`, `DISABLE_PASSWORD_AUTH`) is env-var driven and
+  must not move into either administrative policy store.
+- `AdminSettings` owns `AdminConfig`; `OrganizationDirectoryDurableObject` owns directory users,
+  groups, app policies, receipts, versions, previews, and their audit events.
 - In `packages/mcp-shared/`, `tools.ts` is the trust boundary: nothing outside it may read a tool's
   annotations, a tool is an observation only when the server declares `readOnlyHint: true`, and
   auto-applying a write additionally requires a `vetted` endpoint. Every SDK OAuth operation must be

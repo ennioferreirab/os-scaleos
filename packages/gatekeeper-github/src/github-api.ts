@@ -209,6 +209,7 @@ async function request<T>(
   path: string,
   options: RequestOptions = {},
   getToken?: () => Promise<string>,
+  beforeRequest?: () => Promise<void>,
 ): Promise<RequestResult<T>> {
   const url = new URL(path, options.baseUrl ?? API_BASE_URL);
 
@@ -230,6 +231,7 @@ async function request<T>(
     }
   }
 
+  await beforeRequest?.();
   const authMode = options.auth ?? "bearer";
   if (authMode === "bearer") {
     if (!getToken) {
@@ -252,6 +254,7 @@ async function request<T>(
     body = JSON.stringify(options.body);
   }
 
+  await beforeRequest?.();
   const response = await fetch(url.toString(), {
     method,
     headers,
@@ -361,9 +364,19 @@ export async function revokeOAuthGrant(
 
 export class GitHubApi {
   #getToken: () => Promise<string>;
+  #beforeRequest?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, beforeRequest?: () => Promise<void>) {
     this.#getToken = getToken;
+    this.#beforeRequest = beforeRequest;
+  }
+
+  withBeforeRequest(beforeRequest: () => Promise<void>): GitHubApi {
+    const existing = this.#beforeRequest;
+    return new GitHubApi(this.#getToken, async () => {
+      await existing?.();
+      await beforeRequest();
+    });
   }
 
   async #request<T>(
@@ -371,7 +384,7 @@ export class GitHubApi {
     path: string,
     options: RequestOptions = {},
   ): Promise<RequestResult<T>> {
-    return await request<T>(method, path, options, this.#getToken);
+    return await request<T>(method, path, options, this.#getToken, this.#beforeRequest);
   }
 
   async #conditionalGet<T>(

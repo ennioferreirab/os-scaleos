@@ -5,15 +5,19 @@ import {
   stripTrailingSlashes,
   type AccountDescription,
   type AvatarImage,
+  type ContextAuthority,
+  type AppUiContext,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  type VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
 import AREA_CONFIGURATOR_HTML from "./generated/area-configurator-ui.txt";
@@ -568,35 +572,39 @@ export class HomeAssistantUserImpl
     return SUPPORTED_RESOURCES;
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Home Assistant app authority is unavailable.");
     const userAccount = this.#userAccount();
     const credsGetter = async () => await userAccount.getCredentials();
-
     switch (resourceUrlPattern) {
       case INSTANCE_RESOURCE.urlPattern:
         return {
           iframeHtml: INSTANCE_CONFIGURATOR_HTML,
-          ui: new RpcStub(new InstanceConfiguratorUI(credsGetter)),
+          ui: new RpcStub(new InstanceConfiguratorUI(credsGetter, authority)),
         };
       case AREA_RESOURCE.urlPattern:
         return {
           iframeHtml: AREA_CONFIGURATOR_HTML,
-          ui: new RpcStub(new AreaConfiguratorUI(credsGetter)),
+          ui: new RpcStub(new AreaConfiguratorUI(credsGetter, authority)),
         };
       case LABEL_RESOURCE.urlPattern:
         return {
           iframeHtml: LABEL_CONFIGURATOR_HTML,
-          ui: new RpcStub(new LabelConfiguratorUI(credsGetter)),
+          ui: new RpcStub(new LabelConfiguratorUI(credsGetter, authority)),
         };
       case DEVICE_RESOURCE.urlPattern:
         return {
           iframeHtml: DEVICE_CONFIGURATOR_HTML,
-          ui: new RpcStub(new DeviceConfiguratorUI(credsGetter)),
+          ui: new RpcStub(new DeviceConfiguratorUI(credsGetter, authority)),
         };
       case ENTITY_RESOURCE.urlPattern:
         return {
           iframeHtml: ENTITY_CONFIGURATOR_HTML,
-          ui: new RpcStub(new EntityConfiguratorUI(credsGetter)),
+          ui: new RpcStub(new EntityConfiguratorUI(credsGetter, authority)),
         };
       default:
         throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
@@ -690,20 +698,26 @@ export class HomeAssistantUserImpl
    * Mint a verifier representing this account. Home Assistant uses the "low-stakes" observer
    * strategy (see HomeAssistantGatekeeperImpl.addObserver): it is a self-hosted personal system,
    * and its long-lived access token is all-or-nothing (HA exposes no per-user/per-entity ACL we
-   * could verify an observer against), so there is nothing meaningful to check. The verifier
-   * carries no identity and is never consulted — but the overseer mints one on every open, so it
-   * must exist and not throw.
+   * could verify an observer against). The verifier carries a durable app-policy authority and
+   * performs no resource-specific identity check, but it still rechecks app access when invoked.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.HomeAssistantVerifier({});
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.HomeAssistantVerifier({
+      props: { authority: context.authority },
+    });
   }
 }
 
 // A trivial verifier since Home Assistant's observer strategy is low-stakes.
 @validateRpc()
-export class HomeAssistantVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
+export class HomeAssistantVerifier
+  extends WorkerEntrypoint<Env, { authority: Fetcher<VerifierAppAuthority> }>
+  implements GatekeeperUserVerifier
+{
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -718,15 +732,35 @@ const instanceConfiguratorGetters = new WeakMap<
   object,
   () => Promise<HomeAssistantCredentials>
 >();
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+function disposeAuthority(authority: RpcStub<ConfiguratorAuthority>): void {
+  try {
+    const dispose = Reflect.get(authority, Symbol.dispose);
+    if (typeof dispose === "function") dispose.call(authority);
+  } catch {
+    // Already-disposed / runtime-missing dispose: ignore.
+  }
+}
 
 @validateRpc()
 class InstanceConfiguratorUI extends RpcTarget implements HomeAssistantInstanceConfiguratorRpc {
-  constructor(getCredentials: () => Promise<HomeAssistantCredentials>) {
+  #authority: RpcStub<ConfiguratorAuthority>;
+
+  constructor(
+    getCredentials: () => Promise<HomeAssistantCredentials>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
     instanceConfiguratorGetters.set(this, getCredentials);
+    this.#authority = authority.dup();
+  }
+
+  [Symbol.dispose](): void {
+    disposeAuthority(this.#authority);
   }
 
   async resourceUrl(): Promise<string> {
+    await this.#authority.assertAppAccess();
     const getter = instanceConfiguratorGetters.get(this);
     if (!getter) throw new Error("Configurator is not initialized.");
     const creds = await getter();
@@ -734,9 +768,11 @@ class InstanceConfiguratorUI extends RpcTarget implements HomeAssistantInstanceC
   }
 
   async describeInstance(): Promise<{ name: string; baseUrl: string }> {
+    await this.#authority.assertAppAccess();
     const getter = instanceConfiguratorGetters.get(this);
     if (!getter) throw new Error("Configurator is not initialized.");
     const creds = await getter();
+    await this.#authority.assertAppAccess();
     let name = "Home Assistant";
     try {
       const config = await new HomeAssistantRest(creds).getConfig();
@@ -789,13 +825,23 @@ function buildEntityUrl(entityId: string): string {
 
 @validateRpc()
 class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfiguratorRpc {
-  constructor(getCredentials: () => Promise<HomeAssistantCredentials>) {
+  #authority: RpcStub<ConfiguratorAuthority>;
+  constructor(
+    getCredentials: () => Promise<HomeAssistantCredentials>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
+    this.#authority = authority.dup();
+  }
+  [Symbol.dispose](): void {
+    disposeAuthority(this.#authority);
   }
 
   async listAreas(query: string): Promise<HomeAssistantConfiguratorOption[]> {
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       const list = await ws.send<any[]>({ type: "config/area_registry/list" });
       const options: HomeAssistantConfiguratorOption[] = list
@@ -811,6 +857,7 @@ class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfigura
   }
 
   async resourceUrl(areaId: string | null | undefined): Promise<string> {
+    await this.#authority.assertAppAccess();
     if (!areaId) throw new Error("No area selected.");
     return buildAreaUrl(areaId);
   }
@@ -818,13 +865,23 @@ class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfigura
 
 @validateRpc()
 class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfiguratorRpc {
-  constructor(getCredentials: () => Promise<HomeAssistantCredentials>) {
+  #authority: RpcStub<ConfiguratorAuthority>;
+  constructor(
+    getCredentials: () => Promise<HomeAssistantCredentials>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
+    this.#authority = authority.dup();
+  }
+  [Symbol.dispose](): void {
+    disposeAuthority(this.#authority);
   }
 
   async listLabels(query: string): Promise<HomeAssistantConfiguratorOption[]> {
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       let list: any[];
       try {
@@ -844,6 +901,7 @@ class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfigu
   }
 
   async resourceUrl(labelId: string | null | undefined): Promise<string> {
+    await this.#authority.assertAppAccess();
     if (!labelId) throw new Error("No label selected.");
     return buildLabelUrl(labelId);
   }
@@ -851,13 +909,23 @@ class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfigu
 
 @validateRpc()
 class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfiguratorRpc {
-  constructor(getCredentials: () => Promise<HomeAssistantCredentials>) {
+  #authority: RpcStub<ConfiguratorAuthority>;
+  constructor(
+    getCredentials: () => Promise<HomeAssistantCredentials>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
+    this.#authority = authority.dup();
+  }
+  [Symbol.dispose](): void {
+    disposeAuthority(this.#authority);
   }
 
   async listDevices(query: string): Promise<HomeAssistantConfiguratorOption[]> {
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       const [devices, areas] = await Promise.all([
         ws.send<any[]>({ type: "config/device_registry/list" }),
@@ -880,6 +948,7 @@ class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfi
   }
 
   async resourceUrl(deviceId: string | null | undefined): Promise<string> {
+    await this.#authority.assertAppAccess();
     if (!deviceId) throw new Error("No device selected.");
     return buildDeviceUrl(deviceId);
   }
@@ -887,13 +956,23 @@ class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfi
 
 @validateRpc()
 class EntityConfiguratorUI extends RpcTarget implements HomeAssistantEntityConfiguratorRpc {
-  constructor(getCredentials: () => Promise<HomeAssistantCredentials>) {
+  #authority: RpcStub<ConfiguratorAuthority>;
+  constructor(
+    getCredentials: () => Promise<HomeAssistantCredentials>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
+    this.#authority = authority.dup();
+  }
+  [Symbol.dispose](): void {
+    disposeAuthority(this.#authority);
   }
 
   async listEntities(query: string): Promise<HomeAssistantConfiguratorOption[]> {
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
+    await this.#authority.assertAppAccess();
     const snapshot = await fetchRegistrySnapshot(creds);
     const areaNames = new Map<string, string>(
       snapshot.areas.map((a: any) => [a.area_id, a.name]),
@@ -936,6 +1015,7 @@ class EntityConfiguratorUI extends RpcTarget implements HomeAssistantEntityConfi
   }
 
   async resourceUrl(entityId: string | null | undefined): Promise<string> {
+    await this.#authority.assertAppAccess();
     if (!entityId) throw new Error("No entity selected.");
     return buildEntityUrl(entityId);
   }
@@ -1132,6 +1212,7 @@ export class HomeAssistantGatekeeperImpl
   async startSession(
     approvalQueue: RpcStub<ApprovalQueue>,
   ): Promise<HomeAssistantSession | Area | Label | Device | Entity> {
+    await approvalQueue.assertAppAccess();
     const ctx = await this.#sessionContext(approvalQueue.dup());
     const { resourceKind, resourceId } = this.ctx.props;
     switch (resourceKind) {
@@ -1283,6 +1364,7 @@ export class HomeAssistantGatekeeperImpl
         }
       },
       async submitWrite(body) {
+        await approvalQueue.assertAppAccess();
         // Validate body up front so malformed calls fail immediately with a clear message
         // (rather than ending up in the approval queue or hitting Home Assistant later).
         validateWriteBody(body);
@@ -1992,6 +2074,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async getConfig(): Promise<HomeAssistantConfig> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const config = normalizeConfig(await callApi(this.#ctx, (r) => r.getConfig()));
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Home Assistant configuration",
@@ -2004,6 +2087,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listAreas(): Promise<AreaInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) =>
       ws.send<any[]>({ type: "config/area_registry/list" }),
     );
@@ -2016,6 +2100,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listFloors(): Promise<FloorInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) => {
       try {
         return await ws.send<any[]>({ type: "config/floor_registry/list" });
@@ -2032,6 +2117,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listLabels(): Promise<LabelInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) => {
       try {
         return await ws.send<any[]>({ type: "config/label_registry/list" });
@@ -2048,6 +2134,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listDevices(): Promise<DeviceInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) =>
       ws.send<any[]>({ type: "config/device_registry/list" }),
     );
@@ -2060,6 +2147,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listEntities(filter?: EntityFilter): Promise<EntitySummary[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const { snapshot, appliedCount } = await this.#ctx.registrySnapshotWithOverlay();
     const summaries: EntitySummary[] = [];
     const seen = new Set<string>();
@@ -2085,6 +2173,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listDomains(): Promise<string[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const states = await callApi(this.#ctx, (r) => r.getStates());
     const set = new Set<string>();
     for (const s of states) {
@@ -2101,6 +2190,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listServices(domain?: string): Promise<ServiceInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const raw = await callApi(this.#ctx, (r) => r.getServices());
     let services = normalizeServices(raw);
     if (domain) services = services.filter((s) => s.domain === domain);
@@ -2115,6 +2205,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async getArea(id: string): Promise<Area> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snapshot = await this.#ctx.registrySnapshot();
     const area = snapshot.areas.find((a: any) => a.area_id === id);
     if (!area) throw new Error(`Area not found: ${id}`);
@@ -2128,6 +2219,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async getLabel(id: string): Promise<Label> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snapshot = await this.#ctx.registrySnapshot();
     const label = snapshot.labels.find((l: any) => l.label_id === id);
     if (!label) throw new Error(`Label not found: ${id}`);
@@ -2139,6 +2231,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async getDevice(id: string): Promise<Device> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snapshot = await this.#ctx.registrySnapshot();
     const device = snapshot.devices.find((d: any) => d.id === id);
     if (!device) throw new Error(`Device not found: ${id}`);
@@ -2151,6 +2244,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async getEntity(entityId: string): Promise<Entity> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const state = await callApi(this.#ctx, (r) => r.getState(entityId));
     await this.#ctx.approvalQueue.authorizeObservation({
       title: `Open entity capability`,
@@ -2197,6 +2291,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async renderTemplate(template: string, variables?: Record<string, unknown>): Promise<string> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const result = await callApi(this.#ctx, (r) => r.renderTemplate(template, variables));
     const preview = template.length > 80 ? template.slice(0, 77) + "..." : template;
     await this.#ctx.approvalQueue.authorizeObservation({
@@ -2213,6 +2308,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
     start: string | Date,
     end?: string | Date,
   ): Promise<EntityHistory[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const bundle = await callApi(this.#ctx, (r) =>
       r.getHistory(entityIds, coerceDate(start), end ? coerceDate(end) : undefined, false),
     );
@@ -2231,6 +2327,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
     end?: string | Date,
     entityId?: string,
   ): Promise<LogbookEntry[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const items = await callApi(this.#ctx, (r) =>
       r.getLogbook(coerceDate(start), end ? coerceDate(end) : undefined, entityId),
     );
@@ -2247,6 +2344,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listDashboards(): Promise<DashboardInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) =>
       ws.send<any[]>({ type: "lovelace/dashboards/list" }),
     );
@@ -2266,6 +2364,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async listLovelaceResources(): Promise<LovelaceResourceInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const list = await callWs(this.#ctx, async (ws) =>
       ws.send<any[]>({ type: "lovelace/resources" }),
     );
@@ -2302,6 +2401,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async describe(): Promise<AreaInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const area = snap.areas.find((a: any) => a.area_id === this.#areaId);
     if (!area) throw new Error(`Area not found: ${this.#areaId}`);
@@ -2314,6 +2414,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async getFloor(): Promise<FloorInfo | null> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const area = snap.areas.find((a: any) => a.area_id === this.#areaId);
     if (!area?.floor_id) {
@@ -2333,6 +2434,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async listEntities(filter?: Omit<EntityFilter, "areaId">): Promise<EntitySummary[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const { snapshot: snap, appliedCount } = await this.#ctx.registrySnapshotWithOverlay();
     // `buildSummary()` already resolves an entity's area via its device, so a single pass
     // through `applyEntityFilter` with `areaId: this.#areaId` is sufficient.
@@ -2352,6 +2454,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async listDevices(): Promise<DeviceInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const result = snap.devices.filter((d: any) => d.area_id === this.#areaId).map(normalizeDevice);
     await this.#ctx.approvalQueue.authorizeObservation({
@@ -2364,6 +2467,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async getEntity(entityId: string): Promise<Entity> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const deviceIdsInArea = new Set(
       snap.devices.filter((d: any) => d.area_id === this.#areaId).map((d: any) => d.id),
@@ -2388,6 +2492,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async getDevice(deviceId: string): Promise<Device> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const device = snap.devices.find((d: any) => d.id === deviceId && d.area_id === this.#areaId);
     if (!device) {
@@ -2412,6 +2517,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async getHistory(start: string | Date, end?: string | Date): Promise<EntityHistory[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const deviceIdsInArea = new Set(
       snap.devices.filter((d: any) => d.area_id === this.#areaId).map((d: any) => d.id),
@@ -2468,6 +2574,7 @@ class LabelImpl extends RpcTarget implements Label {
   }
 
   async describe(): Promise<LabelInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const label = snap.labels.find((l: any) => l.label_id === this.#labelId);
     if (!label) throw new Error(`Label not found: ${this.#labelId}`);
@@ -2480,6 +2587,7 @@ class LabelImpl extends RpcTarget implements Label {
   }
 
   async listEntities(filter?: Omit<EntityFilter, "labelId">): Promise<EntitySummary[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const { snapshot: snap, appliedCount } = await this.#ctx.registrySnapshotWithOverlay();
     const summaries: EntitySummary[] = [];
     for (const reg of snap.entities) {
@@ -2500,6 +2608,7 @@ class LabelImpl extends RpcTarget implements Label {
   }
 
   async getEntity(entityId: string): Promise<Entity> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const reg = snap.entities.find((e: any) => e.entity_id === entityId);
     const labels: string[] = reg?.labels ?? [];
@@ -2525,6 +2634,7 @@ class LabelImpl extends RpcTarget implements Label {
   }
 
   async getHistory(start: string | Date, end?: string | Date): Promise<EntityHistory[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const entityIds: string[] = [];
     for (const reg of snap.entities) {
@@ -2575,6 +2685,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async describe(): Promise<DeviceInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const device = snap.devices.find((d: any) => d.id === this.#deviceId);
     if (!device) throw new Error(`Device not found: ${this.#deviceId}`);
@@ -2587,6 +2698,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async getArea(): Promise<AreaInfo | null> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const device = snap.devices.find((d: any) => d.id === this.#deviceId);
     if (!device?.area_id) {
@@ -2606,6 +2718,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async listEntities(filter?: Omit<EntityFilter, "deviceId">): Promise<EntitySummary[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const { snapshot: snap, appliedCount } = await this.#ctx.registrySnapshotWithOverlay();
     const summaries: EntitySummary[] = [];
     for (const reg of snap.entities) {
@@ -2625,6 +2738,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async getEntity(entityId: string): Promise<Entity> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const reg = snap.entities.find((e: any) => e.entity_id === entityId);
     if (!reg || reg.device_id !== this.#deviceId) {
@@ -2649,6 +2763,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async getHistory(start: string | Date, end?: string | Date): Promise<EntityHistory[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#snapshot();
     const entityIds: string[] = [];
     for (const reg of snap.entities) {
@@ -2698,6 +2813,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async describe(): Promise<EntitySummary> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const { snapshot, appliedCount } = await this.#ctx.registrySnapshotWithOverlay();
     const summary = summarizeEntity(snapshot, this.#entityId);
     if (!summary) throw new Error(`Entity not found: ${this.#entityId}`);
@@ -2712,6 +2828,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getState(): Promise<EntityState> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     // Short-circuit: if no pending actions are queued, we don't need the full registry
     // snapshot just to resolve overlay targets — a single REST round-trip suffices. When
     // there ARE pending actions, fetch state + registry in parallel.
@@ -2741,6 +2858,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getDevice(): Promise<DeviceInfo | null> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#ctx.registrySnapshot();
     const reg = snap.entities.find((e: any) => e.entity_id === this.#entityId);
     if (!reg?.device_id) {
@@ -2760,6 +2878,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getArea(): Promise<AreaInfo | null> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#ctx.registrySnapshot();
     const summary = summarizeEntity(snap, this.#entityId);
     if (!summary?.areaId) {
@@ -2779,6 +2898,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getLabels(): Promise<LabelInfo[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const snap = await this.#ctx.registrySnapshot();
     const reg = snap.entities.find((e: any) => e.entity_id === this.#entityId);
     const labelIds: string[] = reg?.labels ?? [];
@@ -2793,6 +2913,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getHistory(start: string | Date, end?: string | Date): Promise<EntityHistory[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const bundle = await callApi(this.#ctx, (r) =>
       r.getHistory([this.#entityId], coerceDate(start), end ? coerceDate(end) : undefined, false),
     );
@@ -2808,6 +2929,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async getLogbook(start: string | Date, end?: string | Date): Promise<LogbookEntry[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const items = await callApi(this.#ctx, (r) =>
       r.getLogbook(coerceDate(start), end ? coerceDate(end) : undefined, this.#entityId),
     );
@@ -3093,6 +3215,7 @@ class DashboardImpl extends RpcTarget implements Dashboard {
   }
 
   async describe(): Promise<DashboardInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const info = await this.#describeRaw();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: `Describe dashboard: ${info.title}`,
@@ -3102,6 +3225,7 @@ class DashboardImpl extends RpcTarget implements Dashboard {
   }
 
   async getConfig(): Promise<DashboardConfig> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const real = await callWs(this.#ctx, async (ws) =>
       ws.send<DashboardConfig>({
         type: "lovelace/config",
