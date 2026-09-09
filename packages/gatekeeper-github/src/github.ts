@@ -5,15 +5,19 @@ import {
   stripTrailingSlashes,
   type ActionDescription,
   type AccountDescription,
+  type AppUiContext,
+  type ObservationDescription,
   type Cursor,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
+  type VerifierAppAuthority,
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -829,6 +833,58 @@ class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
   }
 }
 
+/** Guards a cursor page read and keeps its approval capability alive independently of its parent. */
+@validateRpc()
+class AppAccessCursor<T> extends RpcTarget implements Cursor<T> {
+  #cursor: Cursor<T>;
+  #approvalQueue: RpcStub<ApprovalQueue>;
+  #description: ObservationDescription;
+  #pendingPage?: T[];
+
+  constructor(
+    cursor: Cursor<T>,
+    approvalQueue: RpcStub<ApprovalQueue>,
+    description: ObservationDescription,
+  ) {
+    super();
+    this.#cursor = cursor;
+    this.#approvalQueue = approvalQueue.dup();
+    this.#description = description;
+  }
+
+  async next(): Promise<T[] | null> {
+    await this.#approvalQueue.assertAppAccess();
+    const page = this.#pendingPage ?? await this.#cursor.next();
+    if (page === null) return null;
+
+    try {
+      await this.#approvalQueue.authorizeObservation(this.#description);
+      this.#pendingPage = undefined;
+      return page;
+    } catch (error) {
+      this.#pendingPage = page;
+      throw error;
+    }
+  }
+
+  [Symbol.dispose](): void {
+    try {
+      (this.#cursor as Cursor<T> & { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();
+    } finally {
+      (this.#approvalQueue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
+    }
+  }
+}
+
+function guardCursor<T>(
+  cursor: Cursor<T>,
+  approvalQueue: RpcStub<ApprovalQueue>,
+  description: ObservationDescription,
+): Cursor<T> {
+  return new AppAccessCursor(cursor, approvalQueue, description);
+}
+
+
 /**
  * A cursor that lazily fetches pages from a remote API, applies an overlay and filter
  * to each item, and merges in pre-computed provisional items at their correct sort positions.
@@ -853,6 +909,8 @@ class StreamingCursor<T> extends RpcTarget implements Cursor<T> {
   #injectedItems: T[];
   #injectedIndex = 0;
 
+  /** Keeps its own approval capability so each remote page can be preflighted. */
+  #approvalQueue: RpcStub<ApprovalQueue>;
   #buffer: T[] = [];
   #remotePage = 1;
   #remotePerPage: number;
@@ -867,6 +925,7 @@ class StreamingCursor<T> extends RpcTarget implements Cursor<T> {
     injectedItems: T[];
     pageSize: number;
     remotePageSize?: number;
+    approvalQueue: RpcStub<ApprovalQueue>;
   }) {
     super();
     this.#fetchPage = options.fetchPage;
@@ -876,6 +935,7 @@ class StreamingCursor<T> extends RpcTarget implements Cursor<T> {
     this.#injectedItems = options.injectedItems;
     this.#pageSize = options.pageSize;
     this.#remotePerPage = options.remotePageSize ?? 100;
+    this.#approvalQueue = options.approvalQueue.dup();
   }
 
   async next(): Promise<T[] | null> {
@@ -901,6 +961,9 @@ class StreamingCursor<T> extends RpcTarget implements Cursor<T> {
       return;
     }
 
+    // A single consumer page can require multiple remote pages. Recheck immediately before every
+    // fetch so revocation stops the next page without advancing cursor state past it.
+    await this.#approvalQueue.assertAppAccess();
     const batch = await this.#fetchPage(this.#remotePage, this.#remotePerPage);
     this.#remotePage++;
     if (batch.length < this.#remotePerPage) {
@@ -925,6 +988,10 @@ class StreamingCursor<T> extends RpcTarget implements Cursor<T> {
         this.#buffer.push(this.#injectedItems[this.#injectedIndex++]);
       }
     }
+  }
+
+  [Symbol.dispose](): void {
+    (this.#approvalQueue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
 }
 
@@ -1270,6 +1337,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async startResourceConfigurator(
     resourceUrlPattern: string,
+    context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
     const getToken = async () => {
       const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
@@ -1280,21 +1348,21 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     if (resourceUrlPattern === REPO_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_REPO_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === PULL_REQUEST_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_PULL_REQUEST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken)),
+        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken, context.authority)),
       };
     }
 
@@ -1326,8 +1394,11 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * against the observer's *own* GitHub token.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    const props: GitHubVerifierProps = { userObjectId: this.ctx.props.userObjectId };
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    const props: GitHubVerifierProps = {
+      userObjectId: this.ctx.props.userObjectId,
+      authority: context.authority,
+    };
     return this.ctx.exports.GitHubVerifier({ props });
   }
 }
@@ -1347,6 +1418,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
 type GitHubVerifierProps = {
   userObjectId: string;
+  authority: Fetcher<VerifierAppAuthority>;
 };
 
 /**
@@ -1361,9 +1433,13 @@ export interface GitHubVerifierApi extends GatekeeperUserVerifier {
 export class GitHubVerifier extends WorkerEntrypoint<Env, GitHubVerifierProps>
     implements GitHubVerifierApi {
   async hasRepoAccess(owner: string, repo: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = new GitHubApi(
+      async () => await account.getAccessToken(),
+      () => this.ctx.props.authority.requireAppAccess(),
+    );
     try {
       await api.getRepo(owner, repo);
       return true;
@@ -1388,9 +1464,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
 
-  async #withApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
+  async #withApi<T>(
+    fn: (api: GitHubApi) => Promise<T>,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<T> {
     const account = this.#userAccount();
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = new GitHubApi(
+      async () => await account.getAccessToken(),
+      approvalQueue ? () => approvalQueue.assertAppAccess() : undefined,
+    );
     try {
       return await fn(api);
     } catch (error) {
@@ -1567,7 +1649,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     );
   }
 
-  async #syncDiscussionComments(realId: string, commentCount?: number): Promise<StoredDiscussionCommentState> {
+  async #syncDiscussionComments(
+    realId: string,
+    commentCount?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<StoredDiscussionCommentState> {
     let state = this.#ensureDiscussionCommentState(realId, commentCount);
     if (commentCount !== undefined && state.depth > commentCount) {
       state = this.#resetDiscussionCommentState(realId, commentCount);
@@ -1591,7 +1677,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           page,
           100,
           since,
-        ));
+        ), approvalQueue);
       changedCount += batch.length;
       if (changedCount > DISCUSSION_SYNC_BAIL_LIMIT) {
         return this.#resetDiscussionCommentState(realId, commentCount);
@@ -1637,6 +1723,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     realId: string,
     targetDepth: number,
     chunkHint: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
   ): Promise<StoredDiscussionCommentState> {
     let state = this.#ensureDiscussionCommentState(realId);
     if (targetDepth <= state.depth || state.exhausted) {
@@ -1657,7 +1744,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           Number(realId),
           page,
           chunkSize,
-        ));
+        ), approvalQueue);
       const normalized = batch.map(discussionCommentFromResponse);
 
       if (state.depth > 0 && normalized.some(comment => knownIds.has(comment.id))) {
@@ -1752,7 +1839,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     );
   }
 
-  async #syncPullReviewComments(realId: string): Promise<StoredPullReviewCommentState> {
+  async #syncPullReviewComments(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<StoredPullReviewCommentState> {
     const state = this.#ensurePullReviewCommentState(realId);
     if (Date.now() - state.freshness < ENTITY_CACHE_TTL_MS) {
       return state;
@@ -1773,7 +1863,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           page,
           100,
           since,
-        ));
+        ), approvalQueue);
       changedCount += batch.length;
       if (changedCount > DISCUSSION_SYNC_BAIL_LIMIT) {
         return this.#resetPullReviewCommentState(realId);
@@ -1816,7 +1906,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return state;
   }
 
-  async #materializeAllPullReviewComments(realId: string): Promise<GitHubPullRequestReviewCommentResponse[]> {
+  async #materializeAllPullReviewComments(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubPullRequestReviewCommentResponse[]> {
     let state = this.#ensurePullReviewCommentState(realId);
     const chunkSize = Math.max(1, Math.min(100, state.chunkSize ?? 100));
     state.chunkSize = chunkSize;
@@ -1832,7 +1925,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           Number(realId),
           page,
           chunkSize,
-        ));
+        ), approvalQueue);
 
       if (state.depth > 0 && batch.some(comment => knownIds.has(String(comment.id)))) {
         if (restarted) {
@@ -2065,12 +2158,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #getViewerActor(): Promise<GitHubActor> {
+  async #getViewerActor(approvalQueue?: RpcStub<ApprovalQueue>): Promise<GitHubActor> {
     const viewer = await this.#loadCachedWithEtag<StoredViewer>(
       this.#cacheKey("viewer"),
       VIEWER_CACHE_TTL_MS,
       async etag => {
-        const result = await this.#withApi(api => api.getViewerConditional({ ifNoneMatch: etag }));
+        const result = await this.#withApi(api => api.getViewerConditional({ ifNoneMatch: etag }), approvalQueue);
         if (result.status === 304) {
           return result;
         }
@@ -2143,11 +2236,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
 
 
-  async #getRepoMetadata(): Promise<GitHubRepoMetadata> {
+  async #getRepoMetadata(approvalQueue?: RpcStub<ApprovalQueue>): Promise<GitHubRepoMetadata> {
     const key = this.#cacheKey("repo", this.ctx.props.owner, this.ctx.props.repo);
     return await this.#loadCachedWithEtag<GitHubRepoMetadata>(key, ENTITY_CACHE_TTL_MS, async etag => {
-      const result = await this.#withApi(api =>
-        api.getRepoConditional(this.ctx.props.owner, this.ctx.props.repo, { ifNoneMatch: etag })
+      const result = await this.#withApi(
+        api => api.getRepoConditional(this.ctx.props.owner, this.ctx.props.repo, { ifNoneMatch: etag }),
+        approvalQueue,
       );
       if (result.status === 304) {
         return result;
@@ -2192,6 +2286,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async #getCurrentStateInfo(
     targetKind: EntityKind,
     targetId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
   ): Promise<{ state: GitHubIssueState; reason?: "completed" | "notPlanned" }> {
     const pending = this.#getPendingStateInfo(targetKind, targetId);
     if (pending) {
@@ -2204,22 +2299,24 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const realId = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
     if (!realId) {
       const details = targetKind === "issue"
-        ? await this.#getIssueDetails(targetId)
-        : await this.#getPullRequestDetails(targetId);
+        ? await this.#getIssueDetails(targetId, approvalQueue)
+        : await this.#getPullRequestDetails(targetId, approvalQueue);
       return {
         state: details.state,
         reason: undefined,
       };
     }
-
-    const current = await this.#withApi(api => api.getIssue(this.ctx.props.owner, this.ctx.props.repo, Number(realId)));
+    const current = await this.#withApi(api => api.getIssue(this.ctx.props.owner, this.ctx.props.repo, Number(realId)), approvalQueue);
     return {
       state: current.state,
       reason: normalizeStateReason(current.state_reason),
     };
   }
 
-  async #getIssueDetails(logicalId: string): Promise<GitHubIssueDetails> {
+  async #getIssueDetails(
+    logicalId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubIssueDetails> {
     if (logicalId.startsWith("~")) {
       const provisional = this.#getProvisionalResource(logicalId);
       if (!provisional || provisional.kind !== "issue") {
@@ -2227,7 +2324,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
 
       if (provisional.realId) {
-        const remote = await this.#getRemoteIssueDetails(provisional.realId);
+        const remote = await this.#getRemoteIssueDetails(provisional.realId, approvalQueue);
         return this.#overlayIssueLike(remote, "issue", logicalId);
       }
 
@@ -2236,14 +2333,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         throw new Error(`Provisional issue ${logicalId} is no longer available.`);
       }
 
-      const provisionalIssue = await this.#buildProvisionalIssueDetails(createAction);
+      const provisionalIssue = await this.#buildProvisionalIssueDetails(createAction, approvalQueue);
       return this.#overlayIssueLike(provisionalIssue, "issue", logicalId, true);
     }
 
-    return this.#overlayIssueLike(await this.#getRemoteIssueDetails(logicalId), "issue", logicalId);
+    return this.#overlayIssueLike(await this.#getRemoteIssueDetails(logicalId, approvalQueue), "issue", logicalId);
   }
 
-  async #getPullRequestDetails(logicalId: string): Promise<GitHubPullRequestDetails> {
+  async #getPullRequestDetails(
+    logicalId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubPullRequestDetails> {
     if (logicalId.startsWith("~")) {
       const provisional = this.#getProvisionalResource(logicalId);
       if (!provisional || provisional.kind !== "pull") {
@@ -2251,7 +2351,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
 
       if (provisional.realId) {
-        const remote = await this.#getRemotePullRequestDetails(provisional.realId);
+        const remote = await this.#getRemotePullRequestDetails(provisional.realId, approvalQueue);
         return this.#overlayIssueLike(remote, "pull", logicalId);
       }
 
@@ -2260,18 +2360,22 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         throw new Error(`Provisional pull request ${logicalId} is no longer available.`);
       }
 
-      const provisionalPull = await this.#buildProvisionalPullRequestDetails(createAction);
+      const provisionalPull = await this.#buildProvisionalPullRequestDetails(createAction, approvalQueue);
       return this.#overlayIssueLike(provisionalPull, "pull", logicalId, true);
     }
 
-    return this.#overlayIssueLike(await this.#getRemotePullRequestDetails(logicalId), "pull", logicalId);
+    return this.#overlayIssueLike(await this.#getRemotePullRequestDetails(logicalId, approvalQueue), "pull", logicalId);
   }
 
-  async #getRemoteIssueDetails(realId: string): Promise<GitHubIssueDetails> {
+  async #getRemoteIssueDetails(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubIssueDetails> {
     const key = this.#cacheKey("issue", realId);
     const details = await this.#loadCachedWithEtag<GitHubIssueDetails>(key, ENTITY_CACHE_TTL_MS, async etag => {
-      const result = await this.#withApi(api =>
-        api.getIssueConditional(this.ctx.props.owner, this.ctx.props.repo, Number(realId), { ifNoneMatch: etag })
+      const result = await this.#withApi(
+        api => api.getIssueConditional(this.ctx.props.owner, this.ctx.props.repo, Number(realId), { ifNoneMatch: etag }),
+        approvalQueue,
       );
       if (result.status === 304) {
         return result;
@@ -2290,14 +2394,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return details;
   }
 
-  async #getRemotePullRequestDetails(realId: string): Promise<GitHubPullRequestDetails> {
+  async #getRemotePullRequestDetails(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubPullRequestDetails> {
     const key = this.#cacheKey("pull", realId);
     const details = await this.#loadCachedWithEtag<GitHubPullRequestDetails>(
       key,
       ENTITY_CACHE_TTL_MS,
       async etag => {
-        const result = await this.#withApi(api =>
-          api.getPullRequestConditional(this.ctx.props.owner, this.ctx.props.repo, Number(realId), { ifNoneMatch: etag })
+        const result = await this.#withApi(
+          api => api.getPullRequestConditional(this.ctx.props.owner, this.ctx.props.repo, Number(realId), { ifNoneMatch: etag }),
+          approvalQueue,
         );
         if (result.status === 304) {
           return result;
@@ -2315,21 +2423,34 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return details;
   }
 
-  async #getLiveTopLevelCommentCount(kind: EntityKind, realId: string): Promise<number> {
+  async #getLiveTopLevelCommentCount(
+    kind: EntityKind,
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<number> {
     if (kind === "issue") {
-      const issue = await this.#withApi(api => api.getIssue(this.ctx.props.owner, this.ctx.props.repo, Number(realId)));
+      const issue = await this.#withApi(
+        api => api.getIssue(this.ctx.props.owner, this.ctx.props.repo, Number(realId)),
+        approvalQueue,
+      );
       if (issue.pull_request) {
         throw new Error(`#${realId} is a pull request, not an issue.`);
       }
       return issue.comments;
     }
 
-    const pull = await this.#withApi(api => api.getPullRequest(this.ctx.props.owner, this.ctx.props.repo, Number(realId)));
+    const pull = await this.#withApi(
+      api => api.getPullRequest(this.ctx.props.owner, this.ctx.props.repo, Number(realId)),
+      approvalQueue,
+    );
     return pull.comments;
   }
 
-  async #buildProvisionalIssueDetails(action: CreateIssueAction): Promise<GitHubIssueDetails> {
-    const viewer = await this.#getViewerActor();
+  async #buildProvisionalIssueDetails(
+    action: CreateIssueAction,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubIssueDetails> {
+    const viewer = await this.#getViewerActor(approvalQueue);
     return {
       repo: repoRef(this.ctx.props.owner, this.ctx.props.repo),
       id: action.provisionalId,
@@ -2346,8 +2467,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async #buildProvisionalPullRequestDetails(action: CreatePullRequestAction): Promise<GitHubPullRequestDetails> {
-    const viewer = await this.#getViewerActor();
+  async #buildProvisionalPullRequestDetails(
+    action: CreatePullRequestAction,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubPullRequestDetails> {
+    const viewer = await this.#getViewerActor(approvalQueue);
     let baseSha = "";
     let headSha = "";
     let commits = 0;
@@ -2356,12 +2480,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     let changedFiles = 0;
 
     try {
-      const comparison = await this.#withApi(api => api.compareBranches(
-        this.ctx.props.owner,
-        this.ctx.props.repo,
-        action.options.base,
-        action.options.head,
-      ));
+      const comparison = await this.#withApi(
+        api => api.compareBranches(
+          this.ctx.props.owner,
+          this.ctx.props.repo,
+          action.options.base,
+          action.options.head,
+        ),
+        approvalQueue,
+      );
       baseSha = comparison.base_commit.sha;
       headSha = comparison.commits?.at(-1)?.sha ?? comparison.base_commit.sha;
       commits = comparison.total_commits;
@@ -2369,6 +2496,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       deletions = (comparison.files ?? []).reduce((sum, file) => sum + file.deletions, 0);
       changedFiles = comparison.files?.length ?? 0;
     } catch (error) {
+      await approvalQueue?.assertAppAccess();
       logger.warn("failed to compute provisional pull request comparison", {
         event: "pull.request.provisional.comparison.compute.failed", error,
       });
@@ -2479,9 +2607,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async #buildTouchedIssueSummaries(
     predicate: (item: GitHubIssueDetails) => boolean,
     compare: (a: GitHubIssueSummary, b: GitHubIssueSummary) => number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
   ): Promise<{ ids: Set<string>; items: GitHubIssueSummary[] }> {
     const ids = this.#pendingExistingEntityIds("issue");
-    const items = (await Promise.all([...ids].map(async id => this.#getIssueDetails(id))))
+    const items = (await Promise.all([...ids].map(async id => this.#getIssueDetails(id, approvalQueue))))
       .filter(predicate)
       .map(details => summarizeIssueDetails(details))
       .toSorted(compare);
@@ -2491,22 +2620,27 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async #buildTouchedPullSummaries(
     predicate: (item: GitHubPullRequestDetails) => boolean,
     compare: (a: GitHubPullRequestSummary, b: GitHubPullRequestSummary) => number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
   ): Promise<{ ids: Set<string>; items: GitHubPullRequestSummary[] }> {
     const ids = this.#pendingExistingEntityIds("pull");
-    const items = (await Promise.all([...ids].map(async id => this.#getPullRequestDetails(id))))
+    const items = (await Promise.all([...ids].map(async id => this.#getPullRequestDetails(id, approvalQueue))))
       .filter(predicate)
       .map(details => summarizePullDetails(details))
       .toSorted(compare);
     return { ids, items };
   }
 
-  async #listIssueSummaries(filter: GitHubIssueFilter | undefined, pageSize: number): Promise<Cursor<GitHubIssueSummary>> {
+  async #listIssueSummaries(
+    filter: GitHubIssueFilter | undefined,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubIssueSummary>> {
     const compare = issueComparator(filter?.sort, filter?.direction);
-    const touched = await this.#buildTouchedIssueSummaries(item => issueMatchesFilter(item, filter), compare);
+    const touched = await this.#buildTouchedIssueSummaries(item => issueMatchesFilter(item, filter), compare, approvalQueue);
 
     const provisionals = (await Promise.all(this.#listPendingActions()
       .filter((action): action is CreateIssueAction => action.type === "createIssue")
-      .map(action => this.#buildProvisionalIssueDetails(action).then(issue => this.#overlayIssueLike(issue, "issue", action.provisionalId, true)))))
+      .map(action => this.#buildProvisionalIssueDetails(action, approvalQueue).then(issue => this.#overlayIssueLike(issue, "issue", action.provisionalId, true)))))
       .filter(item => issueMatchesFilter(item, filter))
       .toSorted(compare);
     const injectedItems = [...touched.items, ...provisionals].toSorted(compare);
@@ -2514,6 +2648,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const owner = this.ctx.props.owner;
     const repo = this.ctx.props.repo;
     return new StreamingCursor<GitHubIssueSummary>({
+      approvalQueue,
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-issues", stableKey(filter ?? {}), `p${page}`);
         return await this.#loadCachedWithEtag<GitHubIssueSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
@@ -2526,7 +2661,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             direction: filter?.direction,
             page,
             per_page: perPage,
-          }, { ifNoneMatch: etag }));
+          }, { ifNoneMatch: etag }),
+          approvalQueue,
+        );
           if (raw.status === 304) {
             return raw;
           }
@@ -2548,14 +2685,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #searchIssueSummaries(query: GitHubIssueSearch, pageSize: number): Promise<Cursor<GitHubIssueSummary>> {
+  async #searchIssueSummaries(
+    query: GitHubIssueSearch,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubIssueSummary>> {
     const remoteSort = query.sort ?? "created";
     const remoteDirection = query.direction ?? "desc";
     const compare = issueComparator(remoteSort, remoteDirection);
 
     const provisionals = (await Promise.all(this.#listPendingActions()
       .filter((action): action is CreateIssueAction => action.type === "createIssue")
-      .map(action => this.#buildProvisionalIssueDetails(action).then(issue => this.#overlayIssueLike(issue, "issue", action.provisionalId, true)))))
+      .map(action => this.#buildProvisionalIssueDetails(action, approvalQueue).then(issue => this.#overlayIssueLike(issue, "issue", action.provisionalId, true)))))
       .filter(item => issueMatchesSearch(item, query))
       .toSorted(compare);
 
@@ -2573,11 +2714,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
     };
     return new StreamingCursor<GitHubIssueSummary>({
+      approvalQueue,
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("search-issues-scoped-v1", stableKey(query), `p${page}`);
         const results = await this.#loadCachedWithEtag<CachedIssueSearchResult[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
-          const raw = await this.#withApi(api =>
-            api.searchIssuesConditional(searchQuery, page, perPage, remoteSort, remoteDirection, { ifNoneMatch: etag })
+          const raw = await this.#withApi(
+            api => api.searchIssuesConditional(searchQuery, page, perPage, remoteSort, remoteDirection, { ifNoneMatch: etag }),
+            approvalQueue,
           );
           if (raw.status === 304) {
             return raw;
@@ -2604,13 +2747,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #listPullSummaries(filter: GitHubPullRequestFilter | undefined, pageSize: number): Promise<Cursor<GitHubPullRequestSummary>> {
+  async #listPullSummaries(
+    filter: GitHubPullRequestFilter | undefined,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubPullRequestSummary>> {
     const compare = pullComparator(filter?.sort, filter?.direction);
-    const touched = await this.#buildTouchedPullSummaries(item => pullMatchesFilter(item, filter), compare);
+    const touched = await this.#buildTouchedPullSummaries(item => pullMatchesFilter(item, filter), compare, approvalQueue);
 
     const provisionals = (await Promise.all(this.#listPendingActions()
       .filter((action): action is CreatePullRequestAction => action.type === "createPullRequest")
-      .map(action => this.#buildProvisionalPullRequestDetails(action).then(pull => this.#overlayIssueLike(pull, "pull", action.provisionalId, true)))))
+      .map(action => this.#buildProvisionalPullRequestDetails(action, approvalQueue).then(pull => this.#overlayIssueLike(pull, "pull", action.provisionalId, true)))))
       .filter(item => pullMatchesFilter(item, filter))
       .toSorted(compare);
     const injectedItems = [...touched.items, ...provisionals].toSorted(compare);
@@ -2618,20 +2765,24 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const owner = this.ctx.props.owner;
     const repo = this.ctx.props.repo;
     return new StreamingCursor<GitHubPullRequestSummary>({
+      approvalQueue,
       fetchPage: async (page, perPage) => {
         const cacheKey = this.#cacheKey("list-pulls", stableKey(filter ?? {}), `p${page}`);
         return await this.#loadCachedWithEtag<GitHubPullRequestSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
-          const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
-            state: filter?.state,
-            head: filter?.head
-              ? filter.head.includes(":") ? filter.head : `${owner}:${filter.head}`
-              : undefined,
-            base: filter?.base,
-            sort: filter?.sort,
-            direction: filter?.direction,
-            page,
-            per_page: perPage,
-          }, { ifNoneMatch: etag }));
+          const raw = await this.#withApi(
+            api => api.listPullRequestsConditional(owner, repo, {
+              state: filter?.state,
+              head: filter?.head
+                ? filter.head.includes(":") ? filter.head : `${owner}:${filter.head}`
+                : undefined,
+              base: filter?.base,
+              sort: filter?.sort,
+              direction: filter?.direction,
+              page,
+              per_page: perPage,
+            }, { ifNoneMatch: etag }),
+            approvalQueue,
+          );
           if (raw.status === 304) {
             return raw;
           }
@@ -2653,12 +2804,16 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #searchPullSummaries(query: GitHubPullRequestSearch, pageSize: number): Promise<Cursor<GitHubPullRequestSummary>> {
+  async #searchPullSummaries(
+    query: GitHubPullRequestSearch,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubPullRequestSummary>> {
     const compare = pullComparator("updated", "desc");
 
     const provisionals = (await Promise.all(this.#listPendingActions()
       .filter((action): action is CreatePullRequestAction => action.type === "createPullRequest")
-      .map(action => this.#buildProvisionalPullRequestDetails(action).then(pull => this.#overlayIssueLike(pull, "pull", action.provisionalId, true)))))
+      .map(action => this.#buildProvisionalPullRequestDetails(action, approvalQueue).then(pull => this.#overlayIssueLike(pull, "pull", action.provisionalId, true)))))
       .filter(item => pullMatchesSearch(item, query))
       .toSorted(compare);
 
@@ -2668,6 +2823,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     let upstreamExhausted = false;
     const bufferedMatches: GitHubPullRequestSummary[] = [];
     return new StreamingCursor<GitHubPullRequestSummary>({
+      approvalQueue,
       fetchPage: async (_page, perPage) => {
         const matches: GitHubPullRequestSummary[] = [];
 
@@ -2690,13 +2846,16 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             cacheKey,
             LIST_CACHE_TTL_MS,
             async etag => {
-              const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
-                state: query.state === "all" ? "all" : query.state ?? "all",
-                sort: "updated",
-                direction: "desc",
-                page: sourcePage,
-                per_page: 100,
-              }, { ifNoneMatch: etag }));
+              const raw = await this.#withApi(
+                api => api.listPullRequestsConditional(owner, repo, {
+                  state: query.state === "all" ? "all" : query.state ?? "all",
+                  sort: "updated",
+                  direction: "desc",
+                  page: sourcePage,
+                  per_page: 100,
+                }, { ifNoneMatch: etag }),
+                approvalQueue,
+              );
               if (raw.status === 304) {
                 return raw;
               }
@@ -2731,30 +2890,40 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #getDiscussionCommentPage(realId: string, page: number, perPage: number): Promise<GitHubDiscussionEntry[]> {
-    await this.#materializeDiscussionCommentDepth(realId, page * perPage, perPage);
+  async #getDiscussionCommentPage(
+    realId: string,
+    page: number,
+    perPage: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubDiscussionEntry[]> {
+    await this.#materializeDiscussionCommentDepth(realId, page * perPage, perPage, approvalQueue);
     return this.#readDiscussionCommentSlice(realId, (page - 1) * perPage, perPage);
   }
 
-  async #getDiscussionReviewPage(realId: string, page: number): Promise<GitHubDiscussionEntry[]> {
+  async #getDiscussionReviewPage(
+    realId: string,
+    page: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubDiscussionEntry[]> {
     const cacheKey = this.#cacheKey("discussion-reviews", realId, `p${page}`);
     return await this.#loadCachedWithEtag<GitHubDiscussionEntry[]>(cacheKey, ENTITY_CACHE_TTL_MS, async etag => {
-      const raw = await this.#withApi(api =>
-        api.listPullRequestReviewsConditional(
+      const raw = await this.#withApi(
+        api => api.listPullRequestReviewsConditional(
           this.ctx.props.owner,
           this.ctx.props.repo,
           Number(realId),
           page,
           100,
           { ifNoneMatch: etag },
-        )
+        ),
+        approvalQueue,
       );
       if (raw.status === 304) {
         return raw;
       }
 
       const commentsByReviewId = new Map<number, GitHubPullRequestReviewCommentResponse[]>();
-      for (const comment of await this.#materializeAllPullReviewComments(realId)) {
+      for (const comment of await this.#materializeAllPullReviewComments(realId, approvalQueue)) {
         const reviewId = comment.pull_request_review_id;
         if (!reviewId) {
           continue;
@@ -2800,13 +2969,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     });
   }
 
-  async #getDiscussion(kind: EntityKind, logicalId: string, pageSize: number): Promise<Cursor<GitHubDiscussionEntry>> {
+  async #getDiscussion(
+    kind: EntityKind,
+    logicalId: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubDiscussionEntry>> {
     const realId = logicalId.startsWith("~") ? this.#resolveProvisionalId(logicalId) : logicalId;
     const compare = (a: GitHubDiscussionEntry, b: GitHubDiscussionEntry) =>
       a.createdAt.getTime() - b.createdAt.getTime();
 
     // Build provisional entries from pending actions.
-    const viewer = await this.#getViewerActor();
+    const viewer = await this.#getViewerActor(approvalQueue);
     const provisionals: GitHubDiscussionEntry[] = [];
     for (const action of this.#pendingActionsForEntity(kind, logicalId)) {
       if (action.type === "postComment") {
@@ -2847,17 +3021,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
 
     let commentCount = kind === "issue"
-      ? (await this.#getRemoteIssueDetails(realId)).commentCount
-      : (await this.#getRemotePullRequestDetails(realId)).commentCount;
+      ? (await this.#getRemoteIssueDetails(realId, approvalQueue)).commentCount
+      : (await this.#getRemotePullRequestDetails(realId, approvalQueue)).commentCount;
     const discussionState = this.#ensureDiscussionCommentState(realId, commentCount);
     if (discussionState.depth > commentCount) {
-      commentCount = await this.#getLiveTopLevelCommentCount(kind, realId);
+      commentCount = await this.#getLiveTopLevelCommentCount(kind, realId, approvalQueue);
     }
-    await this.#syncDiscussionComments(realId, commentCount);
+    await this.#syncDiscussionComments(realId, commentCount, approvalQueue);
 
     if (kind === "issue") {
       return new StreamingCursor<GitHubDiscussionEntry>({
-        fetchPage: async (page, perPage) => await this.#getDiscussionCommentPage(realId, page, perPage),
+        approvalQueue,
+        fetchPage: async (page, perPage) => await this.#getDiscussionCommentPage(realId, page, perPage, approvalQueue),
         overlay: item => item,
         filter: () => true,
         comparator: compare,
@@ -2881,14 +3056,14 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       while (result.length < perPage) {
         // Refill comment buffer if needed.
         if (commentBuf.length === 0 && !commentsDone) {
-          commentBuf = await this.#getDiscussionCommentPage(realId, commentPage, 100);
+          commentBuf = await this.#getDiscussionCommentPage(realId, commentPage, 100, approvalQueue);
           commentPage += 1;
           if (commentBuf.length < 100) commentsDone = true;
         }
 
         // Refill review buffer if needed.
         if (reviewBuf.length === 0 && !reviewsDone) {
-          reviewBuf = await this.#getDiscussionReviewPage(realId, reviewPage++);
+          reviewBuf = await this.#getDiscussionReviewPage(realId, reviewPage++, approvalQueue);
           if (reviewBuf.length < 100) reviewsDone = true;
         }
 
@@ -2916,6 +3091,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
 
     return new StreamingCursor<GitHubDiscussionEntry>({
+      approvalQueue,
       fetchPage,
       overlay: item => item, // No per-entry simulation overlay for discussion entries.
       filter: () => true,
@@ -2929,10 +3105,14 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * Accumulate all review comments for a specific review. This is bounded by the
    * number of comments on a single review (typically small).
    */
-  async #accumulateReviewComments(realId: string, reviewId: number): Promise<GitHubPullRequestReviewCommentResponse[]> {
+  async #accumulateReviewComments(
+    realId: string,
+    reviewId: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubPullRequestReviewCommentResponse[]> {
     const reviewCommentState = this.#getPullReviewCommentState(realId);
     if (reviewCommentState?.exhausted) {
-      await this.#syncPullReviewComments(realId);
+      await this.#syncPullReviewComments(realId, approvalQueue);
       return this.#readAllPullReviewComments(realId)
         .filter(comment => comment.pull_request_review_id === reviewId);
     }
@@ -2942,8 +3122,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       cacheKey,
       ENTITY_CACHE_TTL_MS,
       async etag => {
-        const firstPage = await this.#withApi(api =>
-          api.listReviewCommentsForReviewConditional(
+        const firstPage = await this.#withApi(
+          api => api.listReviewCommentsForReviewConditional(
             this.ctx.props.owner,
             this.ctx.props.repo,
             Number(realId),
@@ -2951,7 +3131,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             1,
             100,
             { ifNoneMatch: etag },
-          )
+          ),
+          approvalQueue,
         );
         if (firstPage.status === 304) {
           return firstPage;
@@ -2960,15 +3141,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         const results = [...firstPage.data];
         if (firstPage.data.length === 100) {
           const rest = await this.#fetchAllPages((page, perPage) =>
-            this.#withApi(api =>
-              api.listReviewCommentsForReview(
+            this.#withApi(
+              api => api.listReviewCommentsForReview(
                 this.ctx.props.owner,
                 this.ctx.props.repo,
                 Number(realId),
                 reviewId,
                 page + 1,
                 perPage,
-              )));
+              ),
+              approvalQueue,
+            ));
           results.push(...rest);
         }
 
@@ -2981,7 +3164,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     );
   }
 
-  async #getDiff(logicalId: string, pageSize: number): Promise<{ revision: GitHubPullRequestRevision; files: Cursor<GitHubPullRequestDiffFile> }> {
+  async #getDiff(
+    logicalId: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<{ revision: GitHubPullRequestRevision; files: Cursor<GitHubPullRequestDiffFile> }> {
     if (logicalId.startsWith("~") && !this.#resolveProvisionalId(logicalId)) {
       const action = this.#findCreateAction(logicalId, "pull") as CreatePullRequestAction | undefined;
       if (!action) {
@@ -2993,14 +3180,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         cacheKey,
         ENTITY_CACHE_TTL_MS,
         async etag => {
-          const comparison = await this.#withApi(api =>
-            api.compareBranchesConditional(
+          const comparison = await this.#withApi(
+            api => api.compareBranchesConditional(
               this.ctx.props.owner,
               this.ctx.props.repo,
               action.options.base,
               action.options.head,
               { ifNoneMatch: etag },
-            )
+            ),
+            approvalQueue,
           );
           if (comparison.status === 304) {
             return comparison;
@@ -3024,7 +3212,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
 
     const realId = logicalId.startsWith("~") ? this.#resolveProvisionalId(logicalId)! : logicalId;
-    const details = await this.#getRemotePullRequestDetails(realId);
+    const details = await this.#getRemotePullRequestDetails(realId, approvalQueue);
     const revision = {
       baseSha: details.base.sha,
       headSha: details.head.sha,
@@ -3040,21 +3228,23 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return {
       revision,
       files: new StreamingCursor<GitHubPullRequestDiffFile>({
+        approvalQueue,
         fetchPage: async (page, perPage) => {
           const pageCacheKey = this.#cacheKey("diff-files", realId, revision.baseSha || "pending", revision.headSha || "pending", `p${page}`);
           const normalized = await this.#loadCachedWithEtag<GitHubPullRequestDiffFile[]>(
             pageCacheKey,
             ENTITY_CACHE_TTL_MS,
             async etag => {
-              const raw = await this.#withApi(api =>
-                api.listPullRequestFilesConditional(
+              const raw = await this.#withApi(
+                api => api.listPullRequestFilesConditional(
                   this.ctx.props.owner,
                   this.ctx.props.repo,
                   Number(realId),
                   page,
                   perPage,
                   { ifNoneMatch: etag },
-                )
+                ),
+                approvalQueue,
               );
               if (raw.status === 304) {
                 return raw;
@@ -3095,15 +3285,19 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async #getDiffThreads(logicalId: string, pageSize: number): Promise<Cursor<GitHubDiffThread>> {
+  async #getDiffThreads(
+    logicalId: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubDiffThread>> {
     const realId = logicalId.startsWith("~") ? this.#resolveProvisionalId(logicalId) : logicalId;
     let base: GitHubDiffThread[] = [];
     if (realId) {
-      base = await this.#fetchRemoteDiffThreads(realId);
+      base = await this.#fetchRemoteDiffThreads(realId, approvalQueue);
     }
 
     const threads = new Map<string, GitHubDiffThread>(base.map(thread => [thread.id, structuredClone(thread)]));
-    const viewer = await this.#getViewerActor();
+    const viewer = await this.#getViewerActor(approvalQueue);
     for (const action of this.#pendingActionsForEntity("pull", logicalId)) {
       if (action.type === "postReview") {
         for (const comment of action.review.diffComments ?? []) {
@@ -3140,15 +3334,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const sorted = [...threads.values()].toSorted((a, b) => a.comments[0].createdAt.getTime() - b.comments[0].createdAt.getTime());
     return new ArrayCursor(sorted, pageSize);
   }
-
-  /**
-   * Fetch all review comments for a PR and group them into threads. Grouping requires
-   * seeing all comments (replies may reference comments from different pages), so this
-   * accumulates all pages before grouping.
-   */
-  async #fetchRemoteDiffThreads(realId: string): Promise<GitHubDiffThread[]> {
-    await this.#syncPullReviewComments(realId);
-    const comments = await this.#materializeAllPullReviewComments(realId);
+  async #fetchRemoteDiffThreads(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<GitHubDiffThread[]> {
+    await this.#syncPullReviewComments(realId, approvalQueue);
+    const comments = await this.#materializeAllPullReviewComments(realId, approvalQueue);
 
     const byThread = new Map<string, GitHubDiffThread>();
     for (const comment of comments) {
@@ -3567,45 +3758,75 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
   }
 
-  async repoMetadata(): Promise<GitHubRepoMetadata> {
-    return this.#getRepoMetadata();
+  async repoMetadata(approvalQueue?: RpcStub<ApprovalQueue>): Promise<GitHubRepoMetadata> {
+    return this.#getRepoMetadata(approvalQueue);
   }
 
-  async openIssue(id: string): Promise<GitHubIssueDetails> {
-    return this.#getIssueDetails(id);
+  async openIssue(id: string, approvalQueue?: RpcStub<ApprovalQueue>): Promise<GitHubIssueDetails> {
+    return this.#getIssueDetails(id, approvalQueue);
   }
 
-  async openPullRequest(id: string): Promise<GitHubPullRequestDetails> {
-    return this.#getPullRequestDetails(id);
+  async openPullRequest(id: string, approvalQueue?: RpcStub<ApprovalQueue>): Promise<GitHubPullRequestDetails> {
+    return this.#getPullRequestDetails(id, approvalQueue);
   }
 
-  async issueDiscussion(kind: EntityKind, id: string, pageSize: number): Promise<Cursor<GitHubDiscussionEntry>> {
-    return this.#getDiscussion(kind, id, pageSize);
+  async issueDiscussion(
+    kind: EntityKind,
+    id: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubDiscussionEntry>> {
+    return this.#getDiscussion(kind, id, pageSize, approvalQueue);
   }
 
-  async pullDiff(id: string, pageSize: number): Promise<{ revision: GitHubPullRequestRevision; files: Cursor<GitHubPullRequestDiffFile> }> {
-    return this.#getDiff(id, pageSize);
+  async pullDiff(
+    id: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<{ revision: GitHubPullRequestRevision; files: Cursor<GitHubPullRequestDiffFile> }> {
+    return this.#getDiff(id, pageSize, approvalQueue);
   }
 
-  async pullThreads(id: string, pageSize: number): Promise<Cursor<GitHubDiffThread>> {
-    return this.#getDiffThreads(id, pageSize);
+  async pullThreads(
+    id: string,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubDiffThread>> {
+    return this.#getDiffThreads(id, pageSize, approvalQueue);
   }
 
-  async listIssues(filter: GitHubIssueFilter | undefined, pageSize: number): Promise<Cursor<GitHubIssueSummary>> {
-    return this.#listIssueSummaries(filter, pageSize);
+  async listIssues(
+    filter: GitHubIssueFilter | undefined,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubIssueSummary>> {
+    return this.#listIssueSummaries(filter, pageSize, approvalQueue);
   }
 
-  async searchIssues(query: GitHubIssueSearch, pageSize: number): Promise<Cursor<GitHubIssueSummary>> {
-    return this.#searchIssueSummaries(query, pageSize);
+  async searchIssues(
+    query: GitHubIssueSearch,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubIssueSummary>> {
+    return this.#searchIssueSummaries(query, pageSize, approvalQueue);
   }
 
-  async listPullRequests(filter: GitHubPullRequestFilter | undefined, pageSize: number): Promise<Cursor<GitHubPullRequestSummary>> {
-    return this.#listPullSummaries(filter, pageSize);
+  async listPullRequests(
+    filter: GitHubPullRequestFilter | undefined,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubPullRequestSummary>> {
+    return this.#listPullSummaries(filter, pageSize, approvalQueue);
   }
 
-  async searchPullRequests(query: GitHubPullRequestSearch, pageSize: number): Promise<Cursor<GitHubPullRequestSummary>> {
-    return this.#searchPullSummaries(query, pageSize);
+  async searchPullRequests(
+    query: GitHubPullRequestSearch,
+    pageSize: number,
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<Cursor<GitHubPullRequestSummary>> {
+    return this.#searchPullSummaries(query, pageSize, approvalQueue);
   }
+
 
   async prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueAction> {
     return {
@@ -3631,8 +3852,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async prepareSetTitle(targetKind: EntityKind, targetId: string, title: string): Promise<SetTitleAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+  async prepareSetTitle(
+    targetKind: EntityKind,
+    targetId: string,
+    title: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SetTitleAction> {
+    const details = targetKind === "issue"
+      ? await this.#getIssueDetails(targetId, approvalQueue)
+      : await this.#getPullRequestDetails(targetId, approvalQueue);
     return {
       type: "setTitle",
       approvalId: this.#nextActionId(),
@@ -3646,8 +3874,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async prepareSetBody(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<SetBodyAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+  async prepareSetBody(
+    targetKind: EntityKind,
+    targetId: string,
+    bodyMarkdown: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SetBodyAction> {
+    const details = targetKind === "issue"
+      ? await this.#getIssueDetails(targetId, approvalQueue)
+      : await this.#getPullRequestDetails(targetId, approvalQueue);
     return {
       type: "setBody",
       approvalId: this.#nextActionId(),
@@ -3661,8 +3896,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async prepareAddLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<AddLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+  async prepareAddLabels(
+    targetKind: EntityKind,
+    targetId: string,
+    labels: string[],
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<AddLabelsAction> {
+    const details = targetKind === "issue"
+      ? await this.#getIssueDetails(targetId, approvalQueue)
+      : await this.#getPullRequestDetails(targetId, approvalQueue);
     return {
       type: "addLabels",
       approvalId: this.#nextActionId(),
@@ -3676,8 +3918,15 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
   }
 
-  async prepareRemoveLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<RemoveLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+  async prepareRemoveLabels(
+    targetKind: EntityKind,
+    targetId: string,
+    labels: string[],
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<RemoveLabelsAction> {
+    const details = targetKind === "issue"
+      ? await this.#getIssueDetails(targetId, approvalQueue)
+      : await this.#getPullRequestDetails(targetId, approvalQueue);
     return {
       type: "removeLabels",
       approvalId: this.#nextActionId(),
@@ -3696,8 +3945,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     targetId: string,
     state: GitHubIssueState,
     reason?: "completed" | "notPlanned",
+    approvalQueue?: RpcStub<ApprovalQueue>,
   ): Promise<ChangeStateAction> {
-    const current = await this.#getCurrentStateInfo(targetKind, targetId);
+    const current = await this.#getCurrentStateInfo(targetKind, targetId, approvalQueue);
     return {
       type: "changeState",
       approvalId: this.#nextActionId(),
@@ -3812,7 +4062,8 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async getMetadata(): Promise<GitHubRepoMetadata> {
-    const metadata = await this.#gatekeeper.repoMetadata();
+    await this.#approvalQueue.assertAppAccess();
+    const metadata = await this.#gatekeeper.repoMetadata(this.#approvalQueue);
     await this.#approvalQueue.authorizeObservation({
       title: `Read repository metadata for ${metadata.fullName}`,
       description: `Read basic metadata for the GitHub repository ${metadata.fullName}.`,
@@ -3821,6 +4072,7 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async createIssue(options: GitHubCreateIssueOptions): Promise<GitHubIssue> {
+    await this.#approvalQueue.assertAppAccess();
     const action = await this.#gatekeeper.prepareCreateIssue(options);
     await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
       title: `Create issue ${options.title}`,
@@ -3831,6 +4083,7 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async createPullRequest(options: GitHubCreatePullRequestOptions): Promise<GitHubPullRequest> {
+    await this.#approvalQueue.assertAppAccess();
     const action = await this.#gatekeeper.prepareCreatePullRequest(options);
     await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
       title: `Create pull request ${options.title}`,
@@ -3841,7 +4094,8 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async getIssue(id: string): Promise<GitHubIssue> {
-    const details = await this.#gatekeeper.openIssue(id);
+    await this.#approvalQueue.assertAppAccess();
+    const details = await this.#gatekeeper.openIssue(id, this.#approvalQueue);
     await this.#approvalQueue.authorizeObservation({
       title: `Open issue #${details.id}: ${details.title}`,
       description: `Open a capability for issue #${details.id} in ${details.repo.fullName}.`,
@@ -3850,7 +4104,8 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async getPullRequest(id: string): Promise<GitHubPullRequest> {
-    const details = await this.#gatekeeper.openPullRequest(id);
+    await this.#approvalQueue.assertAppAccess();
+    const details = await this.#gatekeeper.openPullRequest(id, this.#approvalQueue);
     await this.#approvalQueue.authorizeObservation({
       title: `Open pull request #${details.id}: ${details.title}`,
       description: `Open a capability for pull request #${details.id} in ${details.repo.fullName}.`,
@@ -3859,35 +4114,39 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
   }
 
   async listIssues(options?: GitHubIssueFilter): Promise<Cursor<GitHubIssueSummary>> {
-    await this.#approvalQueue.authorizeObservation({
+    await this.#approvalQueue.assertAppAccess();
+    const cursor = await this.#gatekeeper.listIssues(options, options?.resultsPerPage ?? 50, this.#approvalQueue);
+    return guardCursor(cursor, this.#approvalQueue, {
       title: `List issues`,
       description: `List issues in the GitHub repository.`,
     });
-    return this.#gatekeeper.listIssues(options, options?.resultsPerPage ?? 50);
   }
 
   async searchIssues(query: GitHubIssueSearch): Promise<Cursor<GitHubIssueSummary>> {
-    await this.#approvalQueue.authorizeObservation({
+    await this.#approvalQueue.assertAppAccess();
+    const cursor = await this.#gatekeeper.searchIssues(query, query.resultsPerPage ?? 50, this.#approvalQueue);
+    return guardCursor(cursor, this.#approvalQueue, {
       title: `Search issues for "${query.text}"`,
       description: `Search issues in the GitHub repository for "${query.text}".`,
     });
-    return this.#gatekeeper.searchIssues(query, query.resultsPerPage ?? 50);
   }
 
   async listPullRequests(options?: GitHubPullRequestFilter): Promise<Cursor<GitHubPullRequestSummary>> {
-    await this.#approvalQueue.authorizeObservation({
+    await this.#approvalQueue.assertAppAccess();
+    const cursor = await this.#gatekeeper.listPullRequests(options, options?.resultsPerPage ?? 50, this.#approvalQueue);
+    return guardCursor(cursor, this.#approvalQueue, {
       title: `List pull requests`,
       description: `List pull requests in the GitHub repository.`,
     });
-    return this.#gatekeeper.listPullRequests(options, options?.resultsPerPage ?? 50);
   }
 
   async searchPullRequests(query: GitHubPullRequestSearch): Promise<Cursor<GitHubPullRequestSummary>> {
-    await this.#approvalQueue.authorizeObservation({
+    await this.#approvalQueue.assertAppAccess();
+    const cursor = await this.#gatekeeper.searchPullRequests(query, query.resultsPerPage ?? 50, this.#approvalQueue);
+    return guardCursor(cursor, this.#approvalQueue, {
       title: `Search pull requests for "${query.text}"`,
       description: `Search pull requests in the GitHub repository for "${query.text}".`,
     });
-    return this.#gatekeeper.searchPullRequests(query, query.resultsPerPage ?? 50);
   }
 }
 
@@ -3915,15 +4174,9 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
     (this.approvalQueue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
 
-  protected async authorizeMutationPreparation(action: string): Promise<void> {
-    await this.approvalQueue.authorizeObservation({
-      title: `Read current state of #${this.logicalId}`,
-      description: `Read the current state of #${this.logicalId} in order to ${action} and capture revert information.`,
-    });
-  }
-
   async getDetails(): Promise<GitHubIssueDetails> {
-    const details = await this.gatekeeper.openIssue(this.logicalId);
+    await this.approvalQueue.assertAppAccess();
+    const details = await this.gatekeeper.openIssue(this.logicalId, this.approvalQueue);
     await this.approvalQueue.authorizeObservation({
       title: `Read issue #${details.id}: ${details.title}`,
       description: `Read the full details of issue #${details.id} in ${details.repo.fullName}.`,
@@ -3932,8 +4185,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async setTitle(title: string): Promise<void> {
-    await this.authorizeMutationPreparation("change its title");
-    const action = await this.gatekeeper.prepareSetTitle(this.kind, this.logicalId, title);
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareSetTitle(this.kind, this.logicalId, title, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to change its title and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Rename #${this.logicalId}`,
       description: `Change the title from "${action.previousTitle}" to "${title}".`,
@@ -3942,8 +4199,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async setBody(bodyMarkdown: string): Promise<void> {
-    await this.authorizeMutationPreparation("edit its body");
-    const action = await this.gatekeeper.prepareSetBody(this.kind, this.logicalId, bodyMarkdown);
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareSetBody(this.kind, this.logicalId, bodyMarkdown, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to edit its body and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Edit body of #${this.logicalId}`,
       description: `Replace the Markdown body of #${this.logicalId}.`,
@@ -3952,8 +4213,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async addLabels(labels: string[]): Promise<void> {
-    await this.authorizeMutationPreparation("add labels");
-    const action = await this.gatekeeper.prepareAddLabels(this.kind, this.logicalId, labels);
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareAddLabels(this.kind, this.logicalId, labels, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to add labels and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Add labels to #${this.logicalId}`,
       description: `Add labels ${labels.join(", ")} to #${this.logicalId}.`,
@@ -3962,8 +4227,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async removeLabels(labels: string[]): Promise<void> {
-    await this.authorizeMutationPreparation("remove labels");
-    const action = await this.gatekeeper.prepareRemoveLabels(this.kind, this.logicalId, labels);
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareRemoveLabels(this.kind, this.logicalId, labels, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to remove labels and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Remove labels from #${this.logicalId}`,
       description: `Remove labels ${labels.join(", ")} from #${this.logicalId}.`,
@@ -3972,8 +4241,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async close(reason?: "completed" | "notPlanned"): Promise<void> {
-    await this.authorizeMutationPreparation("close it");
-    const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "closed", reason);
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "closed", reason, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to close it and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Close #${this.logicalId}`,
       description: `Close #${this.logicalId}${reason ? ` with reason ${reason}` : ""}.`,
@@ -3982,8 +4255,12 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async reopen(): Promise<void> {
-    await this.authorizeMutationPreparation("reopen it");
-    const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "open");
+    await this.approvalQueue.assertAppAccess();
+    const action = await this.gatekeeper.prepareChangeState(this.kind, this.logicalId, "open", undefined, this.approvalQueue);
+    await this.approvalQueue.authorizeObservation({
+      title: `Read current state of #${this.logicalId}`,
+      description: `Read the current state of #${this.logicalId} in order to reopen it and capture revert information.`,
+    });
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Reopen #${this.logicalId}`,
       description: `Reopen #${this.logicalId}.`,
@@ -3992,14 +4269,21 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
   }
 
   async readDiscussion(options?: GitHubPageOptions): Promise<Cursor<GitHubDiscussionEntry>> {
-    await this.approvalQueue.authorizeObservation({
+    await this.approvalQueue.assertAppAccess();
+    const cursor = await this.gatekeeper.issueDiscussion(
+      this.kind,
+      this.logicalId,
+      options?.resultsPerPage ?? 50,
+      this.approvalQueue,
+    );
+    return guardCursor(cursor, this.approvalQueue, {
       title: `Read discussion for #${this.logicalId}`,
       description: `Read the discussion thread for #${this.logicalId}.`,
     });
-    return this.gatekeeper.issueDiscussion(this.kind, this.logicalId, options?.resultsPerPage ?? 50);
   }
 
   async postComment(bodyMarkdown: string): Promise<void> {
+    await this.approvalQueue.assertAppAccess();
     const action = await this.gatekeeper.preparePostComment(this.kind, this.logicalId, bodyMarkdown);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Comment on #${this.logicalId}`,
@@ -4016,7 +4300,8 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async getDetails(): Promise<GitHubPullRequestDetails> {
-    const details = await this.gatekeeper.openPullRequest(this.logicalId);
+    await this.approvalQueue.assertAppAccess();
+    const details = await this.gatekeeper.openPullRequest(this.logicalId, this.approvalQueue);
     await this.approvalQueue.authorizeObservation({
       title: `Read pull request #${details.id}: ${details.title}`,
       description: `Read the full details of pull request #${details.id} in ${details.repo.fullName}.`,
@@ -4025,22 +4310,39 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async readDiff(options?: GitHubPageOptions): Promise<GitHubPullRequestDiff> {
+    await this.approvalQueue.assertAppAccess();
+    const diff = await this.gatekeeper.pullDiff(
+      this.logicalId,
+      options?.resultsPerPage ?? 20,
+      this.approvalQueue,
+    );
     await this.approvalQueue.authorizeObservation({
-      title: `Read diff for #${this.logicalId}`,
-      description: `Read the diff for pull request #${this.logicalId}.`,
+      title: `Read diff revision for #${this.logicalId} (${diff.revision.baseSha}..${diff.revision.headSha})`,
+      description: `Read base revision ${diff.revision.baseSha} and head revision ${diff.revision.headSha} for pull request #${this.logicalId}.`,
     });
-    return this.gatekeeper.pullDiff(this.logicalId, options?.resultsPerPage ?? 20);
+    return {
+      ...diff,
+      files: guardCursor(diff.files, this.approvalQueue, {
+        title: `Read diff for #${this.logicalId}`,
+        description: `Read the diff for pull request #${this.logicalId}.`,
+      }),
+    };
   }
-
   async readDiffThreads(options?: GitHubPageOptions): Promise<Cursor<GitHubDiffThread>> {
-    await this.approvalQueue.authorizeObservation({
+    await this.approvalQueue.assertAppAccess();
+    const cursor = await this.gatekeeper.pullThreads(
+      this.logicalId,
+      options?.resultsPerPage ?? 20,
+      this.approvalQueue,
+    );
+    return guardCursor(cursor, this.approvalQueue, {
       title: `Read diff threads for #${this.logicalId}`,
       description: `Read diff discussion threads for pull request #${this.logicalId}.`,
     });
-    return this.gatekeeper.pullThreads(this.logicalId, options?.resultsPerPage ?? 20);
   }
 
   async postReview(review: GitHubPullRequestReviewDraft): Promise<void> {
+    await this.approvalQueue.assertAppAccess();
     const action = await this.gatekeeper.preparePostReview(this.logicalId, review);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Submit review for #${this.logicalId}`,
@@ -4050,6 +4352,7 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async replyToDiffComment(commentId: string, bodyMarkdown: string): Promise<void> {
+    await this.approvalQueue.assertAppAccess();
     if (commentId.startsWith("~")) {
       throw new Error(
         "Replies to provisional diff comments are not supported until the parent review is approved and GitHub assigns real comment IDs.",
@@ -4064,6 +4367,7 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async merge(options?: GitHubPullRequestMergeOptions): Promise<void> {
+    await this.approvalQueue.assertAppAccess();
     const action = await this.gatekeeper.prepareMergePullRequest(this.logicalId, options);
     await this.gatekeeper.submitActionForApproval(this.approvalQueue, action, {
       title: `Merge pull request #${this.logicalId}`,

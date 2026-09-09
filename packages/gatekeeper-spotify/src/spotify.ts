@@ -3,6 +3,8 @@ import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
+  type AppUiAuthority,
+  type AppUiContext,
   type AccountDescription,
   type ActionDescription,
   type Gatekeeper,
@@ -10,6 +12,8 @@ import {
   type GatekeeperConnectOptions,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
+  type VerifierAppAuthority,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
@@ -699,19 +703,22 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { class: this.ctx.exports.SpotifyGatekeeperImpl({ props }), resource: ACCOUNT_RESOURCE };
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
     const getToken = async () => await this.#userAccount().getAccessToken();
 
     if (resourceUrlPattern === ACCOUNT_RESOURCE.urlPattern) {
       return {
         iframeHtml: SPOTIFY_ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SpotifyAccountConfiguratorUI(getToken)),
+        ui: new RpcStub(new SpotifyAccountConfiguratorUI(getToken, context.authority)),
       };
     }
     if (resourceUrlPattern === PLAYLIST_RESOURCE.urlPattern) {
       return {
         iframeHtml: SPOTIFY_PLAYLIST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SpotifyPlaylistConfiguratorUI(getToken)),
+        ui: new RpcStub(new SpotifyPlaylistConfiguratorUI(getToken, context.authority)),
       };
     }
     throw new Error(`Unsupported Spotify resource configurator type: ${resourceUrlPattern}`);
@@ -735,8 +742,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * mints one on every open, so it must exist and not throw.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.SpotifyVerifier({});
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.SpotifyVerifier({props: {authority: context.authority}});
   }
 }
 
@@ -745,10 +752,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 //
 // A trivial verifier since Spotify's observer strategy is low-stakes.
 @validateRpc()
-export class SpotifyVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
-}
+export class SpotifyVerifier extends WorkerEntrypoint<Env, {authority: Fetcher<VerifierAppAuthority>}>
+  implements GatekeeperUserVerifier {
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 
+}
 // ---------------------------------------------------------------------------
 // Action model, caching, and simulation (gatekeeper responsibilities 4-6).
 //
@@ -758,7 +768,10 @@ export class SpotifyVerifier extends WorkerEntrypoint<Env> implements Gatekeeper
 // commands are the exception: they are gated like any action but, being live external state, are
 // never simulated.
 
-type WithApi = <T>(fn: (api: SpotifyApi) => Promise<T>) => Promise<T>;
+type WithApi = <T>(
+  fn: (api: SpotifyApi) => Promise<T>,
+  approvalQueue?: RpcStub<ApprovalQueue>,
+) => Promise<T>;
 
 type ActionState = "staged" | "pending" | "approved" | "rejected" | "failed";
 
@@ -984,9 +997,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
 
-  #withApi: WithApi = async <T>(fn: (api: SpotifyApi) => Promise<T>): Promise<T> => {
+  #withApi: WithApi = async <T>(
+    fn: (api: SpotifyApi) => Promise<T>,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<T> => {
     const account = this.#userAccount();
-    const api = new SpotifyApi(() => account.getAccessToken());
+    const baseApi = new SpotifyApi(() => account.getAccessToken());
+    const api = approvalQueue
+      ? baseApi.withBeforeRequest(() => approvalQueue.assertAppAccess())
+      : baseApi;
     try {
       return await fn(api);
     } catch (error) {
@@ -1129,16 +1148,12 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
 
   // -------------------------------------------------------------------------
   // Playlist cache
-  //
-  // Only the (small) playlist summary is cached in KV. The full track list is never persisted —
-  // it is materialized in memory on demand, and only when pending edits require simulating the
-  // post-edit ordering. Reads with no pending edits fetch just the requested page directly. This
-  // keeps KV values small regardless of playlist size.
 
   #playlistDetailsKey(realId: string): string { return `pldetails:${realId}`; }
   #invalidatePlaylist(realId: string): void { this.ctx.storage.kv.delete(this.#playlistDetailsKey(realId)); }
 
-  async #getPlaylistSummary(realId: string): Promise<SpotifyPlaylistSummary> {
+  async #getPlaylistSummary(realId: string, approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyPlaylistSummary> {
+    await approvalQueue?.assertAppAccess();
     const key = this.#playlistDetailsKey(realId);
     const cached = this.ctx.storage.kv.get<PlaylistDetailsCache>(key);
     if (cached && Date.now() - cached.fetchedAt < PLAYLIST_CACHE_TTL_MS) {
@@ -1146,7 +1161,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }
     let summary: SpotifyPlaylistSummary;
     try {
-      summary = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
+      summary = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId), approvalQueue));
     } catch (error) {
       if (error instanceof SpotifyApiError && error.status === 404) {
         throw new Error(`No Spotify playlist found with id "${realId}".`, { cause: error });
@@ -1167,12 +1182,16 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async #materializePlaylistEntries(realId: string): Promise<PlaylistEntry[]> {
+  async #materializePlaylistEntries(
+    realId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<PlaylistEntry[]> {
+    await approvalQueue?.assertAppAccess();
     // Fetch the first page to learn the total, then fetch the remaining pages with bounded
     // concurrency (rather than one-at-a-time) to cut latency on large playlists.
     let first;
     try {
-      first = await this.#withApi(api => api.listPlaylistItems(realId, 50, 0));
+      first = await this.#withApi(api => api.listPlaylistItems(realId, 50, 0), approvalQueue);
     } catch (error) {
       // Spotify withholds contents (403) for playlists the user doesn't own/collaborate on.
       if (error instanceof SpotifyApiError && error.status === 403) return [];
@@ -1187,7 +1206,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     for (let i = 0; i < offsets.length; i += PLAYLIST_FETCH_CONCURRENCY) {
       const batch = offsets.slice(i, i + PLAYLIST_FETCH_CONCURRENCY);
       const pages = await Promise.all(
-        batch.map(offset => this.#withApi(api => api.listPlaylistItems(realId, 50, offset))));
+        batch.map(offset => this.#withApi(api => api.listPlaylistItems(realId, 50, offset), approvalQueue)));
       for (const page of pages) {
         for (const item of page.items ?? []) entries.push(this.#toPlaylistEntry(item));
       }
@@ -1202,8 +1221,13 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
 
   // Full effective (overlaid) track list for a playlist. Only call when simulation is needed
   // (pending track edits exist, or the playlist is provisional).
-  async #effectivePlaylistEntries(logicalId: string, realId: string | undefined): Promise<PlaylistEntry[]> {
-    let entries = realId ? await this.#materializePlaylistEntries(realId) : [];
+  async #effectivePlaylistEntries(
+    logicalId: string,
+    realId: string | undefined,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<PlaylistEntry[]> {
+    await approvalQueue?.assertAppAccess();
+    let entries = realId ? await this.#materializePlaylistEntries(realId, approvalQueue) : [];
     const trackActions = this.#pendingPlaylistTrackActions(logicalId);
     if (trackActions.length > 0) {
       const uris = new Set<string>();
@@ -1212,7 +1236,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
           for (const uri of action.uris) uris.add(uri);
         }
       }
-      const meta = await this.#resolveTrackMetaByUri(uris);
+      const meta = await this.#resolveTrackMetaByUri(uris, approvalQueue);
       for (const action of trackActions) entries = applyPlaylistTrackOverlay(entries, action, meta);
     }
     return entries;
@@ -1223,26 +1247,37 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
    * queueing a content edit, and return the current (simulated) track count for bounds checks.
    * Provisional (not-yet-created) playlists are always owned by the user.
    */
-  async assertEditablePlaylist(logicalId: string): Promise<{ trackCount: number }> {
+  async assertEditablePlaylist(
+    logicalId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<{ trackCount: number }> {
+    await approvalQueue?.assertAppAccess();
     const realId = this.#resolveRealPlaylistId(logicalId);
     if (!realId) {
-      return { trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined)).length };
+      return { trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined, approvalQueue)).length };
     }
-    const [summary, me] = await Promise.all([this.#getPlaylistSummary(realId), this.#currentUserRef()]);
+    const [summary, me] = await Promise.all([
+      this.#getPlaylistSummary(realId, approvalQueue),
+      this.#currentUserRef(approvalQueue),
+    ]);
     if (summary.owner.id !== me.id && !summary.collaborative) {
       throw new Error(
         `Cannot edit playlist "${summary.name}": it is owned by ` +
         `${summary.owner.displayName ?? summary.owner.id} and is not collaborative.`);
     }
     const pendingDelta = this.#pendingPlaylistTrackActions(logicalId).length > 0
-      ? (await this.#effectivePlaylistEntries(logicalId, realId)).length
+      ? (await this.#effectivePlaylistEntries(logicalId, realId, approvalQueue)).length
       : summary.trackCount;
     return { trackCount: pendingDelta };
   }
 
   #playlistCountKey(realId: string): string { return `plcount:${realId}`; }
 
-  async #resolveTrackMetaByUri(uris: Iterable<string>): Promise<Map<string, SpotifyTrack>> {
+  async #resolveTrackMetaByUri(
+    uris: Iterable<string>,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<Map<string, SpotifyTrack>> {
+    await approvalQueue?.assertAppAccess();
     const meta = new Map<string, SpotifyTrack>();
     const ids: string[] = [];
     const seen = new Set<string>();
@@ -1251,25 +1286,33 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       if (id && !seen.has(id)) { seen.add(id); ids.push(id); }
     }
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)));
+      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)), approvalQueue);
       for (const track of tracks) if (track) meta.set(track.uri, normalizeTrack(track));
     }
     return meta;
   }
 
-  async #resolveTracksById(ids: string[]): Promise<Map<string, SpotifyTrack>> {
+  async #resolveTracksById(
+    ids: string[],
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<Map<string, SpotifyTrack>> {
+    await approvalQueue?.assertAppAccess();
     const meta = new Map<string, SpotifyTrack>();
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)));
+      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)), approvalQueue);
       for (const track of tracks) if (track) meta.set(track.id, normalizeTrack(track));
     }
     return meta;
   }
 
-  async #resolveAlbumsById(ids: string[]): Promise<Map<string, SpotifyAlbumRef>> {
+  async #resolveAlbumsById(
+    ids: string[],
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<Map<string, SpotifyAlbumRef>> {
+    await approvalQueue?.assertAppAccess();
     const meta = new Map<string, SpotifyAlbumRef>();
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const albums = await this.#withApi(api => api.getAlbums(ids.slice(i, i + METADATA_CHUNK)));
+      const albums = await this.#withApi(api => api.getAlbums(ids.slice(i, i + METADATA_CHUNK)), approvalQueue);
       for (const album of albums) if (album) meta.set(album.id, normalizeAlbumRef(album));
     }
     return meta;
@@ -1279,24 +1322,32 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // Reads (with simulation overlay)
 
   #cachedUserRef?: SpotifyUserRef;
-  async #currentUserRef(): Promise<SpotifyUserRef> {
+  async #currentUserRef(approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyUserRef> {
+    await approvalQueue?.assertAppAccess();
     if (!this.#cachedUserRef) {
-      this.#cachedUserRef = normalizeUserRef(await this.#withApi(api => api.getCurrentUser()));
+      this.#cachedUserRef = normalizeUserRef(await this.#withApi(api => api.getCurrentUser(), approvalQueue));
     }
     return this.#cachedUserRef;
   }
 
-  async getProfile(): Promise<SpotifyProfile> {
-    return normalizeProfile(await this.#withApi(api => api.getCurrentUser()));
+  async getProfile(approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyProfile> {
+    await approvalQueue?.assertAppAccess();
+    return normalizeProfile(await this.#withApi(api => api.getCurrentUser(), approvalQueue));
   }
 
-  async search(query: string, types: SpotifySearchType[], limit?: number): Promise<SpotifySearchResults> {
+  async search(
+    query: string,
+    types: SpotifySearchType[],
+    limit?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifySearchResults> {
+    await approvalQueue?.assertAppAccess();
     // Feb 2026 reduced the search limit maximum from 50 to 10 for development-mode apps.
     const count = clampLimit(limit, 10, 10);
     // Spotify sprinkles `null` placeholders into playlist search results, which we drop — so a
     // small limit can filter down to fewer (even zero) items. Over-fetch to the API max and then
     // slice each category to the requested count to backfill those gaps.
-    const result = await this.#withApi(api => api.search(query, types, SEARCH_FETCH_MAX));
+    const result = await this.#withApi(api => api.search(query, types, SEARCH_FETCH_MAX), approvalQueue);
     return {
       tracks: (result.tracks?.items ?? []).filter(Boolean).map(normalizeTrack).slice(0, count),
       artists: (result.artists?.items ?? []).filter(Boolean).map(normalizeArtistRef).slice(0, count),
@@ -1305,9 +1356,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async getTrack(trackId: string): Promise<SpotifyTrack> {
+  async getTrack(trackId: string, approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyTrack> {
+    await approvalQueue?.assertAppAccess();
     try {
-      return normalizeTrack(await this.#withApi(api => api.getTrack(trackId)));
+      return normalizeTrack(await this.#withApi(api => api.getTrack(trackId), approvalQueue));
     } catch (error) {
       if (error instanceof SpotifyApiError && (error.status === 404 || error.status === 400)) {
         throw new Error(`No Spotify track found with id "${trackId}".`, { cause: error });
@@ -1316,13 +1368,29 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }
   }
 
-  async getTopTracks(timeRange: SpotifyTopTimeRange | undefined, limit?: number): Promise<SpotifyTrack[]> {
-    const result = await this.#withApi(api => api.getTopTracks(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)));
+  async getTopTracks(
+    timeRange: SpotifyTopTimeRange | undefined,
+    limit?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyTrack[]> {
+    await approvalQueue?.assertAppAccess();
+    const result = await this.#withApi(
+      api => api.getTopTracks(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)),
+      approvalQueue,
+    );
     return (result.items ?? []).map(normalizeTrack);
   }
 
-  async getTopArtists(timeRange: SpotifyTopTimeRange | undefined, limit?: number): Promise<SpotifyArtistRef[]> {
-    const result = await this.#withApi(api => api.getTopArtists(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)));
+  async getTopArtists(
+    timeRange: SpotifyTopTimeRange | undefined,
+    limit?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyArtistRef[]> {
+    await approvalQueue?.assertAppAccess();
+    const result = await this.#withApi(
+      api => api.getTopArtists(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)),
+      approvalQueue,
+    );
     return (result.items ?? []).map(normalizeArtistRef);
   }
 
@@ -1347,9 +1415,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return { added, removed };
   }
 
-  async areTracksSaved(trackIds: string[]): Promise<boolean[]> {
+  async areTracksSaved(trackIds: string[], approvalQueue?: RpcStub<ApprovalQueue>): Promise<boolean[]> {
+    await approvalQueue?.assertAppAccess();
     if (trackIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(trackIds.map(trackUri)));
+    const base = await this.#withApi(api => api.libraryContains(trackIds.map(trackUri)), approvalQueue);
     const pending = this.#listPending();
     return trackIds.map((id, i) => {
       let saved = base[i] ?? false;
@@ -1361,9 +1430,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async areArtistsFollowed(artistIds: string[]): Promise<boolean[]> {
+  async areArtistsFollowed(artistIds: string[], approvalQueue?: RpcStub<ApprovalQueue>): Promise<boolean[]> {
+    await approvalQueue?.assertAppAccess();
     if (artistIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(artistIds.map(artistUri)));
+    const base = await this.#withApi(api => api.libraryContains(artistIds.map(artistUri)), approvalQueue);
     const pending = this.#listPending();
     return artistIds.map((id, i) => {
       let following = base[i] ?? false;
@@ -1375,9 +1445,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async areAlbumsSaved(albumIds: string[]): Promise<boolean[]> {
+  async areAlbumsSaved(albumIds: string[], approvalQueue?: RpcStub<ApprovalQueue>): Promise<boolean[]> {
+    await approvalQueue?.assertAppAccess();
     if (albumIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(albumIds.map(albumUri)));
+    const base = await this.#withApi(api => api.libraryContains(albumIds.map(albumUri)), approvalQueue);
     const pending = this.#listPending();
     return albumIds.map((id, i) => {
       let saved = base[i] ?? false;
@@ -1389,11 +1460,12 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async isFollowingPlaylist(logicalId: string): Promise<boolean> {
+  async isFollowingPlaylist(logicalId: string, approvalQueue?: RpcStub<ApprovalQueue>): Promise<boolean> {
+    await approvalQueue?.assertAppAccess();
     const realId = this.#resolveRealPlaylistId(logicalId);
     // A provisional (pending-create) playlist will land in the user's library once approved.
     let following = realId
-      ? (await this.#withApi(api => api.libraryContains([playlistUri(realId)])))[0] ?? false
+      ? (await this.#withApi(api => api.libraryContains([playlistUri(realId)]), approvalQueue))[0] ?? false
       : true;
     for (const action of this.#listPending()) {
       if (action.type === "playlistFollow" && action.playlistId === logicalId) following = true;
@@ -1402,15 +1474,20 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return following;
   }
 
-  async listSavedTracks(limit?: number, offset?: number): Promise<SpotifyTrack[]> {
+  async listSavedTracks(
+    limit?: number,
+    offset?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyTrack[]> {
+    await approvalQueue?.assertAppAccess();
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listSavedTracks(lim, off));
+    const base = await this.#withApi(api => api.listSavedTracks(lim, off), approvalQueue);
     let tracks = (base.items ?? []).map(item => normalizeTrack(item.track));
     const { added, removed } = this.#pendingSavedDelta("track");
     if (removed.size > 0) tracks = tracks.filter(track => !removed.has(track.id));
     if (off === 0 && added.length > 0) {
-      const meta = await this.#resolveTracksById(added);
+      const meta = await this.#resolveTracksById(added, approvalQueue);
       const existing = new Set(tracks.map(track => track.id));
       const prepend = added.slice().toReversed()
         .map(id => meta.get(id))
@@ -1420,15 +1497,20 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return tracks.slice(0, lim);
   }
 
-  async listSavedAlbums(limit?: number, offset?: number): Promise<SpotifyAlbumRef[]> {
+  async listSavedAlbums(
+    limit?: number,
+    offset?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyAlbumRef[]> {
+    await approvalQueue?.assertAppAccess();
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listSavedAlbums(lim, off));
+    const base = await this.#withApi(api => api.listSavedAlbums(lim, off), approvalQueue);
     let albums = (base.items ?? []).map(item => normalizeAlbumRef(item.album));
     const { added, removed } = this.#pendingSavedDelta("album");
     if (removed.size > 0) albums = albums.filter(album => !removed.has(album.id));
     if (off === 0 && added.length > 0) {
-      const meta = await this.#resolveAlbumsById(added);
+      const meta = await this.#resolveAlbumsById(added, approvalQueue);
       const existing = new Set(albums.map(album => album.id));
       const prepend = added.slice().toReversed()
         .map(id => meta.get(id))
@@ -1456,11 +1538,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       snapshotId: "",
     };
   }
-
-  async listPlaylists(limit?: number, offset?: number): Promise<SpotifyPlaylistSummary[]> {
+  async listPlaylists(
+    limit?: number,
+    offset?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyPlaylistSummary[]> {
+    await approvalQueue?.assertAppAccess();
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listMyPlaylists(lim, off));
+    const base = await this.#withApi(api => api.listMyPlaylists(lim, off), approvalQueue);
     let summaries = (base.items ?? []).filter(Boolean).map(normalizePlaylistSummary);
     // Remember each playlist's real track count. GET /playlists/{id} withholds it for playlists the
     // user doesn't own, so getDetails() uses this as a fallback to stay consistent with listPlaylists.
@@ -1480,11 +1566,11 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     if (creates.length === 0) return summaries;
     // Surface pending (unapproved) creates at the top, with a simulated track count that reflects
     // all queued edits on the provisional playlist (not just the initial adds).
-    const owner = await this.#currentUserRef();
+    const owner = await this.#currentUserRef(approvalQueue);
     const synth: SpotifyPlaylistSummary[] = [];
     for (const create of creates) {
       const summary = this.#applyDetailsOverlay(create.provisionalId, this.#synthCreatedSummary(create));
-      const entries = await this.#effectivePlaylistEntries(create.provisionalId, undefined);
+      const entries = await this.#effectivePlaylistEntries(create.provisionalId, undefined, approvalQueue);
       synth.push({ ...summary, owner, trackCount: entries.length });
     }
     synth.reverse();
@@ -1507,15 +1593,22 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return { ...summary, name, description, public: isPublic, collaborative };
   }
 
-  async playlistGetDetails(logicalId: string): Promise<SpotifyPlaylistSummary> {
+  async playlistGetDetails(
+    logicalId: string,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyPlaylistSummary> {
+    await approvalQueue?.assertAppAccess();
     const realId = this.#resolveRealPlaylistId(logicalId);
     const hasTrackEdits = this.#pendingPlaylistTrackActions(logicalId).length > 0;
 
     let summary: SpotifyPlaylistSummary;
     if (realId) {
-      summary = this.#applyDetailsOverlay(logicalId, await this.#getPlaylistSummary(realId));
+      summary = this.#applyDetailsOverlay(logicalId, await this.#getPlaylistSummary(realId, approvalQueue));
       if (hasTrackEdits) {
-        summary = { ...summary, trackCount: (await this.#effectivePlaylistEntries(logicalId, realId)).length };
+        summary = {
+          ...summary,
+          trackCount: (await this.#effectivePlaylistEntries(logicalId, realId, approvalQueue)).length,
+        };
       } else if (summary.trackCount === 0) {
         // Spotify withholds the count for non-owned playlists here; fall back to a count we saw via
         // listPlaylists so the two reads agree.
@@ -1529,14 +1622,20 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       summary = this.#applyDetailsOverlay(logicalId, this.#synthCreatedSummary(create));
       summary = {
         ...summary,
-        owner: await this.#currentUserRef(),
-        trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined)).length,
+        owner: await this.#currentUserRef(approvalQueue),
+        trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined, approvalQueue)).length,
       };
     }
     return summary;
   }
 
-  async playlistListTracks(logicalId: string, limit?: number, offset?: number): Promise<SpotifyPlaylistTrack[]> {
+  async playlistListTracks(
+    logicalId: string,
+    limit?: number,
+    offset?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyPlaylistTrack[]> {
+    await approvalQueue?.assertAppAccess();
     const lim = clampLimit(limit, 50, 50);
     const off = clampOffset(offset);
     const realId = this.#resolveRealPlaylistId(logicalId);
@@ -1546,7 +1645,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     if (realId && this.#pendingPlaylistTrackActions(logicalId).length === 0) {
       let page;
       try {
-        page = await this.#withApi(api => api.listPlaylistItems(realId, lim, off));
+        page = await this.#withApi(api => api.listPlaylistItems(realId, lim, off), approvalQueue);
       } catch (error) {
         // Non-owned playlists: Spotify withholds contents (403). Match the documented empty result.
         if (error instanceof SpotifyApiError && error.status === 403) return [];
@@ -1569,7 +1668,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       if (!create) throw new Error(`Spotify playlist ${logicalId} was not found.`);
     }
 
-    const entries = await this.#effectivePlaylistEntries(logicalId, realId);
+    const entries = await this.#effectivePlaylistEntries(logicalId, realId, approvalQueue);
     return entries.slice(off, off + lim).map((entry, index) => ({
       position: off + index,
       addedAt: entry.addedAt,
@@ -1578,16 +1677,21 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }));
   }
 
-  async playerGetState(): Promise<SpotifyPlaybackState> {
-    return normalizePlaybackState(await this.#withApi(api => api.getPlaybackState()));
+  async playerGetState(approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyPlaybackState> {
+    await approvalQueue?.assertAppAccess();
+    return normalizePlaybackState(await this.#withApi(api => api.getPlaybackState(), approvalQueue));
   }
 
-  async playerGetDevices(): Promise<SpotifyDevice[]> {
-    return (await this.#withApi(api => api.getDevices())).map(normalizeDevice);
+  async playerGetDevices(approvalQueue?: RpcStub<ApprovalQueue>): Promise<SpotifyDevice[]> {
+    await approvalQueue?.assertAppAccess();
+    return (await this.#withApi(api => api.getDevices(), approvalQueue)).map(normalizeDevice);
   }
 
-  async playerGetQueue(): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
-    const result = await this.#withApi(api => api.getQueue());
+  async playerGetQueue(
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
+    await approvalQueue?.assertAppAccess();
+    const result = await this.#withApi(api => api.getQueue(), approvalQueue);
     if (!result) return { currentlyPlaying: null, queue: [] };
     return {
       currentlyPlaying: result.currently_playing ? normalizeTrack(result.currently_playing) : null,
@@ -1595,8 +1699,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async playerGetRecentlyPlayed(limit?: number): Promise<SpotifyPlayHistoryEntry[]> {
-    const result = await this.#withApi(api => api.getRecentlyPlayed(clampLimit(limit, 20, 50)));
+  async playerGetRecentlyPlayed(
+    limit?: number,
+    approvalQueue?: RpcStub<ApprovalQueue>,
+  ): Promise<SpotifyPlayHistoryEntry[]> {
+    await approvalQueue?.assertAppAccess();
+    const result = await this.#withApi(
+      api => api.getRecentlyPlayed(clampLimit(limit, 20, 50)),
+      approvalQueue,
+    );
     return (result.items ?? []).map(item => ({
       track: normalizeTrack(item.track),
       playedAt: new Date(item.played_at),
@@ -1936,7 +2047,8 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async getState(): Promise<SpotifyPlaybackState> {
-    const state = await this.#gk.playerGetState();
+    await this.#queue.assertAppAccess();
+    const state = await this.#gk.playerGetState(this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read playback state",
       description: "Read the current Spotify playback state and active device.",
@@ -1945,7 +2057,8 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async getDevices(): Promise<SpotifyDevice[]> {
-    const devices = await this.#gk.playerGetDevices();
+    await this.#queue.assertAppAccess();
+    const devices = await this.#gk.playerGetDevices(this.#queue);
     await this.#queue.authorizeObservation({
       title: "List playback devices",
       description: "List the available Spotify Connect devices.",
@@ -1954,7 +2067,8 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async getQueue(): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
-    const result = await this.#gk.playerGetQueue();
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.playerGetQueue(this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read playback queue",
       description: "Read the currently playing track and the upcoming playback queue.",
@@ -1963,7 +2077,8 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async getRecentlyPlayed(limit?: number): Promise<SpotifyPlayHistoryEntry[]> {
-    const result = await this.#gk.playerGetRecentlyPlayed(limit);
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.playerGetRecentlyPlayed(limit, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read recently played",
       description: "Read recently played tracks from listening history.",
@@ -1972,6 +2087,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async play(options?: SpotifyPlayOptions): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (options?.contextUri && options?.trackUris) {
       throw new Error("play(): provide either contextUri or trackUris, not both.");
     }
@@ -1988,18 +2104,22 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async pause(deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     await this.#submit({ op: "pause", deviceId }, "Pause playback", "Pause Spotify playback.");
   }
 
   async next(deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     await this.#submit({ op: "next", deviceId }, "Skip to next track", "Skip to the next track.");
   }
 
   async previous(deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     await this.#submit({ op: "previous", deviceId }, "Skip to previous track", "Skip to the previous track.");
   }
 
   async seek(positionMs: number, deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (!Number.isFinite(positionMs) || positionMs < 0) {
       throw new Error("seek(): positionMs must be a non-negative number of milliseconds.");
     }
@@ -2008,6 +2128,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async setVolume(volumePercent: number, deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (!Number.isFinite(volumePercent) || volumePercent < 0 || volumePercent > 100) {
       throw new Error("setVolume(): volumePercent must be between 0 and 100.");
     }
@@ -2017,6 +2138,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
 
   @skipRpcValidation()
   async setShuffle(shuffle: boolean, deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (typeof shuffle !== "boolean") {
       throw new Error("setShuffle(): shuffle must be a boolean (true or false).");
     }
@@ -2026,6 +2148,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
 
   @skipRpcValidation()
   async setRepeat(mode: string, deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (typeof mode !== "string" || !REPEAT_MODES.has(mode)) {
       throw new Error(`setRepeat(): mode must be one of "off", "track", or "context".`);
     }
@@ -2034,6 +2157,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async transferTo(deviceId: string, play?: boolean): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (typeof deviceId !== "string" || deviceId.trim() === "") {
       throw new Error("transferTo(): deviceId must be a non-empty string.");
     }
@@ -2045,6 +2169,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async addToQueue(uri: string, deviceId?: string): Promise<void> {
+    await this.#queue.assertAppAccess();
     const trackUriValue = toTrackUri(uri);
     await this.#submit({ op: "addToQueue", uri: trackUriValue, deviceId }, "Add to queue", `Add ${trackUriValue} to the playback queue.`);
   }
@@ -2068,7 +2193,8 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async getDetails(): Promise<SpotifyPlaylistSummary> {
-    const summary = await this.#gk.playlistGetDetails(this.#logicalId);
+    await this.#queue.assertAppAccess();
+    const summary = await this.#gk.playlistGetDetails(this.#logicalId, this.#queue);
     await this.#queue.authorizeObservation({
       title: `Read playlist "${summary.name}"`,
       description: `Read details of the Spotify playlist "${summary.name}" (${summary.trackCount} tracks).`,
@@ -2077,7 +2203,8 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async listTracks(limit?: number, offset?: number): Promise<SpotifyPlaylistTrack[]> {
-    const tracks = await this.#gk.playlistListTracks(this.#logicalId, limit, offset);
+    await this.#queue.assertAppAccess();
+    const tracks = await this.#gk.playlistListTracks(this.#logicalId, limit, offset, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read playlist tracks",
       description: `Read ${tracks.length} track(s) from the playlist.`,
@@ -2086,6 +2213,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async addTracks(trackUris: string[], position?: number): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (trackUris.length === 0) return;
     if (trackUris.length > MAX_PLAYLIST_URIS_PER_CALL) {
       throw new Error(`addTracks(): at most ${MAX_PLAYLIST_URIS_PER_CALL} URIs per call.`);
@@ -2094,7 +2222,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
       throw new Error("addTracks(): position must be a non-negative integer.");
     }
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
+    await this.#gk.assertEditablePlaylist(this.#logicalId, this.#queue);
     const action = this.#gk.preparePlaylistAdd(this.#logicalId, uris, position);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: `Add ${uris.length} track(s) to playlist`,
@@ -2104,9 +2232,10 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async removeTracks(trackUris: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (trackUris.length === 0) return;
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
+    await this.#gk.assertEditablePlaylist(this.#logicalId, this.#queue);
     const action = this.#gk.preparePlaylistRemove(this.#logicalId, uris);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: `Remove ${uris.length} track(s) from playlist`,
@@ -2116,13 +2245,14 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async reorderTracks(rangeStart: number, insertBefore: number, rangeLength?: number): Promise<void> {
+    await this.#queue.assertAppAccess();
     const length = rangeLength ?? 1;
     if (!Number.isInteger(rangeStart) || rangeStart < 0 ||
         !Number.isInteger(insertBefore) || insertBefore < 0 ||
         !Number.isInteger(length) || length < 1) {
       throw new Error("reorderTracks(): rangeStart/insertBefore must be >= 0 and rangeLength >= 1.");
     }
-    const { trackCount } = await this.#gk.assertEditablePlaylist(this.#logicalId);
+    const { trackCount } = await this.#gk.assertEditablePlaylist(this.#logicalId, this.#queue);
     if (rangeStart + length > trackCount || insertBefore > trackCount) {
       throw new Error(`reorderTracks(): range is out of bounds for a playlist with ${trackCount} track(s).`);
     }
@@ -2135,11 +2265,12 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async replaceTracks(trackUris: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (trackUris.length > MAX_PLAYLIST_URIS_PER_CALL) {
       throw new Error(`replaceTracks(): at most ${MAX_PLAYLIST_URIS_PER_CALL} URIs per call.`);
     }
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
+    await this.#gk.assertEditablePlaylist(this.#logicalId, this.#queue);
     const action = this.#gk.preparePlaylistReplace(this.#logicalId, uris);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: "Replace playlist tracks",
@@ -2149,11 +2280,12 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async changeDetails(update: SpotifyPlaylistDetailsUpdate): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (Object.keys(update).length === 0) return;
     if (update.public === true && update.collaborative === true) {
       throw new Error("changeDetails(): a collaborative playlist must be private (public and collaborative cannot both be true).");
     }
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
+    await this.#gk.assertEditablePlaylist(this.#logicalId, this.#queue);
     const action = this.#gk.preparePlaylistDetails(this.#logicalId, update);
     const fields = Object.keys(update).join(", ") || "details";
     await this.#gk.submitActionForApproval(this.#queue, action, {
@@ -2164,6 +2296,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async unfollow(): Promise<void> {
+    await this.#queue.assertAppAccess();
     const action = this.#gk.preparePlaylistUnfollow(this.#logicalId);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: "Remove playlist from library",
@@ -2173,6 +2306,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async follow(): Promise<void> {
+    await this.#queue.assertAppAccess();
     const action = this.#gk.preparePlaylistFollow(this.#logicalId);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: "Add playlist to library",
@@ -2182,7 +2316,8 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async isFollowing(): Promise<boolean> {
-    const result = await this.#gk.isFollowingPlaylist(this.#logicalId);
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.isFollowingPlaylist(this.#logicalId, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Check playlist follow status",
       description: "Check whether this playlist is in your library.",
@@ -2207,7 +2342,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async getProfile(): Promise<SpotifyProfile> {
-    const profile = await this.#gk.getProfile();
+    await this.#queue.assertAppAccess();
+    const profile = await this.#gk.getProfile(this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read Spotify profile",
       description: `Read the connected Spotify account's profile (${profile.displayName ?? profile.id}).`,
@@ -2217,6 +2353,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
 
   @skipRpcValidation()
   async search(query: string, types: string[], limit?: number): Promise<SpotifySearchResults> {
+    await this.#queue.assertAppAccess();
     if (typeof query !== "string" || query.trim() === "") {
       throw new Error("search(): query must be a non-empty string.");
     }
@@ -2229,7 +2366,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       }
     }
     assertOptionalLimit(limit);
-    const results = await this.#gk.search(query, types as SpotifySearchType[], limit);
+    const results = await this.#gk.search(query, types as SpotifySearchType[], limit, this.#queue);
     await this.#queue.authorizeObservation({
       title: `Search Spotify for "${query}"`,
       description: `Search the Spotify catalog for "${query}" (${types.join(", ")}).`,
@@ -2238,7 +2375,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async getTrack(trackId: string): Promise<SpotifyTrack> {
-    const track = await this.#gk.getTrack(toBareId(trackId, "track"));
+    await this.#queue.assertAppAccess();
+    const track = await this.#gk.getTrack(toBareId(trackId, "track"), this.#queue);
     await this.#queue.authorizeObservation({
       title: `Read track "${track.name}"`,
       description: `Read catalog details for the track "${track.name}".`,
@@ -2247,7 +2385,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async listSavedTracks(limit?: number, offset?: number): Promise<SpotifyTrack[]> {
-    const tracks = await this.#gk.listSavedTracks(limit, offset);
+    await this.#queue.assertAppAccess();
+    const tracks = await this.#gk.listSavedTracks(limit, offset, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read saved tracks",
       description: `Read ${tracks.length} saved track(s) from the library.`,
@@ -2256,7 +2395,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async listSavedAlbums(limit?: number, offset?: number): Promise<SpotifyAlbumRef[]> {
-    const albums = await this.#gk.listSavedAlbums(limit, offset);
+    await this.#queue.assertAppAccess();
+    const albums = await this.#gk.listSavedAlbums(limit, offset, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read saved albums",
       description: `Read ${albums.length} saved album(s) from the library.`,
@@ -2265,7 +2405,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async areTracksSaved(trackIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areTracksSaved(trackIds.map(id => toBareId(id, "track")));
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.areTracksSaved(trackIds.map(id => toBareId(id, "track")), this.#queue);
     await this.#queue.authorizeObservation({
       title: "Check saved tracks",
       description: `Check whether ${trackIds.length} track(s) are saved in the library.`,
@@ -2274,7 +2415,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async areAlbumsSaved(albumIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areAlbumsSaved(albumIds.map(id => toBareId(id, "album")));
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.areAlbumsSaved(albumIds.map(id => toBareId(id, "album")), this.#queue);
     await this.#queue.authorizeObservation({
       title: "Check saved albums",
       description: `Check whether ${albumIds.length} album(s) are saved in the library.`,
@@ -2284,11 +2426,12 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
 
   @skipRpcValidation()
   async getTopTracks(timeRange?: string, limit?: number): Promise<SpotifyTrack[]> {
+    await this.#queue.assertAppAccess();
     if (timeRange !== undefined && (typeof timeRange !== "string" || !TOP_TIME_RANGES.has(timeRange))) {
       throw new Error(`getTopTracks(): invalid timeRange "${timeRange}". Use short_term, medium_term, or long_term.`);
     }
     assertOptionalLimit(limit);
-    const tracks = await this.#gk.getTopTracks(timeRange as SpotifyTopTimeRange | undefined, limit);
+    const tracks = await this.#gk.getTopTracks(timeRange as SpotifyTopTimeRange | undefined, limit, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read top tracks",
       description: `Read the user's top ${tracks.length} track(s).`,
@@ -2298,11 +2441,12 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
 
   @skipRpcValidation()
   async getTopArtists(timeRange?: string, limit?: number): Promise<SpotifyArtistRef[]> {
+    await this.#queue.assertAppAccess();
     if (timeRange !== undefined && (typeof timeRange !== "string" || !TOP_TIME_RANGES.has(timeRange))) {
       throw new Error(`getTopArtists(): invalid timeRange "${timeRange}". Use short_term, medium_term, or long_term.`);
     }
     assertOptionalLimit(limit);
-    const artists = await this.#gk.getTopArtists(timeRange as SpotifyTopTimeRange | undefined, limit);
+    const artists = await this.#gk.getTopArtists(timeRange as SpotifyTopTimeRange | undefined, limit, this.#queue);
     await this.#queue.authorizeObservation({
       title: "Read top artists",
       description: `Read the user's top ${artists.length} artist(s).`,
@@ -2311,6 +2455,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async saveTracks(trackIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (trackIds.length === 0) return;
     trackIds = trackIds.map(id => toBareId(id, "track"));
     const action = this.#gk.prepareSaveTracks(trackIds);
@@ -2322,6 +2467,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async removeSavedTracks(trackIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (trackIds.length === 0) return;
     trackIds = trackIds.map(id => toBareId(id, "track"));
     const action = this.#gk.prepareRemoveSavedTracks(trackIds);
@@ -2333,6 +2479,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async saveAlbums(albumIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (albumIds.length === 0) return;
     albumIds = albumIds.map(id => toBareId(id, "album"));
     const action = this.#gk.prepareSaveAlbums(albumIds);
@@ -2344,6 +2491,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async removeSavedAlbums(albumIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (albumIds.length === 0) return;
     albumIds = albumIds.map(id => toBareId(id, "album"));
     const action = this.#gk.prepareRemoveSavedAlbums(albumIds);
@@ -2355,6 +2503,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async followArtists(artistIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (artistIds.length === 0) return;
     artistIds = artistIds.map(id => toBareId(id, "artist"));
     const action = this.#gk.prepareFollowArtists(artistIds);
@@ -2366,6 +2515,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async unfollowArtists(artistIds: string[]): Promise<void> {
+    await this.#queue.assertAppAccess();
     if (artistIds.length === 0) return;
     artistIds = artistIds.map(id => toBareId(id, "artist"));
     const action = this.#gk.prepareUnfollowArtists(artistIds);
@@ -2377,7 +2527,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async isFollowingArtists(artistIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areArtistsFollowed(artistIds.map(id => toBareId(id, "artist")));
+    await this.#queue.assertAppAccess();
+    const result = await this.#gk.areArtistsFollowed(artistIds.map(id => toBareId(id, "artist")), this.#queue);
     await this.#queue.authorizeObservation({
       title: "Check followed artists",
       description: `Check whether ${artistIds.length} artist(s) are followed.`,
@@ -2386,7 +2537,8 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async listPlaylists(limit?: number, offset?: number): Promise<SpotifyPlaylistSummary[]> {
-    const playlists = await this.#gk.listPlaylists(limit, offset);
+    await this.#queue.assertAppAccess();
+    const playlists = await this.#gk.listPlaylists(limit, offset, this.#queue);
     await this.#queue.authorizeObservation({
       title: "List playlists",
       description: `List ${playlists.length} of the user's playlists.`,
@@ -2405,6 +2557,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
     name: string,
     options?: { description?: string; public?: boolean; collaborative?: boolean },
   ): Promise<SpotifyPlaylist> {
+    await this.#queue.assertAppAccess();
     if (typeof name !== "string" || name.trim() === "") {
       throw new Error("createPlaylist(): name must be a non-empty string.");
     }
@@ -2429,24 +2582,47 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
 // Resource configurators — narrow, read-only helpers exposed to the sandboxed iframe.
 // Credentials are kept private in a WeakMap keyed by the RpcTarget instance.
 
-const configuratorTokenGetters = new WeakMap<object, () => Promise<string>>();
+type SpotifyConfiguratorState = {
+  getToken: () => Promise<string>;
+  authority: RpcStub<AppUiAuthority>;
+};
+
+const configuratorStates = new WeakMap<object, SpotifyConfiguratorState>();
 
 function configuratorApi(target: object): SpotifyApi {
-  const getToken = configuratorTokenGetters.get(target);
-  if (!getToken) throw new Error("Spotify configurator is not initialized.");
-  return new SpotifyApi(getToken);
+  const state = configuratorStates.get(target);
+  if (!state) throw new Error("Spotify configurator is not initialized.");
+  return new SpotifyApi(state.getToken).withBeforeRequest(() => state.authority.requireAppAccess());
+}
+
+async function requireConfiguratorAccess(target: object): Promise<void> {
+  const state = configuratorStates.get(target);
+  if (!state) throw new Error("Spotify configurator is not initialized.");
+  await state.authority.requireAppAccess();
+}
+
+function disposeConfigurator(target: object): void {
+  const state = configuratorStates.get(target);
+  if (!state) return;
+  configuratorStates.delete(target);
+  state.authority[Symbol.dispose]();
 }
 
 const CONFIGURATOR_OPTION_LIMIT = 50;
 
 @validateRpc()
 class SpotifyAccountConfiguratorUI extends RpcTarget implements SpotifyAccountConfiguratorRpc {
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
     super();
-    configuratorTokenGetters.set(this, getToken);
+    configuratorStates.set(this, { getToken, authority: authority.dup() });
+  }
+
+  [Symbol.dispose](): void {
+    disposeConfigurator(this);
   }
 
   async resourceUrl(): Promise<string> {
+    await requireConfiguratorAccess(this);
     const user = await configuratorApi(this).getCurrentUser();
     return externalUrl(user, profileUrl(user.id));
   }
@@ -2454,12 +2630,17 @@ class SpotifyAccountConfiguratorUI extends RpcTarget implements SpotifyAccountCo
 
 @validateRpc()
 class SpotifyPlaylistConfiguratorUI extends RpcTarget implements SpotifyPlaylistConfiguratorRpc {
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
     super();
-    configuratorTokenGetters.set(this, getToken);
+    configuratorStates.set(this, { getToken, authority: authority.dup() });
+  }
+
+  [Symbol.dispose](): void {
+    disposeConfigurator(this);
   }
 
   async listPlaylists(query: string): Promise<SpotifyConfiguratorOption[]> {
+    await requireConfiguratorAccess(this);
     const api = configuratorApi(this);
     const trimmed = query.trim();
 
@@ -2469,7 +2650,9 @@ class SpotifyPlaylistConfiguratorUI extends RpcTarget implements SpotifyPlaylist
       try {
         const playlist = await api.getPlaylist(directId);
         return [playlistToOption(playlist)];
-      } catch {
+      } catch (error) {
+        // Do not turn a live app-policy denial (or an auth failure) into a fallback read.
+        if (!(error instanceof SpotifyApiError) || error.isAuthError) throw error;
         // fall through to search/listing
       }
     }

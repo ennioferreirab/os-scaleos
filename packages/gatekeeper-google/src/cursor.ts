@@ -42,6 +42,7 @@ export type CursorPagerOptions<Item, Entry> = {
   /** How many result-less pages to walk past before giving up. */
   maxEmptyPages?: number;
 };
+type PendingCursorPages<Item> = CursorPage<Item>[];
 
 /**
  * Pages to walk past before concluding the provider is wasting our time.
@@ -64,6 +65,9 @@ export class CursorPager<Item, Entry> implements Pager<Entry> {
   // only with genuinely distinct pages.
   #seenTokens = new Set<string>();
   #exhausted = false;
+  // Provider pages fetched for a page whose authorization failed. Retrying rebuilds entries from
+  // these snapshots instead of issuing another vendor request for the same consumer-visible page.
+  #pendingPages: PendingCursorPages<Item> | undefined;
   #tail: Promise<unknown> = Promise.resolve();
 
   constructor(options: CursorPagerOptions<Item, Entry>) {
@@ -91,12 +95,28 @@ export class CursorPager<Item, Entry> implements Pager<Entry> {
     let { provider, fetchPage, buildEntries, authorize, disposeEntries } = this.#options;
     let pageToken = this.#pageToken;
     // Tokens followed during this call. Merged into the committed set only once the page is
-    // approved: a denied read rewinds the cursor, and the retry re-derives these same tokens.
+    // approved: a denied read leaves both the position and these tokens uncommitted.
     let followed = new Set<string>();
+    // If authorization failed after provider pages were fetched, replay those page snapshots rather
+    // than fetching them from the vendor again. The entries are rebuilt because the prior entries
+    // were disposed after authorization failed.
+    let pendingPages = this.#pendingPages;
+    let pendingIndex = 0;
+    let fetchedPages: PendingCursorPages<Item> = [];
     let entries: Entry[];
 
     for (let fetched = 1; ; fetched++) {
-      let page = await fetchPage(pageToken);
+      let page: CursorPage<Item>;
+      if (pendingPages && pendingIndex < pendingPages.length) {
+        page = pendingPages[pendingIndex++]!;
+      } else {
+        if (pendingPages) {
+          fetchedPages = pendingPages;
+          pendingPages = undefined;
+        }
+        page = await fetchPage(pageToken);
+        fetchedPages.push(page);
+      }
       pageToken = page.nextPageToken;
 
       // A token we have already followed would page forever. Comparing only against the token we
@@ -124,6 +144,7 @@ export class CursorPager<Item, Entry> implements Pager<Entry> {
     try {
       await authorize(entries);
     } catch (error) {
+      this.#pendingPages = pendingPages ?? fetchedPages;
       try {
         await disposeEntries?.(entries);
       } catch {
@@ -131,6 +152,7 @@ export class CursorPager<Item, Entry> implements Pager<Entry> {
       }
       throw error;
     }
+    this.#pendingPages = undefined;
     for (let token of followed) this.#seenTokens.add(token);
     this.#pageToken = pageToken;
     this.#exhausted = pageToken === undefined;

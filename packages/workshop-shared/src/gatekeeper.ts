@@ -82,13 +82,29 @@ export type VendorDescription = {
 export interface AppUiAuthority extends RpcTarget {
   /** Reject when the originating human session expired or the directory user is no longer active. */
   requireActive(): Promise<void>;
+  /** Recheck current app policy for the vendor that minted this authority. */
+  requireAppAccess(): Promise<void>;
   /** Recheck the current directory role; never rely on the role observed when the UI was opened. */
   isAdmin(): Promise<boolean>;
 }
 
-/** Per-open context the Workshop passes to GatekeeperUser.startAppUi(). */
+/** Per-open context the Workshop passes to account management and resource-configuration UIs. */
 export type AppUiContext = {
   authority: RpcStub<AppUiAuthority>;
+}
+
+/**
+ * Durable, attenuated authority retained by a vendor verifier. It is bound to one connected
+ * account and rechecks that account plus current directory app policy without retaining a human
+ * session or exposing the Workshop's user object.
+ */
+export interface VerifierAppAuthority extends WorkerEntrypoint {
+  requireAppAccess(): Promise<void>;
+}
+
+/** Context supplied when a connected account mints a persistent observer verifier. */
+export type GatekeeperVerifierContext = {
+  authority: Fetcher<VerifierAppAuthority>;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -603,9 +619,12 @@ export interface GatekeeperUser extends WorkerEntrypoint {
   /**
    * Get the UI used to choose a specific resource.
    * `resourceUrlPattern` is the `urlPattern` associated with the supported resource.
+   * `context.authority` rechecks the originating session and current app policy on each sensitive
+   * operation performed through the retained configurator frame.
    */
   startResourceConfigurator(
     resourceUrlPattern: string,
+    context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame>;
 
   /**
@@ -635,8 +654,11 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    */
   getAuthenticatedEmail(): Promise<string | null>;
 
-  /** Get a `GatekeeperUserVerifier` representing this user. */
-  getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>>;
+  /**
+   * Get a `GatekeeperUserVerifier` representing this user. The returned persistent verifier must
+   * call `context.authority.requireAppAccess()` before every access check.
+   */
+  getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>>;
 
   /**
    * Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
@@ -940,10 +962,16 @@ export interface SlashCommandProvider extends RpcTarget {
  * called before applying them.
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
+  /**
+   * Recheck the live app and caller access for this retained session before reading from the
+   * underlying service. This preflight must not be confused with authorizeObservation(), which is
+   * deliberately called after a successful read so its description can include returned data.
+   */
+  assertAppAccess(): Promise<void>;
+
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
   //   system should direct the user to the right UI to authorize the action.
-
   /**
    * Submit an action for approval.
    *

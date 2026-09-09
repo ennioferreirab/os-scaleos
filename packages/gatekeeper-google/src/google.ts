@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperVerifierContext, Cursor, ActionKind } from '@gadgets/workshop-shared/gatekeeper';
 import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GoogleAccessToken, revokeGoogleToken } from "./google-api";
 import { GoogleDocSession, DocMetadata, type GoogleDocReadSession } from "./docs-types";
 import { GoogleDocsApi, type GoogleDocsDocument } from "./docs-api";
@@ -785,7 +785,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   async startResourceConfigurator(
-      resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+      resourceUrlPattern: string, context: AppUiContext): Promise<ResourceConfiguratorFrame> {
     let getToken = async (opts?: AccessTokenRequest) => {
       let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
       let obj = this.ctx.exports.UserAccount.get(id);
@@ -795,56 +795,56 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
       return {
         iframeHtml: BIGQUERY_CONFIGURATOR_HTML,
-        ui: new RpcStub(new BigQueryConfiguratorUI(getToken)),
+        ui: new RpcStub(new BigQueryConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === GMAIL_RESOURCE.urlPattern) {
       return {
         iframeHtml: GMAIL_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GmailConfiguratorUI()),
+        ui: new RpcStub(new GmailConfiguratorUI(context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_CALENDAR_RESOURCE.urlPattern) {
       return {
         iframeHtml: CALENDAR_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CalendarConfiguratorUI(getToken)),
+        ui: new RpcStub(new CalendarConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DOC_RESOURCE.urlPattern) {
       return {
         iframeHtml: GOOGLE_DOC_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GoogleDocConfiguratorUI(getToken)),
+        ui: new RpcStub(new GoogleDocConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_SHEETS_RESOURCE.urlPattern) {
       return {
         iframeHtml: GOOGLE_SHEETS_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GoogleSheetsConfiguratorUI(getToken)),
+        ui: new RpcStub(new GoogleSheetsConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveAccountConfiguratorUI()),
+        ui: new RpcStub(new DriveAccountConfiguratorUI(context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: SHARED_DRIVE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken)),
+        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken, context.authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_FILE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveFileConfiguratorUI(getToken)),
+        ui: new RpcStub(new DriveFileConfiguratorUI(getToken, context.authority)),
       };
     }
 
@@ -891,8 +891,11 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * overseer mints one on every open.)
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    let props: GoogleVerifierProps = { userObjectId: this.ctx.props.userObjectId };
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    let props: GoogleVerifierProps = {
+      userObjectId: this.ctx.props.userObjectId,
+      authority: context.authority,
+    };
     return this.ctx.exports.GoogleVerifier({ props });
   }
 }
@@ -916,6 +919,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
 type GoogleVerifierProps = {
   userObjectId: string;
+  authority: GatekeeperVerifierContext["authority"];
 };
 
 // Extract the HTTP status from the ad-hoc Error messages thrown by the Google API helpers
@@ -948,13 +952,19 @@ export interface GoogleVerifierApi extends GatekeeperUserVerifier {
 @validateRpc()
 export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     implements GoogleVerifierApi {
+  async #requireAppAccess(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
+
   async #getToken(opts?: AccessTokenRequest): Promise<string> {
+    await this.#requireAppAccess();
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
     return (await account.getAccessToken(opts)).token;
   }
 
   async hasDocAccess(documentId: string): Promise<boolean> {
+    await this.#requireAppAccess();
     let api = new GoogleDocsApi(opts => this.#getToken(opts));
     try {
       await api.getDocumentMetadata(documentId);
@@ -966,6 +976,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasSpreadsheetAccess(spreadsheetId: string): Promise<boolean> {
+    await this.#requireAppAccess();
     let api = new GoogleSheetsApi(opts => this.#getToken(opts));
     try {
       await api.getSpreadsheet(spreadsheetId);
@@ -977,6 +988,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasCalendarWriterAccess(calendarId: string): Promise<boolean> {
+    await this.#requireAppAccess();
     let api = new GoogleCalendarApi(opts => this.#getToken(opts));
     try {
       let calendar = await api.getCalendar(calendarId);
@@ -988,6 +1000,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasCalendarFreeBusyAccess(calendarId: string): Promise<boolean> {
+    await this.#requireAppAccess();
     let api = new GoogleCalendarApi(opts => this.#getToken(opts));
     try {
       return await api.hasFreeBusyAccess(calendarId);
@@ -998,6 +1011,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async hasDatasetAccess(projectId: string, datasetId: string): Promise<boolean> {
+    await this.#requireAppAccess();
     let api = new BigQueryApi(opts => this.#getToken(opts));
     try {
       await api.getDataset(projectId, datasetId);
@@ -1009,6 +1023,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 
   async verifyDriveFiles(fileIds: string[]): Promise<ObserverBatchResult> {
+    await this.#requireAppAccess();
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
     let granted = await account.getGrantedResourceUrlPatterns();
@@ -1061,29 +1076,31 @@ class PendingActionStore<Action> {
 @validateRpc()
 class RpcCursor<Entry> extends RpcTarget implements Cursor<Entry> {
   #pager: Pager<Entry>;
-  #owned: Disposable | undefined;
+  #approvalQueue: RpcStub<ApprovalQueue>;
 
   /**
-   * `owned` is disposed with this cursor. A cursor authorizes every page it discloses, so it needs
-   * an approval-queue stub that lives as long as it does rather than its session's, which the
-   * cursor's owner may dispose first.
-   *
-   * Optional because a Gmail cursor has nothing to outlive: that session never disposes its own
-   * stub (see the TODO on GmailSessionImpl).
+   * The caller transfers an approval-queue duplicate to this cursor. The pager and all entries it
+   * creates use the same duplicate, so it remains valid after the parent session is disposed and is
+   * released together with the underlying pager.
    */
-  constructor(pager: Pager<Entry>, owned?: Disposable) {
+  constructor(pager: Pager<Entry>, approvalQueue: RpcStub<ApprovalQueue>) {
     super();
     this.#pager = pager;
-    this.#owned = owned;
+    this.#approvalQueue = approvalQueue;
   }
 
   [Symbol.dispose](): void {
-    this.#owned?.[Symbol.dispose]();
+    try {
+      (this.#pager as Pager<Entry> & {[Symbol.dispose]?: () => void})[Symbol.dispose]?.();
+    } finally {
+      this.#approvalQueue[Symbol.dispose]();
+    }
   }
 
   // `next()` takes no arguments, so there is no argument surface to validate.
   @skipRpcValidation()
-  next(): Promise<Entry[] | null> {
+  async next(): Promise<Entry[] | null> {
+    await this.#approvalQueue.assertAppAccess();
     return this.#pager.next();
   }
 }
@@ -1479,12 +1496,16 @@ export class GoogleDocGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<GoogleDocSession> {
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let queue = approvalQueue.dup();
+    let api = new GoogleDocsApi(async opts => {
+      await queue.assertAppAccess();
+      return this.#getAccessToken(opts);
+    });
     let pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
     return new GoogleDocSessionImpl(
         api,
         this.ctx.props.documentId,
-        approvalQueue.dup(),
+        queue,
         pendingActions,
         this.ctx.storage,
         this.#simulationCache);
@@ -1740,6 +1761,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
    * `getContent()` already shows them.
    */
   async getMetadata(): Promise<DocMetadata> {
+    await this.#approvalQueue.assertAppAccess();
     let metadata = await this.#docsApi.getDocumentMetadata(this.#documentId);
     let revisedAt = this.#observeDocRevision(metadata.revisionId);
     let pendingActions = this.#pendingActions.list()
@@ -1780,6 +1802,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async getContent(): Promise<string> {
+    await this.#approvalQueue.assertAppAccess();
     let {markdown} = await this.#getSimulatedContent();
 
     await this.#approvalQueue.authorizeObservation({
@@ -1794,6 +1817,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     if (oldMarkdown === newMarkdown) {
       return;
     }
+    await this.#approvalQueue.assertAppAccess();
 
     let {snapshot, markdown} = await this.#getSimulatedContent();
     findUniqueMarkdown(markdown, oldMarkdown, "replaceText");
@@ -1833,6 +1857,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async appendText(markdown: string): Promise<void> {
+    await this.#approvalQueue.assertAppAccess();
     let {snapshot} = await this.#getSimulatedContent();
 
     let action: GoogleDocAction = {
@@ -1910,9 +1935,13 @@ export class GoogleSheetsGatekeeperImpl
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleSpreadsheetSession> {
-    let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
+    let queue = approvalQueue.dup();
+    let api = new GoogleSheetsApi(async opts => {
+      await queue.assertAppAccess();
+      return this.#getAccessToken(opts);
+    });
     return new GoogleSpreadsheetSessionImpl(
-      api, this.ctx.props.spreadsheetId, approvalQueue.dup(),
+      api, this.ctx.props.spreadsheetId, queue,
     );
   }
 
@@ -1967,6 +1996,7 @@ class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadshee
   }
 
   async getSpreadsheet(): Promise<SpreadsheetInfo> {
+    await this.#approvalQueue.assertAppAccess();
     let spreadsheet = await this.#api.getSpreadsheet(this.#spreadsheetId);
     await this.#approvalQueue.authorizeObservation({
       title: "Read Google spreadsheet metadata",
@@ -1995,6 +2025,7 @@ class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadshee
     ranges: string[],
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange[]> {
+    await this.#approvalQueue.assertAppAccess();
     let result = await this.#api.readRanges(
       this.#spreadsheetId, ranges, options?.valueMode,
     );
@@ -2229,13 +2260,17 @@ export class GoogleCalendarGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<GoogleCalendarSession> {
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    let queue = approvalQueue.dup();
+    let api = new GoogleCalendarApi(async opts => {
+      await queue.assertAppAccess();
+      return this.#getAccessToken(opts);
+    });
     let pendingActions = new PendingActionStore<GoogleCalendarAction>(this.ctx.storage.kv);
     return new GoogleCalendarSessionImpl(
       api,
       this.ctx.props.calendarId,
       this.ctx.props.availabilityMode,
-      approvalQueue.dup(),
+      queue,
       pendingActions,
       calendarIds => this.#observers.prepareObservation(calendarIds),
     );
@@ -2388,6 +2423,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   }
 
   async getCalendar(): Promise<GoogleCalendarInfo> {
+    await this.#approvalQueue.assertAppAccess();
     let calendar = await this.#api.getCalendar(this.#calendarId);
     await this.#approvalQueue.authorizeObservation({
       title: "Read Google Calendar metadata",
@@ -2397,6 +2433,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   }
 
   async listEvents(opts: CalendarListEventsOptions): Promise<CalendarEvent[]> {
+    await this.#approvalQueue.assertAppAccess();
     validateCalendarTimeWindow(opts.timeMin, opts.timeMax, 366);
     let events = await this.#api.listEvents(this.#calendarId, opts);
     let simulated = applyPendingCalendarActions(events, this.#pendingActions.list(), opts);
@@ -2418,6 +2455,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     timeMax: Date;
     timeZone?: string;
   }): Promise<PersonAvailability[]> {
+    await this.#approvalQueue.assertAppAccess();
     validateCalendarTimeWindow(opts.timeMin, opts.timeMax, 90);
     let people = [...new Set(opts.people.map(person => person.trim()).filter(Boolean))];
     if (people.length === 0) throw new Error("At least one person or calendar is required.");
@@ -2439,9 +2477,11 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     let successfulForeign = availability
         .filter(result => foreign.includes(result.email) && !result.error)
         .map(result => result.email);
-    let check = successfulForeign.length > 0
-        ? await this.#observeAvailabilityCalendars(successfulForeign)
-        : {pendingSets: [], commit() {}};
+    let check: ObserverCheck<string> = {pendingSets: [], commit() {}};
+    if (successfulForeign.length > 0) {
+      await this.#approvalQueue.assertAppAccess();
+      check = await this.#observeAvailabilityCalendars(successfulForeign);
+    }
 
     await this.#approvalQueue.authorizeObservation({
       title: "Check Google Calendar availability",
@@ -2500,6 +2540,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
       let start = patch.start;
       let end = patch.end;
       if (start === undefined || end === undefined) {
+        await this.#approvalQueue.assertAppAccess();
         let current = await this.#api.getEvent(this.#calendarId, eventId);
         start ??= current.start;
         end ??= current.end;
@@ -2597,15 +2638,17 @@ export class GoogleDriveGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveSession> {
     let observerTracker = this.#observerTracker();
+    let queue = approvalQueue.dup();
     let getDriveAccessToken = (opts?: AccessTokenRequest) => this.#getAccessToken(opts);
     return new GoogleDriveSessionImpl(
       new DriveApi(getDriveAccessToken),
       new GoogleDocsApi(getDriveAccessToken),
       new GoogleSheetsApi(getDriveAccessToken),
       this.ctx.props.scope,
-      approvalQueue.dup(),
+      queue,
       fileIds => observerTracker.prepareObservation(fileIds),
       () => [...observerTracker.observers()].map(([id]) => id),
+      getDriveAccessToken,
     );
   }
 
@@ -2656,6 +2699,7 @@ class GoogleDocReadSessionImpl extends RpcTarget implements GoogleDocReadSession
   }
 
   async getMetadata(): Promise<DocMetadata> {
+    await this.#approvalQueue.assertAppAccess();
     let file = await this.#driveApi.getFile(this.#documentId);
     let lastModified = new Date(file.modifiedTime ?? "");
     if (Number.isNaN(lastModified.valueOf())) {
@@ -2669,6 +2713,7 @@ class GoogleDocReadSessionImpl extends RpcTarget implements GoogleDocReadSession
   }
 
   async getContent(): Promise<string> {
+    await this.#approvalQueue.assertAppAccess();
     let snapshot = docToMarkdown(await this.#docsApi.getDocument(this.#documentId));
     await this.#approvalQueue.authorizeObservation({
       title: "Read Google Doc content",
@@ -2686,6 +2731,7 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
   #driveApi: DriveApi;
   #docsApi: GoogleDocsApi;
   #sheetsApi: GoogleSheetsApi;
+  #rawAccessToken?: (opts?: AccessTokenRequest) => Promise<string>;
   #approvalQueue: RpcStub<ApprovalQueue>;
 
   constructor(
@@ -2696,12 +2742,14 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
     approvalQueue: RpcStub<ApprovalQueue>,
     prepareObservation: (fileIds: string[]) => Promise<ObserverCheck<string>>,
     observerIds: () => string[],
+    rawAccessToken?: (opts?: AccessTokenRequest) => Promise<string>,
   ) {
     super();
     this.#driveApi = driveApi;
     this.#docsApi = docsApi;
     this.#sheetsApi = sheetsApi;
     this.#approvalQueue = approvalQueue;
+    this.#rawAccessToken = rawAccessToken;
     this.#coreOptions = { api: driveApi, scope, prepareObservation, observerIds };
     this.#core = this.#coreFor(this.#approvalQueue);
   }
@@ -2728,9 +2776,36 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
    * Scope and observer tracking are identical in every case; only the approval queue differs,
    * which is the whole reason a cursor needs a core of its own.
    */
+  #gatedAccessToken(queue: RpcStub<ApprovalQueue>) {
+    if (!this.#rawAccessToken) return undefined;
+    return async (opts?: AccessTokenRequest): Promise<string> => {
+      await queue.assertAppAccess();
+      return this.#rawAccessToken!(opts);
+    };
+  }
   #coreFor(queue: RpcStub<ApprovalQueue>): DriveSessionCore {
+    let getAccessToken = this.#gatedAccessToken(queue);
+    let driveApi = getAccessToken ? new DriveApi(getAccessToken) : this.#driveApi;
     return new DriveSessionCore({
       ...this.#coreOptions,
+      api: {
+        listFiles: async options => {
+          await queue.assertAppAccess();
+          return driveApi.listFiles(options);
+        },
+        getFile: async fileId => {
+          await queue.assertAppAccess();
+          return driveApi.getFile(fileId);
+        },
+        getDrive: async driveId => {
+          await queue.assertAppAccess();
+          return driveApi.getDrive(driveId);
+        },
+      },
+      prepareObservation: async fileIds => {
+        await queue.assertAppAccess();
+        return this.#coreOptions.prepareObservation(fileIds);
+      },
       authorize: description => queue.authorizeObservation(description),
     });
   }
@@ -2761,18 +2836,35 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
     let documentId = await this.#core.openNativeFile(
       fileId, GOOGLE_DOC_MIME_TYPE, "Google Doc",
     );
-    return new GoogleDocReadSessionImpl(
-      this.#docsApi, this.#driveApi, documentId, this.#approvalQueue.dup(),
-    );
+    let queue = this.#approvalQueue.dup();
+    try {
+      let getAccessToken = this.#gatedAccessToken(queue);
+      return new GoogleDocReadSessionImpl(
+        getAccessToken ? new GoogleDocsApi(getAccessToken) : this.#docsApi,
+        getAccessToken ? new DriveApi(getAccessToken) : this.#driveApi,
+        documentId, queue,
+      );
+    } catch (error) {
+      queue[Symbol.dispose]();
+      throw error;
+    }
   }
 
   async openGoogleSheet(fileId: string): Promise<GoogleSpreadsheetReadSession> {
     let spreadsheetId = await this.#core.openNativeFile(
       fileId, GOOGLE_SHEET_MIME_TYPE, "Google Sheet",
     );
-    return new GoogleSpreadsheetSessionImpl(
-      this.#sheetsApi, spreadsheetId, this.#approvalQueue.dup(),
-    );
+    let queue = this.#approvalQueue.dup();
+    try {
+      let getAccessToken = this.#gatedAccessToken(queue);
+      return new GoogleSpreadsheetSessionImpl(
+        getAccessToken ? new GoogleSheetsApi(getAccessToken) : this.#sheetsApi,
+        spreadsheetId, queue,
+      );
+    } catch (error) {
+      queue[Symbol.dispose]();
+      throw error;
+    }
   }
 }
 
@@ -2839,10 +2931,14 @@ export class BigQueryGatekeeperImpl
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<BigQuerySession> {
-    let api = new BigQueryApi(opts => this.#getAccessToken(opts));
+    let queue = approvalQueue.dup();
+    let api = new BigQueryApi(async opts => {
+      await queue.assertAppAccess();
+      return this.#getAccessToken(opts);
+    });
     return new BigQuerySessionImpl(
       api,
-      approvalQueue.dup(),
+      queue,
       this.ctx.props.scopedProjectId,
       this.ctx.props.scopedDatasetId,
       this.ctx.props.scopedTableId,
@@ -2923,11 +3019,18 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     datasets: { projectId: string; datasetId: string }[],
     description: ObservationDescription,
   ): Promise<void> {
-    let check = datasets.length > 0 ? await this.#observe(datasets) : {pendingSets: [], commit() {}};
+    let check: ObserverCheck<BigQueryDatasetRef>;
+    if (datasets.length > 0) {
+      await this.#approvalQueue.assertAppAccess();
+      check = await this.#observe(datasets);
+    } else {
+      check = {pendingSets: [], commit() {}};
+    }
     await this.#approvalQueue.authorizeObservation({
       ...description, excludeObservers: check.excludeObservers,
     });
     check.commit();
+
   }
 
   // The unique datasets referenced by a dry-run's `referencedTables` (format "project.dataset.table",
@@ -3044,6 +3147,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   // --- API ---------------------------------------------------------------
 
   async query(sql: string, opts?: BigQueryQueryOptions): Promise<BigQueryQueryResult> {
+    await this.#approvalQueue.assertAppAccess();
     let billingProject = this.#billingProject();
     let defaultDataset = this.#effectiveDataset(opts);
     let maxBytes = opts?.maximumBytesBilled ?? DEFAULT_MAX_BYTES_BILLED;
@@ -3077,6 +3181,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
         `Maximum bytes billed: ${maxBytes.toLocaleString()}.`,
       prohibitAllSharing: true,
     });
+    await this.#approvalQueue.assertAppAccess();
 
     let result = await this.#api.query(billingProject, sql, {
       ...opts,
@@ -3091,6 +3196,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     sql: string,
     opts?: Pick<BigQueryQueryOptions, "defaultDataset" | "params">,
   ): Promise<BigQueryDryRunResult> {
+    await this.#approvalQueue.assertAppAccess();
     let billingProject = this.#billingProject();
     let defaultDataset = this.#effectiveDataset(opts);
 
@@ -3125,6 +3231,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   }
 
   async listDatasets(projectId?: string): Promise<BigQueryDataset[]> {
+    await this.#approvalQueue.assertAppAccess();
     if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
       throw new Error(
         `Cannot list datasets in "${projectId}" — this connection is scoped to ` +
@@ -3156,6 +3263,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   }
 
   async listTables(datasetId?: string, projectId?: string): Promise<BigQueryTable[]> {
+    await this.#approvalQueue.assertAppAccess();
     if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
       throw new Error(
         `Cannot list tables in project "${projectId}" — this connection is scoped to ` +
@@ -3195,6 +3303,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     datasetId?: string,
     projectId?: string,
   ): Promise<{ table: BigQueryTable; schema: BigQueryField[] }> {
+    await this.#approvalQueue.assertAppAccess();
     if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
       throw new Error(
         `Cannot describe table in project "${projectId}" — this connection is scoped to ` +

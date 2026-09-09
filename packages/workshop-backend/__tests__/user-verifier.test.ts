@@ -1,18 +1,35 @@
 import { describe, expect, it } from "vitest";
-import type { GatekeeperUser, GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  GatekeeperUser, GatekeeperUserVerifier, GatekeeperVerifierContext, VerifierAppAuthority,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { UserDurableObject } from "../src/user.js";
 
 function makeUserWithAccount(vendorId: string) {
   const verifier = {} as Fetcher<GatekeeperUserVerifier>;
+  const authority = {} as Fetcher<VerifierAppAuthority>;
   let verifierRequests = 0;
+  let verifierContext: GatekeeperVerifierContext | undefined;
+  let authorityProps: unknown;
   const account = {
-    async getVerifier() {
+    async getVerifier(context: GatekeeperVerifierContext) {
       verifierRequests++;
+      verifierContext = context;
       return verifier;
     },
   } as Fetcher<GatekeeperUser>;
   const user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
+    centralAuthMode: false,
+    vendors: new Map([["notion", {}], ["linear", {}]]),
+    ctx: {
+      id: {toString: () => "user-do-id"},
+      exports: {
+        GatekeeperVerifierAuthority: ({props}: {props: unknown}) => {
+          authorityProps = props;
+          return authority;
+        },
+      },
+    },
     storage: {
       connectedAccounts: {
         get: (accountId: number) => accountId === 7
@@ -21,15 +38,30 @@ function makeUserWithAccount(vendorId: string) {
       },
     },
   });
-  return { user, verifier, verifierRequests: () => verifierRequests };
+  return {
+    user,
+    verifier,
+    authority,
+    authorityProps: () => authorityProps,
+    verifierContext: () => verifierContext,
+    verifierRequests: () => verifierRequests,
+  };
 }
 
 describe("UserDurableObject.getVerifier", () => {
-  it("returns a verifier when the connected account belongs to the expected vendor", async () => {
-    const { user, verifier, verifierRequests } = makeUserWithAccount("notion");
+  it("returns a verifier with durable live authority for the exact connected account", async () => {
+    const {
+      user, verifier, authority, authorityProps, verifierContext, verifierRequests,
+    } = makeUserWithAccount("notion");
 
     await expect(user.getVerifier(7, "notion")).resolves.toBe(verifier);
     expect(verifierRequests()).toBe(1);
+    expect(verifierContext()).toEqual({authority});
+    expect(authorityProps()).toEqual({
+      userObjectId: "user-do-id",
+      accountId: 7,
+      vendorId: "notion",
+    });
   });
 
   it("returns null when the account is missing", async () => {

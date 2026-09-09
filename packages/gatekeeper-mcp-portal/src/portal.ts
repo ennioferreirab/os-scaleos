@@ -12,17 +12,21 @@ import {
   matchesResourceUrlPattern,
   stripTrailingSlashes,
   type AccountDescription,
+  type AppUiAuthority,
+  type AppUiContext,
   type AvatarImage,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  type VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { isValidToolName, type ToolIndex } from "@gadgets/mcp-shared/client";
 import { MAX_TOOLS_PER_SERVER, type ServerTrust } from "@gadgets/mcp-shared/tools";
@@ -706,16 +710,24 @@ export class GatekeeperUserImpl
     return { class: this.ctx.exports.McpGatekeeperImpl({ props }), resource };
   }
 
-  async startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    _resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
     return {
       iframeHtml: MCP_SERVER_CONFIGURATOR_HTML,
-      ui: new RpcStub(new McpServerConfiguratorUI(this.env, this.#account())),
+      ui: new RpcStub(new McpServerConfiguratorUI(
+        this.env, this.#account(), context.authority)),
     };
   }
 
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.McpPortalVerifier({});
+  async getVerifier(
+    context: GatekeeperVerifierContext,
+  ): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.McpPortalVerifier({
+      props: { authority: context.authority },
+    });
   }
 }
 
@@ -755,8 +767,7 @@ export class McpCredentialAccount
     sessionId: string | null,
   ): Promise<boolean> {
     return this.#account().setVaultMcpSessionId(
-      endpoint,
-      generation,
+      endpoint, generation,
       this.ctx.props.credentialGeneration,
       previousSessionId,
       sessionId,
@@ -772,14 +783,18 @@ export class McpCredentialAccount
 // ---------------------------------------------------------------------------
 // Verifier
 
-// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` refuses
-// everyone.
+type McpPortalVerifierProps = {
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 @validateRpc()
 export class McpPortalVerifier
-  extends WorkerEntrypoint<Env>
+  extends WorkerEntrypoint<Env, McpPortalVerifierProps>
   implements GatekeeperUserVerifier
 {
-  verify(): void {}
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -789,16 +804,23 @@ export class McpPortalVerifier
 class McpServerConfiguratorUI extends RpcTarget implements McpServerConfiguratorRpc {
   #env: Env;
   #account: DurableObjectStub<McpAccount>;
+  #authority: RpcStub<AppUiAuthority>;
   #serverPromise: Promise<ConnectedServer> | undefined;
   #portalServersPromise: Promise<PortalServer[]> | undefined;
 
-  constructor(env: Env, account: DurableObjectStub<McpAccount>) {
+  constructor(
+    env: Env,
+    account: DurableObjectStub<McpAccount>,
+    authority: RpcStub<AppUiAuthority>,
+  ) {
     super();
     this.#env = env;
     this.#account = account;
+    this.#authority = authority.dup();
   }
 
   async getEndpoint(): Promise<string> {
+    await this.#authority.requireAppAccess();
     return (await this.#server()).endpoint;
   }
 
@@ -817,6 +839,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   // endpoint that does not implement the portal contract or currently fronts nothing; either case
   // leaves the form unsubmittable.
   async listServerOptions(): Promise<ConfiguratorUIOption[]> {
+    await this.#authority.requireAppAccess();
     return (await this.#portalServers())
       .filter(upstream => !isPortalServerHidden(this.#env, upstream.id))
       .map(upstream => ({
@@ -831,6 +854,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   // Tools the grant may cover within one portal upstream server. The survey is checked before the
   // detailed catalog is fetched, and `toolGrantOptions` decides what each source says.
   async listToolOptions(serverId: string): Promise<ConfiguratorUIOption[]> {
+    await this.#authority.requireAppAccess();
     if (!isValidToolName(serverId) || isPortalServerHidden(this.#env, serverId)) return [];
     if (!(await this.#portalServers()).some(server => server.id === serverId)) return [];
     const server = await this.#server();
@@ -844,6 +868,10 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
       tools,
       trust: portalTrust(this.#env),
     });
+  }
+
+  [Symbol.dispose](): void {
+    this.#authority[Symbol.dispose]();
   }
 }
 

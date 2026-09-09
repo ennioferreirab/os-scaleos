@@ -58,16 +58,19 @@ export async function loadEnabledContextCollections(
 
 @validateRpc()
 export class ContextApiImpl extends RpcTarget implements ContextApi {
+  private readonly authority: NativeRpcStub<AppUiAuthority>;
+
   constructor(
     private env: Cloudflare.Env,
     private domain: string,
     private accountId: string,
-    private authority: NativeRpcStub<AppUiAuthority>,
+    authority: NativeRpcStub<AppUiAuthority>,
     private collections: DurableObjectNamespace<ContextCollectionDurableObject>,
     private userLibraries: DurableObjectNamespace<UserLibraryDurableObject>,
     private registries: DurableObjectNamespace<LibraryRegistryDurableObject>,
   ) {
     super();
+    this.authority = authority.dup();
   }
 
   #collection(id: string) {
@@ -82,6 +85,10 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     return this.registries.getByName(this.domain);
   }
 
+  async #assertActive(): Promise<void> {
+    await this.authority.requireAppAccess();
+  }
+
   // Whether this account owns the private collection.
   async #ownsPrivate(collectionId: string): Promise<boolean> {
     return this.#userLib().hasOwned(collectionId);
@@ -89,7 +96,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   // Read: own private collections or any public collection.
   async #assertCanRead(collectionId: string): Promise<void> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
@@ -101,7 +108,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   // Write: own private collections, or public collections for admins.
   async #assertCanWrite(collectionId: string): Promise<void> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
@@ -118,12 +125,12 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   async #assertAdmin(): Promise<void> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     if (!(await this.authority.isAdmin())) throw new Error("Admin access required.");
   }
 
   async getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     return {
       isAdmin: await this.authority.isAdmin(),
       supportsGitCollections: !!this.env.ARTIFACTS,
@@ -140,7 +147,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     source: ContextCollectionContent["source"] = "web",
   ): Promise<ContextCollectionMetadata> {
     if (visibility === "public") await this.#assertAdmin();
-    else await this.authority.requireActive();
+    else await this.#assertActive();
     if (source !== "web" && source !== "git") {
       throw new Error(`Unsupported collection source: ${source}`);
     }
@@ -223,7 +230,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   async getContextCollectionMetadata(collectionId: string): Promise<ContextCollectionMetadata | null> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     try {
       let [meta, owns, isPublic] = await Promise.all([
         this.#collection(collectionId).getMetadata(),
@@ -269,16 +276,20 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   // --- Listing & access ---
 
   async listEnabledContextCollections(): Promise<EnabledCollectionInfo[]> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     return loadEnabledContextCollections(this.env, this.domain, this.#userLib());
   }
 
   async canWriteContextCollection(collectionId: string): Promise<boolean> {
-    await this.authority.requireActive();
+    await this.#assertActive();
     let [owns, isPublic] = await Promise.all([
       this.#ownsPrivate(collectionId),
       this.#registry().isPublic(collectionId),
     ]);
     return owns || (isPublic && await this.authority.isAdmin());
+  }
+
+  [Symbol.dispose](): void {
+    this.authority[Symbol.dispose]();
   }
 }

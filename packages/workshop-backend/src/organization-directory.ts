@@ -2,18 +2,25 @@ import {
   AUTH_ERROR_CODES,
   AdminAuditEvent,
   AdminMutationReceipt,
+  AppPolicyAudiencePreview,
+  AppPolicy,
+  AppPolicyMode,
   DirectoryInviteResult,
   DirectoryUser,
   PendingUserLifecycle,
   ResumeUserStatusInput,
   createAuthError,
+  isAppPolicyMode,
   type Audience,
+  type AppAccessResult,
   type DirectoryAudienceTargets,
   type Group,
   type GroupMember,
 } from "@gadgets/workshop-shared/api";
 import { collection, createTypedStorage } from "@gadgets/typed-storage";
 import { DurableObject } from "cloudflare:workers";
+import type { GatekeeperVendor } from "@gadgets/workshop-shared/gatekeeper";
+import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { requireSubject, type SupabaseAuthEnv } from "./auth/supabase.js";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -54,11 +61,12 @@ type DirectoryMutation = {
   mutationId: string;
   actorId: string;
   operation: "inviteUser" | "setUserRole" | "setUserStatus" |
-    "createGroup" | "renameGroup" | "replaceGroupMembers" | "deleteGroup";
+    "createGroup" | "renameGroup" | "replaceGroupMembers" | "deleteGroup" | "setAppPolicy";
   requestHash: string;
   receipt: AdminMutationReceipt;
   user?: DirectoryUser;
   group?: Group;
+  appPolicy?: AppPolicy;
 };
 type StoredAuditEvent = AdminAuditEvent & {storageKey: string};
 
@@ -89,6 +97,7 @@ function makeDirectoryStorage(storage: DurableObjectStorage) {
           byUser: (member: GroupMember) => member.userId,
         },
       }),
+      appPolicies: collection<AppPolicy>()({primaryKey: "vendorId"}),
       mutations: collection<DirectoryMutation>()({primaryKey: "key"}),
       auditEvents: collection<StoredAuditEvent>()({
         primaryKey: "storageKey",
@@ -103,6 +112,59 @@ function makeDirectoryStorage(storage: DurableObjectStorage) {
 }
 
 type DirectoryStorage = ReturnType<typeof makeDirectoryStorage>;
+
+function invalidInput(message: string): Error {
+  return Object.assign(new TypeError(message), {code: AUTH_ERROR_CODES.invalidInput});
+}
+
+function defaultAppPolicy(vendorId: string, createdAt: string): AppPolicy {
+  return {
+    vendorId,
+    mode: "disabled",
+    audience: {everyone: false, userIds: [], groupIds: []},
+    updatedAt: createdAt,
+  };
+}
+
+function normalizeAudienceIds(value: unknown, field: "userIds" | "groupIds"): string[] {
+  if (!Array.isArray(value) ||
+      !value.every((entry): entry is string => typeof entry === "string")) {
+    throw invalidInput(`Audience ${field} must be an array of UUIDs.`);
+  }
+  try {
+    return [...new Set(value.map(entry => requireSubject(entry, field)))].toSorted();
+  } catch {
+    throw invalidInput(`Audience ${field} must contain only UUIDs.`);
+  }
+}
+
+function normalizeAudience(value: unknown): Audience {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw invalidInput("Audience must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.everyone !== "boolean") {
+    throw invalidInput("Audience everyone must be a boolean.");
+  }
+  const userIds = normalizeAudienceIds(record.userIds, "userIds");
+  const groupIds = normalizeAudienceIds(record.groupIds, "groupIds");
+  return {everyone: record.everyone, userIds, groupIds};
+}
+
+function validateAudience(audience: Audience, storage: DirectoryStorage): void {
+  if (audience.userIds.some(userId => !storage.directoryUsers.get(userId))) {
+    throw invalidInput("Audience userIds must reference existing users.");
+  }
+  if (audience.groupIds.some(groupId => !storage.groups.get(groupId))) {
+    throw invalidInput("Audience groupIds must reference existing groups.");
+  }
+}
+
+function appPolicySummary(policy: AppPolicy): string {
+  const audience = policy.audience;
+  return `mode=${policy.mode};everyone=${audience.everyone};users=${audience.userIds.length};` +
+    `groups=${audience.groupIds.length}`;
+}
 
 type ProviderUser = {
   id: string;
@@ -301,6 +363,7 @@ function sameEvent(left: AdminAuditEvent, right: AdminAuditEvent): boolean {
 /** Authoritative organization directory for the configured single organization. */
 export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: DirectoryStorage;
+  private vendors: Map<string, Service<GatekeeperVendor>>;
   private inviteInFlight = new Map<string, {
     actorId: string;
     email: string;
@@ -311,6 +374,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.storage = makeDirectoryStorage(ctx.storage);
+    this.vendors = buildGatekeeperVendorMap(env);
   }
 
   #configuredOrgId(): string {
@@ -324,6 +388,20 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       throw new Error("Configured ORG_ID does not match the durable organization.");
     }
     return identity;
+  }
+
+  #requireRegisteredVendor(vendorId: unknown): string {
+    if (typeof vendorId !== "string" || !this.vendors.has(vendorId)) {
+      throw invalidInput("vendorId must identify a registered gatekeeper.");
+    }
+    return vendorId;
+  }
+
+  async #isAutoProvisioningVendor(vendorId: string): Promise<boolean> {
+    const vendor = this.vendors.get(vendorId);
+    if (!vendor) throw invalidInput("vendorId must identify a registered gatekeeper.");
+    const description = await vendor.describe();
+    return description.autoProvisionsAccount === true;
   }
 
   #effectiveStatus(user: DirectoryUser): "active" | "disabled" {
@@ -830,6 +908,114 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     });
   }
 
+  /** List registered gatekeeper app policies, filling absent records with disabled defaults. */
+  listAppPolicies(actorId: string): AppPolicy[] {
+    const identity = this.#identity();
+    this.#requireAdmin(actorId);
+    const stored = new Map([...this.storage.appPolicies.list()]
+        .map(policy => [policy.vendorId, policy] as const));
+    return [...this.vendors.keys()].toSorted().map(vendorId =>
+      stored.get(vendorId) ?? defaultAppPolicy(vendorId, identity.createdAt));
+  }
+
+  /** Set one registered app policy with an idempotent receipt and one local audit event. */
+  async setAppPolicy(actorId: string, input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+    mutationId: string;
+  }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}> {
+    actorId = requireSubject(actorId, "actorId");
+    this.#identity();
+    this.#requireAdmin(actorId);
+    const vendorId = this.#requireRegisteredVendor(input.vendorId);
+    if (!isAppPolicyMode(input.mode)) throw invalidInput("Invalid app policy mode.");
+    const mode = input.mode;
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const audience = normalizeAudience(input.audience);
+    const hash = await requestHash({vendorId, mode, audience});
+    const key = mutationKey(actorId, "setAppPolicy", mutationId);
+    const replay = this.storage.transaction(() => {
+      this.#identity();
+      this.#requireAdmin(actorId);
+      return this.storage.mutations.get(key);
+    });
+    if (replay) {
+      if (replay.requestHash !== hash || !replay.appPolicy) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      return {policy: replay.appPolicy, receipt: replay.receipt};
+    }
+    validateAudience(audience, this.storage);
+    if (mode === "enabled" && !(await this.#isAutoProvisioningVendor(vendorId))) {
+      throw invalidInput("Only auto-provisioning gatekeepers may use enabled mode.");
+    }
+    return this.storage.transaction(() => {
+      const identity = this.#identity();
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash || !completed.appPolicy) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        return {policy: completed.appPolicy, receipt: completed.receipt};
+      }
+      const current = this.storage.appPolicies.get(vendorId) ??
+        defaultAppPolicy(vendorId, identity.createdAt);
+      validateAudience(audience, this.storage);
+      const now = new Date().toISOString();
+      const policy: AppPolicy = {vendorId, mode, audience, updatedAt: now};
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      const change: AdminAuditEvent["change"] = {
+        field: "appPolicy",
+        before: appPolicySummary(current),
+        after: appPolicySummary(policy),
+      };
+      this.storage.appPolicies.put(policy);
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "setAppPolicy", requestHash: hash, receipt, appPolicy: policy,
+      });
+      this.#storeEvent(this.#event(actorId, vendorId, "setAppPolicy",
+          "DIRECTORY_APP_POLICY_CHANGED", mutationId, change, version.before, version.after, key,
+          undefined, "directoryApp"));
+      return {policy, receipt};
+    });
+  }
+
+  /** Preview a proposed app policy from live directory state without changing policy storage. */
+  async previewAppPolicy(actorId: string, input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+  }): Promise<AppPolicyAudiencePreview> {
+    actorId = requireSubject(actorId, "actorId");
+    this.#identity();
+    this.#requireAdmin(actorId);
+    const vendorId = this.#requireRegisteredVendor(input.vendorId);
+    if (!isAppPolicyMode(input.mode)) throw invalidInput("Invalid app policy mode.");
+    const audience = normalizeAudience(input.audience);
+    validateAudience(audience, this.storage);
+    if (input.mode === "enabled" && !(await this.#isAutoProvisioningVendor(vendorId))) {
+      throw invalidInput("Only auto-provisioning gatekeepers may use enabled mode.");
+    }
+    if (input.mode === "disabled") return {users: []};
+
+    const users = [...this.storage.directoryUsers.list()]
+        .filter(user => this.#effectiveStatus(user) === "active")
+        .map(user => {
+          const access = this.resolveAudience(user.userId, audience);
+          return access.allowed
+            ? {userId: user.userId, displayName: user.displayName, sources: access.sources}
+            : null;
+        })
+        .filter((user): user is NonNullable<typeof user> => user !== null)
+        .toSorted((left, right) =>
+          left.displayName.localeCompare(right.displayName, "pt-BR") ||
+          left.userId.localeCompare(right.userId, "pt-BR"));
+    return {users};
+  }
+
   /** List groups after rechecking the requesting administrator in this directory invocation. */
   listGroups(actorId: string): Group[] {
     this.#identity();
@@ -1050,6 +1236,19 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       if (this.storage.groupMembers.get(`${groupId}:${subject}`)) sources.push(`group:${groupId}`);
     }
     return {allowed: sources.length > 0, sources};
+  }
+
+  /** Resolve one subject's current access to a registered app from its policy and audience. */
+  resolveAppAccess(subject: string, vendorId: string): AppAccessResult {
+    this.#identity();
+    subject = requireSubject(subject);
+    const policy = typeof vendorId === "string" && this.vendors.has(vendorId)
+      ? this.storage.appPolicies.get(vendorId)
+      : undefined;
+    const mode: AppPolicyMode = policy && isAppPolicyMode(policy.mode) ? policy.mode : "disabled";
+    if (!policy || mode === "disabled") return {allowed: false, mode, sources: []};
+    const audience = this.resolveAudience(subject, policy.audience);
+    return {allowed: audience.allowed, mode, sources: audience.sources};
   }
 
   /** Resolve an admitted user for the private backend-to-backend directory endpoint. */

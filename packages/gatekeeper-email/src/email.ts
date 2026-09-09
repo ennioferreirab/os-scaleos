@@ -15,6 +15,10 @@ import {
   AccountDescription,
   SupportedResource,
   ResourceConfiguratorFrame,
+  AppUiAuthority,
+  AppUiContext,
+  GatekeeperVerifierContext,
+  VerifierAppAuthority,
   stripTrailingSlashes,
 } from '@gadgets/workshop-shared/gatekeeper';
 import {
@@ -110,22 +114,30 @@ function validateEmailName(value: string | undefined): { ok: true, emailName: st
 
 const emailConfiguratorEnvs = new WeakMap<object, Env>();
 
-// RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
+// RPC interface exposed to the resource selection/configuration iframe.
 @validateRpc()
 class EmailMailboxConfiguratorUI extends RpcTarget implements EmailMailboxConfiguratorRpc {
-  constructor(env: Env) {
+  readonly #authority: RpcStub<AppUiAuthority>;
+
+  constructor(env: Env, authority: RpcStub<AppUiAuthority>) {
     super();
+    this.#authority = authority.dup();
     emailConfiguratorEnvs.set(this, env);
   }
 
   // Email mailbox resource URLs depend on Gatekeeper's configured BASE_URL,
   // so the iframe asks Gatekeeper to construct the URL.
   async resourceUrl(emailName: string | null | undefined): Promise<string> {
+    await this.#authority.requireAppAccess();
     let validated = validateEmailName(emailName ?? undefined);
     if (!validated.ok) throw new Error(validated.message);
     let env = emailConfiguratorEnvs.get(this);
     if (!env) throw new Error("Email configurator is not initialized.");
     return `${getBaseUrl(env)}/mailbox/${encodeURIComponent(validated.emailName)}`;
+  }
+
+  [Symbol.dispose](): void {
+    this.#authority[Symbol.dispose]();
   }
 }
 
@@ -372,14 +384,17 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return getSupportedResourcesList(this.env);
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+      resourceUrlPattern: string,
+      context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
     let resource = getEmailMailboxResource(this.env);
     if (resourceUrlPattern !== resource.urlPattern) {
       throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
     }
     return {
       iframeHtml: EMAIL_CONFIGURATOR_HTML,
-      ui: new RpcStub(new EmailMailboxConfiguratorUI(this.env)),
+      ui: new RpcStub(new EmailMailboxConfiguratorUI(this.env, context.authority)),
     };
   }
 
@@ -465,15 +480,24 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * mints one on every open, so it must exist and not throw.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.EmailVerifier({});
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.EmailVerifier({
+      props: { authority: context.authority },
+    });
   }
 }
 
+type EmailVerifierProps = {
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 // A trivial verifier since the email gatekeeper's observer strategy is low-stakes.
 @validateRpc()
-export class EmailVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
+export class EmailVerifier extends WorkerEntrypoint<Env, EmailVerifierProps>
+    implements GatekeeperUserVerifier {
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
 // =======================================================================================
@@ -500,10 +524,12 @@ class EmailSessionImpl extends RpcTarget implements EmailSession {
   }
 
   async getAddress(): Promise<string> {
+    await this.#approvalQueue.assertAppAccess();
     return `${this.#emailName}@${this.#emailHost}`;
   }
 
   async subscribe(callback: RpcStub<EmailHookTarget>): Promise<void> {
+    await this.#approvalQueue.assertAppAccess();
     // Construct the HookController at bind time, so its props carry the specifics of this
     // registration (here, just the gatekeeper props). The controller needs no other state.
     let hookController: Fetcher<HookController<EmailHookTarget>> =

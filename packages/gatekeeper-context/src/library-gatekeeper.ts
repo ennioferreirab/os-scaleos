@@ -9,8 +9,8 @@ import type {
   VendorDescription, AccountDescription, AgentCatalog,
   AppUiContext, GatekeeperUser, GatekeeperUiFrame, ApprovalQueue, ObservationAuthorizer,
   GatekeeperConnectCallback, GatekeeperConnectOptions, SupportedResource,
-  Gatekeeper, GatekeeperUserVerifier, ResourceDescription, ActionKind,
-  SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult,
+  Gatekeeper, GatekeeperUserVerifier, GatekeeperVerifierContext, ResourceDescription, ActionKind,
+  SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult, VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { LibraryReadSession } from "./library-read.js";
 import { ContextApiImpl, loadEnabledContextCollections } from "./context-api.js";
@@ -160,7 +160,7 @@ export class ContextAccount
   getGatekeeperClassFor(_url: string): never {
     throw new Error("The Context Library has no URL-addressed resources.");
   }
-  startResourceConfigurator(_resourceUrlPattern: string): never {
+  startResourceConfigurator(_resourceUrlPattern: string, _context: AppUiContext): never {
     throw new Error("The Context Library has no URL-addressed resources.");
   }
   /** No grantable resource types, so nothing to authorize and no URL to return. */
@@ -192,16 +192,23 @@ export class ContextAccount
    * observer can independently read each collection the Gadget has observed.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.ContextVerifier({ props: this.ctx.props });
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.ContextVerifier({
+      props: {...this.ctx.props, authority: context.authority},
+    });
   }
 }
 
+type ContextVerifierProps = ContextAccountProps & {
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 @validateRpc()
 export class ContextVerifier
-    extends WorkerEntrypoint<Cloudflare.Env, ContextAccountProps>
+    extends WorkerEntrypoint<Cloudflare.Env, ContextVerifierProps>
     implements ContextVerifierApi {
   async hasCollectionAccess(sharingDomain: string, collectionId: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     if (sharingDomain !== this.ctx.props.sharingDomain) return false;
     let userLibraries = this.ctx.exports.UserLibraryDurableObject;
     let registries = this.ctx.exports.LibraryRegistryDurableObject;

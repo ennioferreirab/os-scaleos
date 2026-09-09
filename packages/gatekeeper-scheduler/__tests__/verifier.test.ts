@@ -3,13 +3,21 @@ import { expect, it } from "vitest";
 
 const worker = createExecutionContext().exports as unknown as {
   ScheduleAccount(options: { props: { accountId: string } }): {
-    getVerifier(): Promise<{ verify(): Promise<void> }>;
+    getVerifier(context: {authority: unknown}): Promise<{ verify(): Promise<void> }>;
+  };
+  TestVerifierAuthority(options: object): unknown;
+  TestVerifierControl(options: object): {
+    reset(): Promise<void>;
+    getChecks(): Promise<number>;
   };
 };
 
-it("exports a callable scheduler verifier", async () => {
+it("rechecks live app authority whenever the scheduler verifier is used", async () => {
   const account = worker.ScheduleAccount({ props: { accountId: "test-account" } });
-  const verifier = await account.getVerifier();
+  const authority = worker.TestVerifierAuthority({});
+  const control = worker.TestVerifierControl({});
+  await control.reset();
 
-  await expect(verifier.verify()).resolves.toBeUndefined();
+  await expect((await account.getVerifier({authority})).verify()).resolves.toBeUndefined();
+  await expect(control.getChecks()).resolves.toBe(1);
 });

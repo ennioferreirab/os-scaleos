@@ -1,98 +1,107 @@
+import { RpcStub as NativeRpcStub, RpcTarget } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_ADMIN_CONFIG, serializeAdminConfig } from "../src/admin-config.js";
 import { OverseerDurableObject } from "../src/overseer.js";
 import { openFakeOverseer } from "./fixtures.js";
 
 vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
 
-function makeOverseer(
-    getConfig: () => Promise<string | null>,
-    hook: { enabled: boolean; vendorId?: string; callback?: object } | null =
-        { enabled: true, vendorId: "email" },
-    legacyVendorId?: string,
-): OverseerDurableObject {
+function makeOverseer(hook: {
+  enabled: boolean;
+  callback?: object;
+  ownerSubject?: string;
+} | null = {
+  enabled: true,
+  callback: {},
+  ownerSubject: "owner-subject",
+}) {
+  let authorizeObservation = vi.fn(async () => {});
+  let submitAction = vi.fn(async () => {});
+  let bindHook = vi.fn(async () => {});
+  let assertGatekeeperCallerAccess = vi.fn(async (_id: number, _caller: unknown) => {
+    if (!hook) throw new Error("Hook has been deleted.");
+    if (!hook.enabled) throw new Error("Hook has been deleted or disabled.");
+    return {...hook, gatekeeperId: 1};
+  });
+  let assertHookAccess = vi.fn(async (_id: number) => {
+    if (!hook) throw new Error("Hook has been deleted.");
+    if (!hook.enabled) throw new Error("Hook has been deleted or disabled.");
+    return {...hook, gatekeeperId: 1};
+  });
   let overseer = Object.create(OverseerDurableObject.prototype) as OverseerDurableObject;
   Object.assign(overseer, {
-    env: { BLUEPRINTS: { get: getConfig } },
     impl: {
-      storage: {
-        boundHooks: { get: () => hook && ({ ...hook, gatekeeperId: 1 }) },
-        gatekeepers: {
-          get: () => legacyVendorId && {
-            creationSpec: {
-              type: "gatekeeper",
-              vendorId: legacyVendorId,
-              resourceUrl: "https://example.com",
-              typeUrlPattern: "https://*",
-            },
-          },
-        },
-      },
+      assertHookAccess, assertGatekeeperCallerAccess, authorizeObservation, submitAction, bindHook,
     },
   });
-  return overseer;
+  return {
+    overseer,
+    calls: {
+      assertHookAccess, assertGatekeeperCallerAccess, authorizeObservation, submitAction, bindHook,
+    },
+  };
 }
 
 describe("OverseerDurableObject.startHook", () => {
-  it.each([
-    ["ordinary", DEFAULT_ADMIN_CONFIG, "email"],
-    ["ambient", {
-      ...DEFAULT_ADMIN_CONFIG,
-      ambientGatekeeperModes: { scheduler: "optional" as const },
-    }, "scheduler"],
-  ])("allows delivery for an enabled %s vendor", async (_kind, config, vendorId) => {
-    let callback = {};
-    let overseer = makeOverseer(
-        async () => serializeAdminConfig(config), { enabled: true, vendorId, callback });
-
-    await expect(overseer.startHook(1)).resolves.toMatchObject({ callback });
-  });
-
-  it("rejects delivery for an administratively disabled ordinary vendor", async () => {
-    let config = { ...DEFAULT_ADMIN_CONFIG, disabledGatekeepers: ["email"] };
-    let overseer = makeOverseer(async () => serializeAdminConfig(config));
-
-    await expect(overseer.startHook(1)).rejects.toThrow("Gatekeeper is disabled.");
-  });
-
-  it("rejects delivery for an administratively disabled ambient vendor", async () => {
-    let config = {
-      ...DEFAULT_ADMIN_CONFIG,
-      ambientGatekeeperModes: { scheduler: "disabled" as const },
+  it("rechecks retained callbacks and scopes every approval-queue operation to the hook", async () => {
+    let fire = vi.fn(async (_value: string) => {});
+    let callback = new NativeRpcStub(new (class extends RpcTarget {
+      async onFire(value: string) {
+        await fire(value);
+      }
+    })());
+    let hook = {
+      enabled: true,
+      callback,
+      ownerSubject: "owner-subject",
     };
-    let overseer = makeOverseer(
-        async () => serializeAdminConfig(config), { enabled: true, vendorId: "scheduler" });
+    let {overseer, calls} = makeOverseer(hook);
 
-    await expect(overseer.startHook(1)).rejects.toThrow("Gatekeeper is disabled.");
+    let started = await overseer.startHook(4);
+    expect(calls.assertHookAccess).toHaveBeenCalledWith(4);
+
+    let observation = {title: "Read", description: "Read data"};
+    await started.approvalQueue.authorizeObservation(observation);
+    expect(calls.authorizeObservation).toHaveBeenCalledWith(
+        1, observation, {from: "hook", hookId: 4, ownerSubject: "owner-subject"});
+
+    let action = {title: "Write", description: "Write data", implementsRevert: false};
+    await started.approvalQueue.submitAction(7, action);
+    expect(calls.submitAction).toHaveBeenCalledWith(
+        1, 7, action, {from: "hook", hookId: 4, ownerSubject: "owner-subject"});
+    await started.approvalQueue.assertAppAccess();
+    expect(calls.assertGatekeeperCallerAccess).toHaveBeenCalledWith(
+        1, {from: "hook", hookId: 4, ownerSubject: "owner-subject"});
+
+
+    let controller = new NativeRpcStub(new (class extends RpcTarget {
+      async enable() {}
+      async disable() {}
+    })());
+    let hookCallback = new NativeRpcStub(new (class extends RpcTarget {})());
+    let description = {title: "Nested", description: "Register nested hook"};
+    await started.approvalQueue.bindHook(controller, hookCallback, description);
+    expect(calls.bindHook).toHaveBeenCalledWith(
+        1, controller, hookCallback, description,
+        {from: "hook", hookId: 4, ownerSubject: "owner-subject"});
+
+    const authorizedCallback = overseer.authorizedHookCallback(4, callback) as unknown as {
+      onFire(value: string): Promise<void>;
+    };
+    await authorizedCallback.onFire("first");
+    hook.enabled = false;
+    await expect(authorizedCallback.onFire("denied"))
+        .rejects.toThrow("Hook has been deleted or disabled.");
+    expect(fire).toHaveBeenCalledTimes(1);
   });
 
-  it("enforces vendor policy for legacy hooks without a denormalized vendor ID", async () => {
-    let config = { ...DEFAULT_ADMIN_CONFIG, disabledGatekeepers: ["email"] };
-    let overseer = makeOverseer(
-        async () => serializeAdminConfig(config), { enabled: true }, "email");
-
-    await expect(overseer.startHook(1)).rejects.toThrow("Gatekeeper is disabled.");
-  });
-
-  it("rejects delivery when admin-config KV access fails", async () => {
-    let overseer = makeOverseer(async () => { throw new Error("KV unavailable"); });
-
-    await expect(overseer.startHook(1)).rejects.toThrow("KV unavailable");
-  });
-
-  it("rejects delivery when the hook was disabled", async () => {
-    let overseer = makeOverseer(
-        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
-        { enabled: false, vendorId: "email" });
-
-    await expect(overseer.startHook(1)).rejects.toThrow("Hook has been deleted or disabled.");
+  it("rejects delivery when the hook is disabled", async () => {
+    let {overseer} = makeOverseer({enabled: false});
+    await expect(overseer.startHook(4)).rejects.toThrow("Hook has been deleted or disabled.");
   });
 
   it("rejects delivery when the hook was deleted", async () => {
-    let overseer = makeOverseer(
-        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG), null);
-
-    await expect(overseer.startHook(1)).rejects.toThrow("Hook has been deleted or disabled.");
+    let {overseer} = makeOverseer(null);
+    await expect(overseer.startHook(4)).rejects.toThrow("Hook has been deleted.");
   });
 });
 

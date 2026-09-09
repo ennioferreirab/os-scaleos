@@ -1018,14 +1018,29 @@ export class NotionApi {
   #getToken: () => Promise<string>;
   // Optional: rotate credentials when a request hits 401. Returns a fresh access token.
   #refresh?: () => Promise<string>;
+  #beforeRequest?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>, refresh?: () => Promise<string>) {
+  constructor(
+    getToken: () => Promise<string>,
+    refresh?: () => Promise<string>,
+    beforeRequest?: () => Promise<void>,
+  ) {
     this.#getToken = getToken;
     this.#refresh = refresh;
+    this.#beforeRequest = beforeRequest;
+  }
+
+  /**
+   * Rebind this client to the operation owner's capability. Children must not retain parent guards.
+   */
+  withBeforeRequest(beforeRequest: () => Promise<void>): NotionApi {
+    return new NotionApi(this.#getToken, this.#refresh, beforeRequest);
   }
 
   async #request<T>(method: string, path: string, body?: unknown, version?: string): Promise<T> {
+    await this.#beforeRequest?.();
     let token = await this.#getToken();
+    await this.#beforeRequest?.();
     let response = await this.#send(method, path, token, body, version);
 
     // On auth failure, try once to refresh the token, then retry the request. If refresh fails
@@ -1033,10 +1048,11 @@ export class NotionApi {
     // — the refresh callback is responsible for notifying the Workshop of credential expiry.
     if (response.status === 401 && this.#refresh) {
       try {
+        await this.#beforeRequest?.();
         token = await this.#refresh();
+        await this.#beforeRequest?.();
         response = await this.#send(method, path, token, body, version);
       } catch {
-        // fall through with the original 401 response
       }
     }
 

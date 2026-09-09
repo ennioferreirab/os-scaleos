@@ -33,7 +33,7 @@ import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { OrganizationDirectoryDurableObject } from "./organization-directory.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
-import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback, TransientStubLoopback } from "./overseer";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
@@ -69,7 +69,7 @@ export { AdminSettings };
 export { OrganizationDirectoryDurableObject };
 
 // Re-export entrypoint types from user.ts.
-export { UserDurableObject, GatekeeperConnectCallbackImpl };
+export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority };
 
 // Re-export entrypoint types from overseer.ts.
 export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
@@ -142,12 +142,17 @@ async function handleDirectoryUserRequest(
 class AppUiAuthorityImpl extends NativeRpcTarget implements AppUiAuthority {
   constructor(
       private requireActiveCallback: () => Promise<void>,
+      private requireAppAccessCallback: () => Promise<void>,
       private isAdminCallback: () => Promise<boolean>) {
     super();
   }
 
   requireActive(): Promise<void> {
     return this.requireActiveCallback();
+  }
+
+  requireAppAccess(): Promise<void> {
+    return this.requireAppAccessCallback();
   }
 
   isAdmin(): Promise<boolean> {
@@ -466,7 +471,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       accountId: number,
       resourceUrlPattern: string) {
     await this.#requireActive();
-    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern);
+    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern, {
+      authority: new AppUiAuthorityImpl(
+          () => this.#requireActive(),
+          async () => {
+            await this.#requireActive();
+            await this.#user.requireOptionalConnectedAccountAccess(accountId);
+          },
+          () => this.#isAdmin()),
+    });
   }
 
   async dismissSharedGadget(gadgetId: string): Promise<void> {
@@ -696,17 +709,31 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
     // appear in the nav even before the user opens a gadget — in a single round trip.
     let accounts = await this.#user.listProvidedAccounts();
-    return accounts
-        .filter((account: (typeof accounts)[number]) => account.description.providesUi)
-        .map((account: (typeof accounts)[number]) => ({
-          id: account.vendorId,
-          title: account.description.providesUi!.title,
-          icon: account.description.providesUi!.icon,
-        }));
+    let apps: GatekeeperAppInfo[] = [];
+    for (let account of accounts) {
+      let providesUi = account.description.providesUi;
+      if (!providesUi) continue;
+      if (this.centralAuthMode) {
+        let access = await this.organizationDirectory.getByName("")
+            .resolveAppAccess(this.guard.subject, account.vendorId);
+        if (!access.allowed) continue;
+      }
+      apps.push({
+        id: account.vendorId,
+        title: providesUi.title,
+        icon: providesUi.icon,
+      });
+    }
+    return apps;
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
     await this.#requireActive();
+    if (this.centralAuthMode) {
+      let access = await this.organizationDirectory.getByName("")
+          .resolveAppAccess(this.guard.subject, id);
+      if (!access.allowed) return null;
+    }
     // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
     // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
     let user = this.#user;  // one stub for both calls
@@ -716,6 +743,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return user.startAccountAppUi(app.accountId, {
       authority: new AppUiAuthorityImpl(
           () => this.#requireActive(),
+          async () => {
+            await this.#requireActive();
+            await user.requireAccountAppUiAccess(app.accountId, id);
+          },
           () => this.#isAdmin()),
     });
   }

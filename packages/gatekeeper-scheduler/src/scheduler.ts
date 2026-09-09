@@ -9,6 +9,7 @@ import type {
   AccountDescription,
   ActionKind,
   AgentCatalog,
+  AppUiAuthority,
   AppUiContext,
   ApprovalQueue,
   Gatekeeper,
@@ -17,6 +18,7 @@ import type {
   GatekeeperUiFrame,
   GatekeeperUser,
   GatekeeperUserVerifier,
+  GatekeeperVerifierContext,
   HookController,
   HookInitiator,
   HookTargetMetadata,
@@ -25,6 +27,7 @@ import type {
   ResourceDescription,
   SupportedResource,
   VendorDescription,
+  VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   normalizeCalendarRule,
@@ -141,6 +144,7 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
 
   /** Lists this workspace's enabled schedules after observation authorization. */
   async list(): Promise<ScheduleSummary[]> {
+    await this.#approvalQueue.assertAppAccess();
     const schedules = await this.#driver.listWorkspace(this.#workspaceId);
     await this.#approvalQueue.authorizeObservation({
       title: "List scheduled tasks",
@@ -301,13 +305,24 @@ export class SchedulerGatekeeper
 
 @validateRpc()
 export class ScheduleManagementApi extends RpcTarget {
-  constructor(private readonly driver: Pick<ScheduleDriver, "listAccount">) {
+  private readonly authority: NativeRpcStub<AppUiAuthority>;
+
+  constructor(
+    private readonly driver: Pick<ScheduleDriver, "listAccount">,
+    authority: NativeRpcStub<AppUiAuthority>,
+  ) {
     super();
+    this.authority = authority.dup();
   }
 
-  /** Lists schedules across this account without mutation authority. */
-  list(options?: ManagementListOptions): Promise<ManagementSchedulePage> {
+  /** Lists schedules across this account after revalidating the host app policy. */
+  async list(options?: ManagementListOptions): Promise<ManagementSchedulePage> {
+    await this.authority.requireAppAccess();
     return this.driver.listAccount(options);
+  }
+
+  [Symbol.dispose](): void {
+    this.authority[Symbol.dispose]();
   }
 }
 
@@ -339,8 +354,10 @@ export class ScheduleAccount
   }
 
   /** Opens the account's read-only management frame. */
-  async startAppUi(_context: AppUiContext): Promise<GatekeeperUiFrame> {
-    const ui = new NativeRpcStub(new ScheduleManagementApi(this.#driver()));
+  async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
+    const ui = new NativeRpcStub(
+      new ScheduleManagementApi(this.#driver(), context.authority),
+    );
     return { iframeHtml: APP_HTML, ui };
   }
 
@@ -355,7 +372,10 @@ export class ScheduleAccount
   }
 
   /** Rejects resource configuration because Scheduler is ambient-only. */
-  startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  startResourceConfigurator(
+    _resourceUrlPattern: string,
+    _context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
     throw new Error("Scheduled Tasks has no URL-addressed resources.");
   }
 
@@ -381,8 +401,8 @@ export class ScheduleAccount
 
   /** Mints the trivial verifier used by the low-stakes observer policy. */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.ScheduleVerifier({});
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.ScheduleVerifier({props: {authority: context.authority}});
   }
 
   #driver(): DurableObjectStub<ScheduleDriver> {
@@ -392,10 +412,12 @@ export class ScheduleAccount
 
 @validateRpc()
 export class ScheduleVerifier
-  extends WorkerEntrypoint<Cloudflare.Env>
+  extends WorkerEntrypoint<Cloudflare.Env, {authority: Fetcher<VerifierAppAuthority>}>
   implements GatekeeperUserVerifier
 {
-  verify(): void {}
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
 @validateRpc()

@@ -1,9 +1,10 @@
 // The agent-facing read session for one granted observability binding.
 //
-// Every method funnels through `#observe`, which records the read on the approval queue before
-// returning it. That is the capability-audit guarantee for this gatekeeper: a read that reaches the
-// agent but not the queue would be an unaudited disclosure, so the wrapper is the invariant worth
-// testing rather than any individual method.
+// Every method funnels through `#observe`, whose API read callback rechecks live app access before
+// token/cache acquisition and immediately before each provider fetch. It records the read on the
+// approval queue before returning it. That is the capability-audit guarantee for this gatekeeper: a
+// read that reaches the agent but not the queue would be an unaudited disclosure, so the wrapper is
+// the invariant worth testing rather than any individual method.
 
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
@@ -68,8 +69,8 @@ export class CloudflareObservabilitySessionImpl extends RpcTarget
     target: string,
   ) {
     super();
-    this.#api = api;
     this.#queue = queue;
+    this.#api = api.withBeforeRequest(() => this.#queue.assertAppAccess());
     this.#target = target.slice(0, MAX_TARGET_LENGTH);
   }
 

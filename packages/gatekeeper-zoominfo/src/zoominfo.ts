@@ -4,11 +4,15 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type AppUiAuthority,
+  type AppUiContext,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
+  type VerifierAppAuthority,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
@@ -563,13 +567,17 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { class: this.ctx.exports.ZoomInfoGatekeeperImpl({ props }), resource: ACCOUNT_RESOURCE };
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    await context.authority.requireAppAccess();
     if (resourceUrlPattern !== ACCOUNT_RESOURCE.urlPattern) {
       throw new Error(`Unsupported ZoomInfo resource configurator type: ${resourceUrlPattern}`);
     }
     return {
       iframeHtml: ZOOMINFO_ACCOUNT_CONFIGURATOR_HTML,
-      ui: new RpcStub(new ZoomInfoAccountConfiguratorUI()),
+      ui: new RpcStub(new ZoomInfoAccountConfiguratorUI(context.authority.dup())),
     };
   }
 
@@ -588,22 +596,38 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
    * overseer mints one on every collaborator open, so getVerifier must still return a valid stub.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.ZoomInfoVerifier({});
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.ZoomInfoVerifier({ props: { authority: context.authority } });
   }
 }
 
 // A trivial verifier since ZoomInfoGatekeeperImpl refuses all non-owner observers.
+type ZoomInfoVerifierProps = {
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 @validateRpc()
-export class ZoomInfoVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
+export class ZoomInfoVerifier extends WorkerEntrypoint<Env, ZoomInfoVerifierProps>
+    implements GatekeeperUserVerifier {
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Resource configurator — whole-account has no inputs; just reports the canonical URL.
-
 class ZoomInfoAccountConfiguratorUI extends RpcTarget implements ZoomInfoAccountConfiguratorRpc {
+  readonly #authority: RpcStub<AppUiAuthority>;
+
+  constructor(authority: RpcStub<AppUiAuthority>) {
+    super();
+    this.#authority = authority;
+  }
+
+  [Symbol.dispose](): void {
+    this.#authority[Symbol.dispose]();
+  }
+
   async resourceUrl(): Promise<string> {
+    await this.#authority.requireAppAccess();
     return ACCOUNT_URL;
   }
 }
@@ -1011,7 +1035,10 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     super();
     this.#account = account;
     this.#approvalQueue = approvalQueue;
-    this.#api = new ZoomInfoApi(() => account.getAccessToken(), apiBaseUrl);
+    this.#api = new ZoomInfoApi(
+      () => account.getAccessToken(),
+      apiBaseUrl,
+      () => this.#approvalQueue.assertAppAccess());
     this.#kv = kv;
   }
 
@@ -1051,6 +1078,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     worstCaseCredits: number,
     page?: PageRequest,
   ): Promise<EnrichmentTicket> {
+    await this.#approvalQueue.assertAppAccess();
+
     const store = new EnrichmentStore(this.#kv);
     const id = store.submit({ kind, summary, attributes, page });
     try {
@@ -1077,6 +1106,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Lookup
 
   async lookup(fieldName: LookupFieldName, filters?: LookupFilters): Promise<LookupValue[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const cacheKey = `lookup:${fieldName}:${JSON.stringify(filters ?? {})}`;
     let results = this.#cacheGet<LookupValue[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
     const fromCache = results !== undefined;
@@ -1103,6 +1134,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   }
 
   async lookupEnrichFields(entity: EnrichEntity, fieldType: "input" | "output"): Promise<EnrichFieldInfo[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const cacheKey = `lookupEnrich:${entity}:${fieldType}`;
     let results = this.#cacheGet<EnrichFieldInfo[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
     const fromCache = results !== undefined;
@@ -1131,6 +1164,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Companies
 
   async searchCompanies(criteria: CompanySearchCriteria, page?: PageRequest): Promise<SearchPage<CompanyMatch>> {
+    await this.#approvalQueue.assertAppAccess();
+
     assertCompatibleLocation(criteria, "searchCompanies");
     const doc = await this.#call(api =>
       api.post("/data/v1/companies/search", "CompanySearch", clean({ ...criteria }), pageQuery(page)));
@@ -1182,6 +1217,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Contacts
 
   async searchContacts(criteria: ContactSearchCriteria, page?: PageRequest): Promise<SearchPage<ContactMatch>> {
+    await this.#approvalQueue.assertAppAccess();
+
     const { company, ...contact } = criteria;
     assertCompatibleLocation(company, "searchContacts");
     const attributes = clean({ ...company, ...contact });
@@ -1219,6 +1256,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Intent
 
   async searchIntent(criteria: IntentSearchCriteria, page?: PageRequest): Promise<SearchPage<IntentSignal>> {
+    await this.#approvalQueue.assertAppAccess();
+
     const { company, ...intent } = criteria;
     assertNoCompanyIdentity(company, "searchIntent", "enrichIntent");
     assertCompatibleLocation(company, "searchIntent");
@@ -1252,6 +1291,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Scoops
 
   async searchScoops(criteria: ScoopSearchCriteria, page?: PageRequest): Promise<SearchPage<Scoop>> {
+    await this.#approvalQueue.assertAppAccess();
+
     const { contact, company, ...scoop } = criteria;
     assertNoCompanyIdentity(company, "searchScoops", "enrichScoops");
     assertCompatibleLocation(company, "searchScoops");
@@ -1283,6 +1324,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // News
 
   async searchNews(criteria: NewsSearchCriteria, page?: PageRequest): Promise<SearchPage<NewsArticle>> {
+    await this.#approvalQueue.assertAppAccess();
+
     const doc = await this.#call(api =>
       api.post("/data/v1/news/search", "NewsSearch", clean({ ...criteria }), pageQuery(page)));
     const result = toSearchPage(doc, mapNewsArticle, page);
@@ -1310,6 +1353,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Enrichment results
 
   async getEnrichmentResult(ticket: EnrichmentTicket): Promise<EnrichmentOutcome> {
+    await this.#approvalQueue.assertAppAccess();
+
     const store = new EnrichmentStore(this.#kv);
     const stored = store.getResult(ticket.id);
     let outcome: EnrichmentOutcome;
@@ -1336,6 +1381,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Recommendations & lookalikes
 
   async findSimilarCompanies(criteria: SimilarCompaniesCriteria): Promise<CompanyLookalike[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const query: QueryParams = clean({
       "filter[companyId]": criteria.companyId,
       "filter[companyName]": criteria.companyName,
@@ -1364,6 +1411,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   }
 
   async findContactLookalikes(criteria: ContactLookalikesCriteria): Promise<ContactLookalike[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const query: QueryParams = clean({
       "filter[referencePersonId]": idValue(criteria.referencePersonId),
       "filter[targetCompanyId]": idValue(criteria.targetCompanyId),
@@ -1387,6 +1436,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   }
 
   async getContactRecommendations(criteria: ContactRecommendationsCriteria): Promise<ContactRecommendation[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const query: QueryParams = clean({
       "filter[useCaseType]": criteria.useCaseType,
       "filter[ziCompanyId]": idValue(criteria.companyId),
@@ -1421,6 +1472,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Account intelligence
 
   async getAccountSummary(companyId: string): Promise<AccountSummary> {
+    await this.#approvalQueue.assertAppAccess();
+
     const doc = await this.#call(api =>
       api.get(`/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary`));
     const resource = firstResource(doc);
@@ -1433,6 +1486,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   }
 
   async askAccountSummary(companyId: string, question: string): Promise<string> {
+    await this.#approvalQueue.assertAppAccess();
+
     const doc = await this.#call(api =>
       api.post(
         `/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary/actions/ask`,
@@ -1448,6 +1503,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   }
 
   async getCompanyInsights(criteria: CompanyInsightsCriteria): Promise<CompanyInsights[]> {
+    await this.#approvalQueue.assertAppAccess();
+
     const ziCompanyIds = criteria.companyIds.map(id => idValue(id));
     const doc = await this.#call(api =>
       api.post("/copilot/v1/companies/insights", "CompanyInsightsSearch",
@@ -1478,6 +1535,7 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Usage
 
   async getCreditUsage(): Promise<CreditUsage> {
+    await this.#approvalQueue.assertAppAccess();
     const doc = await this.#call(api => api.get("/data/v1/users/usage"));
     const usageList = (attrs(firstResource(doc) ?? {}).usage ?? []) as Record<string, unknown>[];
     const usage: UsageLimit[] = usageList.map(u => ({

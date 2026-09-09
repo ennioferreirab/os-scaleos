@@ -2,13 +2,12 @@
 // mirrored to one reserved BLUEPRINTS KV key, so the per-(re)connect getServerConfig() path and the
 // agent can resolve it with a single cheap KV get.
 //
-// This covers the "soft" deployment customizations only (branding, agent instructions, and which
-// gatekeeper connectors/resources are offered). Authentication/authorization config (sign-in
-// providers, password login) is deliberately NOT here — it stays env-var driven so it can't be
-// changed by a compromised admin session. Everything here is enabled by default; the admin UI opts
-// things *out*.
+// This covers presentation settings, resource-specific availability, and format curation.
+// Registered app availability and audiences live only in OrganizationDirectory.appPolicies;
+// authentication configuration (sign-in providers, password login) remains env-var driven so it
+// cannot be changed by a compromised admin session. Resource types are enabled by default.
 
-import { AmbientGatekeeperMode, BannerConfig, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, OutputFormatOffer, isAmbientGatekeeperMode, isBannerColor, isOutputIcon } from "@gadgets/workshop-shared/api";
+import { BannerConfig, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, OutputFormatOffer, isBannerColor, isOutputIcon } from "@gadgets/workshop-shared/api";
 import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive.js";
 
@@ -36,14 +35,6 @@ export type AdminConfig = {
   accentColor: string;
   /** Disabled gatekeeper resources: vendorId -> disabled resource urlPatterns. */
   disabledResources: Record<string, string[]>;
-  /** Fully-disabled gatekeeper vendor ids. */
-  disabledGatekeepers: string[];
-  /**
-   * Per-vendor provisioning mode for auto-provisioning ("ambient") gatekeepers (e.g. the Context
-   * Library). Absent ⇒ the default ("optional", see provisioning-policy.ts). Only meaningful for
-   * vendors that declare autoProvisionsAccount.
-   */
-  ambientGatekeeperModes: Record<string, AmbientGatekeeperMode>;
 
   /**
    * The blueprints offered as this deployment's standard output formats. What a user gets from
@@ -88,8 +79,6 @@ export const DEFAULT_ADMIN_CONFIG: AdminConfig = {
   banner: { text: "", color: DEFAULT_BANNER_COLOR },
   accentColor: "",
   disabledResources: {},
-  disabledGatekeepers: [],
-  ambientGatekeeperModes: {},
   formats: [],
 };
 
@@ -292,12 +281,6 @@ export function parseAdminConfig(raw: string | null): AdminConfig {
         if (list.length > 0) disabledResources[vendorId] = list;
       }
     }
-    let ambientGatekeeperModes: Record<string, AmbientGatekeeperMode> = {};
-    if (p.ambientGatekeeperModes && typeof p.ambientGatekeeperModes === "object") {
-      for (let [vendorId, mode] of Object.entries(p.ambientGatekeeperModes)) {
-        if (isAmbientGatekeeperMode(mode)) ambientGatekeeperModes[vendorId.toLowerCase()] = mode;
-      }
-    }
     return {
       signupsEnabled: typeof p.signupsEnabled === "boolean" ? p.signupsEnabled : true,
       siteName: typeof p.siteName === "string" ? p.siteName : "",
@@ -310,8 +293,6 @@ export function parseAdminConfig(raw: string | null): AdminConfig {
       },
       accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
       disabledResources,
-      disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
-      ambientGatekeeperModes,
       formats: parseFormats(p.formats),
     };
   } catch {

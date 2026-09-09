@@ -3,11 +3,9 @@ import type { GatekeeperAppInfo } from '@gadgets/workshop-shared/api'
 import { useOptionalAuthenticatedApi } from './AuthContext'
 import { useLocale } from './i18n'
 
-// Shared per-API-stub cache of the listGatekeeperApps() request, so multiple callers in one render
-// cycle (e.g. the Header nav and the /gatekeepers/$appId page) share a single RPC instead of each
-// firing their own. Keyed weakly by the stub, so it's dropped when the authenticated session ends.
+// Shared per-API-stub in-flight request, so multiple callers in one render cycle share a single
+// RPC. Resolved data is never retained: an app-policy change must be observed on the next call.
 const appsRequestByApi = new WeakMap<object, Promise<GatekeeperAppInfo[]>>()
-
 // Mounted useGatekeeperApps() hooks register here so an explicit refresh can prompt them to refetch.
 const refreshListeners = new Set<() => void>()
 
@@ -51,8 +49,15 @@ export function useGatekeeperApps(): GatekeeperAppInfo[] {
     if (!request) {
       request = auth.authenticatedApi.listGatekeeperApps()
       appsRequestByApi.set(api, request)
-      // Don't cache a failure permanently — drop it so a later mount can retry.
-      request.catch(() => appsRequestByApi.delete(api))
+      // Keep only the in-flight request. A later mount/navigation must issue a fresh policy read.
+      void request.then(
+        () => {
+          if (appsRequestByApi.get(api) === request) appsRequestByApi.delete(api)
+        },
+        () => {
+          if (appsRequestByApi.get(api) === request) appsRequestByApi.delete(api)
+        },
+      )
     }
     let cancelled = false
     request
