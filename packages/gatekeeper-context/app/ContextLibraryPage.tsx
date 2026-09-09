@@ -2544,6 +2544,9 @@ function CollectionEditor({
       setLoading(false);
     }
   }, [context, collectionId]);
+  useEffect(() => {
+    void loadDocs();
+  }, [loadDocs]);
   const handleRefreshArtifactSource = async () => {
     if (!canManage) return;
     setRefreshingSource(true);
