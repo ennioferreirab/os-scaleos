@@ -8,6 +8,7 @@ import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
+import AdminGroupsPanel from './components/AdminGroupsPanel'
 import { useLocale } from './i18n'
 import { hasPublicAuthConfig } from './auth/supabase'
 
@@ -127,6 +128,10 @@ export default function AdminPage() {
       case 'inviteUser': return t('adminArea.audit.actions.inviteUser')
       case 'setUserRole': return t('adminArea.audit.actions.setUserRole')
       case 'setUserStatus': return t('adminArea.audit.actions.setUserStatus')
+      case 'createGroup': return t('adminArea.audit.actions.createGroup')
+      case 'renameGroup': return t('adminArea.audit.actions.renameGroup')
+      case 'replaceGroupMembers': return t('adminArea.audit.actions.replaceGroupMembers')
+      case 'deleteGroup': return t('adminArea.audit.actions.deleteGroup')
       case 'setSignupsEnabled': return t('adminArea.audit.actions.setSignupsEnabled')
     }
   }
@@ -574,6 +579,7 @@ export default function AdminPage() {
           { value: 'gatekeepers', label: t('adminArea.tabs.gatekeepers') },
           { value: 'formats', label: t('adminArea.tabs.formats') },
           { value: 'users', label: t('adminArea.tabs.users') },
+          { value: 'groups', label: t('adminArea.tabs.groups') },
           ...(!centralAuthEnabled
             ? [{ value: 'access', label: t('adminArea.tabs.access') }]
             : []),
@@ -686,6 +692,8 @@ export default function AdminPage() {
 
         </div>
       )}
+
+      {activeTab === 'groups' && admin && <AdminGroupsPanel admin={admin.api} />}
 
       {/* Standard output formats */}
       {activeTab === 'formats' && admin && (

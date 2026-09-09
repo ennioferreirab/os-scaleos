@@ -241,6 +241,7 @@ describe("OrganizationDirectoryDurableObject", () => {
         status: "disabled",
         mutationId,
         actorUserId: ADMIN_ID,
+        startedAt: expect.any(String),
       });
       await expect(directory.resumeUserStatus(RESUMER_ID, {...pending, status: "active"}))
           .rejects.toMatchObject({code: AUTH_ERROR_CODES.conflict});
@@ -257,6 +258,196 @@ describe("OrganizationDirectoryDurableObject", () => {
         resumedByUserId: RESUMER_ID,
         action: "setUserStatus",
       });
+    });
+  });
+
+  it("creates, renames, lists, replaces, and deletes groups with idempotent audit receipts",
+      async () => {
+    await inDirectory(`groups-${crypto.randomUUID()}`, async directory => {
+      await bootstrapAndInvite(directory);
+      await directory.inviteUser(ADMIN_ID, {
+        email: "resumer@example.test",
+        displayName: "Resumer",
+        mutationId: crypto.randomUUID(),
+      });
+
+      const createInput = {name: "  Alpha  ", mutationId: crypto.randomUUID()};
+      const created = await directory.createGroup(ADMIN_ID, createInput);
+      expect(created.group.name).toBe("Alpha");
+      expect(await directory.createGroup(ADMIN_ID, createInput)).toEqual(created);
+      await expect(directory.createGroup(ADMIN_ID, {
+        name: "alpha", mutationId: crypto.randomUUID(),
+      })).rejects.toMatchObject({code: AUTH_ERROR_CODES.conflict});
+
+      const second = await directory.createGroup(ADMIN_ID, {
+        name: "Beta", mutationId: crypto.randomUUID(),
+      });
+      expect(directory.listGroups(ADMIN_ID).map(group => group.name)).toEqual(["Alpha", "Beta"]);
+
+      await directory.renameGroup(ADMIN_ID, {
+        groupId: created.group.groupId,
+        name: "  alpha  ",
+        mutationId: crypto.randomUUID(),
+      });
+      expect(directory.listGroups(ADMIN_ID)
+          .find(group => group.groupId === created.group.groupId)?.name).toBe("alpha");
+
+      const memberReceipt = await directory.replaceGroupMembers(ADMIN_ID, {
+        groupId: created.group.groupId,
+        userIds: [RESUMER_ID, MEMBER_ID, MEMBER_ID],
+        mutationId: crypto.randomUUID(),
+      });
+      expect(memberReceipt.policyVersion).toBeGreaterThan(created.receipt.policyVersion);
+      expect(directory.getGroupMembers(ADMIN_ID, created.group.groupId))
+          .toEqual([MEMBER_ID, RESUMER_ID]);
+
+      await expect(directory.replaceGroupMembers(ADMIN_ID, {
+        groupId: created.group.groupId,
+        userIds: ["50000000-0000-4000-8000-000000000005"],
+        mutationId: crypto.randomUUID(),
+      })).rejects.toMatchObject({code: AUTH_ERROR_CODES.invalidInput});
+      expect(directory.getGroupMembers(ADMIN_ID, created.group.groupId))
+          .toEqual([MEMBER_ID, RESUMER_ID]);
+
+      await directory.deleteGroup(ADMIN_ID, {
+        groupId: second.group.groupId,
+        mutationId: crypto.randomUUID(),
+      });
+      expect(directory.listGroups(ADMIN_ID).map(group => group.groupId))
+          .toEqual([created.group.groupId]);
+
+      const actor = directory.getOrCreateActor("admin-user-do");
+      const groupEvents = directory.listAdminAuditEvents(actor.tenantId, 50)
+          .filter(event => event.resourceType === "directoryGroup");
+      expect(groupEvents).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          resourceId: created.group.groupId,
+          action: "createGroup",
+          reasonCode: "DIRECTORY_GROUP_CREATED",
+          change: {field: "name", before: null, after: "Alpha"},
+        }),
+        expect.objectContaining({
+          resourceId: created.group.groupId,
+          action: "replaceGroupMembers",
+          reasonCode: "DIRECTORY_GROUP_MEMBERS_CHANGED",
+          change: {field: "members", before: "0", after: "2"},
+        }),
+        expect.objectContaining({
+          resourceId: second.group.groupId,
+          action: "deleteGroup",
+          reasonCode: "DIRECTORY_GROUP_DELETED",
+          change: {field: "name", before: "Beta", after: null},
+        }),
+      ]));
+    });
+  });
+
+  it("rechecks group-read authority and exposes only effective-active picker fields", async () => {
+    await inDirectory(`audience-targets-${crypto.randomUUID()}`, async directory => {
+      await bootstrapAndInvite(directory);
+      await directory.inviteUser(ADMIN_ID, {
+        email: "resumer@example.test",
+        displayName: "Resumer",
+        mutationId: crypto.randomUUID(),
+      });
+      const created = await directory.createGroup(ADMIN_ID, {
+        name: "Audience group", mutationId: crypto.randomUUID(),
+      });
+
+      expect(() => directory.listGroups(MEMBER_ID))
+          .toThrow(expect.objectContaining({code: AUTH_ERROR_CODES.forbidden}));
+      expect(() => directory.getGroupMembers(MEMBER_ID, created.group.groupId))
+          .toThrow(expect.objectContaining({code: AUTH_ERROR_CODES.forbidden}));
+
+      failLifecycle = true;
+      await expect(directory.setUserStatus(ADMIN_ID, {
+        userId: MEMBER_ID,
+        status: "disabled",
+        mutationId: crypto.randomUUID(),
+      })).rejects.toMatchObject({code: AUTH_ERROR_CODES.dependencyUnavailable});
+
+      expect(directory.listAudienceTargets(RESUMER_ID)).toEqual({
+        users: [
+          {userId: ADMIN_ID, displayName: "Admin"},
+          {userId: RESUMER_ID, displayName: "Resumer"},
+        ],
+        groups: [{groupId: created.group.groupId, name: "Audience group"}],
+      });
+      expect(() => directory.listAudienceTargets(MEMBER_ID))
+          .toThrow(expect.objectContaining({code: AUTH_ERROR_CODES.forbidden}));
+    });
+  });
+
+  it("resolves additive audiences from current active users and live group membership",
+      async () => {
+    await inDirectory(`audience-${crypto.randomUUID()}`, async directory => {
+      await bootstrapAndInvite(directory);
+      await directory.inviteUser(ADMIN_ID, {
+        email: "resumer@example.test",
+        displayName: "Resumer",
+        mutationId: crypto.randomUUID(),
+      });
+      const first = await directory.createGroup(ADMIN_ID, {
+        name: "First", mutationId: crypto.randomUUID(),
+      });
+      const second = await directory.createGroup(ADMIN_ID, {
+        name: "Second", mutationId: crypto.randomUUID(),
+      });
+      await directory.replaceGroupMembers(ADMIN_ID, {
+        groupId: first.group.groupId,
+        userIds: [MEMBER_ID],
+        mutationId: crypto.randomUUID(),
+      });
+      await directory.replaceGroupMembers(ADMIN_ID, {
+        groupId: second.group.groupId,
+        userIds: [MEMBER_ID, RESUMER_ID],
+        mutationId: crypto.randomUUID(),
+      });
+
+      const bothSources = [first.group.groupId, second.group.groupId]
+          .toSorted().map(groupId => `group:${groupId}`);
+      expect(directory.resolveAudience(MEMBER_ID, {
+        everyone: false,
+        userIds: [],
+        groupIds: [second.group.groupId, first.group.groupId],
+      })).toEqual({allowed: true, sources: bothSources});
+      expect(directory.resolveAudience(MEMBER_ID, {
+        everyone: true,
+        userIds: [MEMBER_ID],
+        groupIds: [],
+      })).toEqual({allowed: true, sources: ["everyone", `user:${MEMBER_ID}`]});
+
+      await directory.replaceGroupMembers(ADMIN_ID, {
+        groupId: first.group.groupId,
+        userIds: [],
+        mutationId: crypto.randomUUID(),
+      });
+      expect(directory.resolveAudience(MEMBER_ID, {
+        everyone: false,
+        userIds: [],
+        groupIds: [first.group.groupId, second.group.groupId],
+      })).toEqual({allowed: true, sources: [`group:${second.group.groupId}`]});
+
+      await directory.deleteGroup(ADMIN_ID, {
+        groupId: second.group.groupId,
+        mutationId: crypto.randomUUID(),
+      });
+      expect(directory.resolveAudience(MEMBER_ID, {
+        everyone: false,
+        userIds: [],
+        groupIds: [second.group.groupId],
+      })).toEqual({allowed: false, sources: []});
+
+      await directory.setUserStatus(ADMIN_ID, {
+        userId: MEMBER_ID,
+        status: "disabled",
+        mutationId: crypto.randomUUID(),
+      });
+      expect(directory.resolveAudience(MEMBER_ID, {
+        everyone: true,
+        userIds: [MEMBER_ID],
+        groupIds: [],
+      })).toEqual({allowed: false, sources: []});
     });
   });
 

@@ -337,7 +337,9 @@ export const AUTH_ERROR_CODES = {
   invalidSessionToken: "INVALID_SESSION_TOKEN",
   notAuthenticatedWithAccess: "NOT_AUTHENTICATED_WITH_ACCESS",
   unauthenticated: "UNAUTHENTICATED",
+  invalidInput: "INVALID_INPUT",
   forbidden: "FORBIDDEN",
+  notFound: "NOT_FOUND",
   conflict: "CONFLICT",
   dependencyUnavailable: "DEPENDENCY_UNAVAILABLE",
 } as const;
@@ -351,7 +353,9 @@ export const AUTH_ERROR_MESSAGES: Record<AuthErrorCode, string> = {
   [AUTH_ERROR_CODES.invalidSessionToken]: "invalid session token",
   [AUTH_ERROR_CODES.notAuthenticatedWithAccess]: "Not authenticated with Access.",
   [AUTH_ERROR_CODES.unauthenticated]: "Authentication is required.",
+  [AUTH_ERROR_CODES.invalidInput]: "The supplied input is invalid.",
   [AUTH_ERROR_CODES.forbidden]: "This operation is not permitted.",
+  [AUTH_ERROR_CODES.notFound]: "The requested resource was not found.",
   [AUTH_ERROR_CODES.conflict]: "The requested operation conflicts with current state.",
   [AUTH_ERROR_CODES.dependencyUnavailable]: "An authentication dependency is unavailable.",
 };
@@ -699,6 +703,12 @@ export interface AuthenticatedApi extends RpcTarget {
   amIAdmin(): Promise<boolean>;
 
   /**
+   * List the minimal active-user and live-group projection offered by audience pickers.
+   * The verified session Subject supplies authority; callers cannot select another actor.
+   */
+  listAudienceTargets(): Promise<DirectoryAudienceTargets>;
+
+  /**
    * Returns a capability for managing deployment-wide admin settings, or null when the caller is not
    * an admin. The access check happens once here, so the returned stub's methods need no per-call
    * checks. (Authentication config — sign-in providers, password login — is intentionally not
@@ -862,7 +872,7 @@ export type AdminMutationReceipt = {
 /** A bounded, non-sensitive description of one field changed by an administrative mutation. */
 export type AdminAuditChange = {
   /** Stable field name from the administrative resource schema. */
-  field: "signupsEnabled" | "role" | "status";
+  field: "signupsEnabled" | "role" | "status" | "name" | "members";
   /** Bounded value before the mutation; never contains invitation secrets or user content. */
   before: boolean | string | null;
   /** Bounded value after the mutation; never contains invitation secrets or user content. */
@@ -884,12 +894,13 @@ export type AdminAuditEvent = {
   /** Optional executor principal for future product adapters; absent for local OS administration. */
   executorPrincipalId?: string;
   /** Stable kind of resource affected by the event. */
-  resourceType: "adminConfig" | "directoryUser";
+  resourceType: "adminConfig" | "directoryUser" | "directoryGroup";
   /** Backend-owned identifier of the affected OS installation. */
   resourceId: string;
   /** Stable administrative operation name. */
   action: "setSignupsEnabled" | "bootstrapAdmin" | "inviteUser" |
-      "setUserRole" | "setUserStatus";
+      "setUserRole" | "setUserStatus" | "createGroup" | "renameGroup" |
+      "replaceGroupMembers" | "deleteGroup";
   /** Policy version before the mutation. */
   beforeVersion: number;
   /** Policy version after the mutation. */
@@ -899,7 +910,9 @@ export type AdminAuditEvent = {
   /** Stable reason describing the outcome without carrying private content. */
   reasonCode: "ADMIN_CONFIG_UPDATED" | "DIRECTORY_ADMIN_BOOTSTRAPPED" |
       "DIRECTORY_USER_INVITED" | "DIRECTORY_USER_ROLE_CHANGED" |
-      "DIRECTORY_USER_DISABLED" | "DIRECTORY_USER_REACTIVATED";
+      "DIRECTORY_USER_DISABLED" | "DIRECTORY_USER_REACTIVATED" |
+      "DIRECTORY_GROUP_CREATED" | "DIRECTORY_GROUP_RENAMED" |
+      "DIRECTORY_GROUP_MEMBERS_CHANGED" | "DIRECTORY_GROUP_DELETED";
   /** Backend-generated identifier for correlating this event with its mutation receipt. */
   correlationId: string;
   /** Caller-generated operation key used only for idempotent retry detection. */
@@ -946,6 +959,56 @@ export type DirectoryUser = {
   createdAt: string;
   /** Server update time as ISO-8601 UTC. */
   updatedAt: string;
+};
+
+/** Shared directory group record used by the administrator UI and future audience consumers. */
+export type Group = {
+  /** Server-generated immutable UUID of the group. */
+  groupId: string;
+  /** Display name; surrounding whitespace is trimmed but capitalization is preserved. */
+  name: string;
+  /** Server time at which the group was created, as an ISO-8601 UTC string. */
+  createdAt: string;
+  /** Server time of the last group metadata or membership change, as an ISO-8601 UTC string. */
+  updatedAt: string;
+};
+
+/** One authoritative group membership row in the organization directory. */
+export type GroupMember = {
+  /** Stable primary key `${groupId}:${userId}`. */
+  key: string;
+  /** UUID of the containing group. */
+  groupId: string;
+  /** Verified Supabase Subject of the admitted user. */
+  userId: string;
+};
+
+/** Additive audience selector shared by resources that need directory authorization. */
+export type Audience = {
+  /** Whether every currently active organization user is included. */
+  everyone: boolean;
+  /** Directly included verified Supabase Subjects. */
+  userIds: string[];
+  /** Included server-generated directory group UUIDs. */
+  groupIds: string[];
+};
+
+/** Minimal directory projection exposed to authenticated audience pickers. */
+export type DirectoryAudienceTargets = {
+  /** Currently effective-active users, without contact, role, status, or audit fields. */
+  users: Array<{
+    /** Verified Supabase Subject. */
+    userId: string;
+    /** Current directory display name. */
+    displayName: string;
+  }>;
+  /** Existing directory groups, without membership or audit fields. */
+  groups: Array<{
+    /** Server-generated immutable group UUID. */
+    groupId: string;
+    /** Current group display name. */
+    name: string;
+  }>;
 };
 
 /** Result of one authoritative Supabase invitation plus local admission. */
@@ -1063,6 +1126,27 @@ export interface AdminApi {
 
   /** Resume the exact original lifecycle payload after rechecking current administrator authority. */
   resumeUserStatus(input: ResumeUserStatusInput): Promise<AdminMutationReceipt>;
+
+  /** List existing groups by normalized display name and then immutable group id. */
+  listGroups(): Promise<Group[]>;
+
+  /** Return the deduplicated, sorted Subjects currently recorded in one group. */
+  getGroupMembers(groupId: string): Promise<string[]>;
+
+  /** Create a named group and return its durable mutation receipt. */
+  createGroup(input: {name: string; mutationId: string})
+      : Promise<{group: Group; receipt: AdminMutationReceipt}>;
+
+  /** Rename a group while preserving its immutable id and membership. */
+  renameGroup(input: {groupId: string; name: string; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Replace a group's complete member set atomically. */
+  replaceGroupMembers(input: {groupId: string; userIds: string[]; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Delete a group and all of its membership rows atomically. */
+  deleteGroup(input: {groupId: string; mutationId: string}): Promise<AdminMutationReceipt>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.

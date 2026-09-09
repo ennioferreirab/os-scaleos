@@ -1,4 +1,4 @@
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, Group, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -785,6 +785,36 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   async resumeUserStatus(input: PendingUserLifecycle): Promise<AdminMutationReceipt> {
     await this.#requireAdmin();
     return this.directory.resumeUserStatus(this.guard.subject, input);
+  }
+
+  async listGroups(): Promise<Group[]> {
+    this.guard.assertValid();
+    return this.directory.listGroups(this.guard.subject);
+  }
+
+  async getGroupMembers(groupId: string): Promise<string[]> {
+    this.guard.assertValid();
+    return this.directory.getGroupMembers(this.guard.subject, groupId);
+  }
+
+  async createGroup(input: {name: string; mutationId: string}) {
+    await this.#requireAdmin();
+    return this.directory.createGroup(this.guard.subject, input);
+  }
+
+  async renameGroup(input: {groupId: string; name: string; mutationId: string}) {
+    await this.#requireAdmin();
+    return this.directory.renameGroup(this.guard.subject, input);
+  }
+
+  async replaceGroupMembers(input: {groupId: string; userIds: string[]; mutationId: string}) {
+    await this.#requireAdmin();
+    return this.directory.replaceGroupMembers(this.guard.subject, input);
+  }
+
+  async deleteGroup(input: {groupId: string; mutationId: string}) {
+    await this.#requireAdmin();
+    return this.directory.deleteGroup(this.guard.subject, input);
   }
 
   async setSiteName(name: string): Promise<void> {
