@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -13,8 +13,22 @@ import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
+import { OrganizationDirectoryDurableObject } from './organization-directory.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
+
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const DEFAULT_AUDIT_EVENT_LIMIT = 50;
+const MAX_AUDIT_EVENT_LIMIT = 200;
+
+type StoredAdminMutation = {
+  idempotencyKey: string;
+  requestedSignupsEnabled: boolean;
+  event: AdminAuditEvent;
+  receipt: AdminMutationReceipt;
+  mirrored: boolean;
+  delivered: boolean;
+};
 
 function makeAdminSettingsStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
@@ -23,6 +37,12 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       // authoritative featured bit; this DO keeps the publishable deployment-wide copy.
       featuredBlueprints: collection<BlueprintPublicInfo>()({
         primaryKey: 'id',
+      }),
+
+      // Durable transaction outbox and idempotency receipts for audited admin mutations. Records
+      // are retained with the audit history so a late retry cannot duplicate an old operation.
+      adminMutations: collection<StoredAdminMutation>()({
+        primaryKey: 'idempotencyKey',
       }),
     },
     singletons: {
@@ -40,6 +60,10 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       // exactly once per blueprint: an admin who then removes a format keeps it removed, while a
       // deployment that installed before curation existed still gets promoted.
       promotedFormatBlueprints: <string[]>[],
+
+      // Monotonic version shared by audited deployment-policy mutations. Existing deployments
+      // begin at zero; every newly committed audited mutation increments it in the same transaction.
+      policyVersion: 0,
     },
   });
 }
@@ -57,6 +81,7 @@ type AdminSettingsStorage = ReturnType<typeof makeAdminSettingsStorage>;
 export class AdminSettings extends DurableObject<Cloudflare.Env> {
   private storage: AdminSettingsStorage;
   private users: DurableObjectNamespace<UserDurableObject>;
+  private organizationDirectory: DurableObjectNamespace<OrganizationDirectoryDurableObject>;
   // Every bound gatekeeper, keyed by vendor id. Deployment-global (from env bindings), so admin
   // resource listing needs no user context.
   private vendors: Map<string, Service<GatekeeperVendor>>;
@@ -72,6 +97,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
     this.storage = makeAdminSettingsStorage(ctx.storage);
     this.users = this.ctx.exports.UserDurableObject;
+    this.organizationDirectory = this.ctx.exports.OrganizationDirectoryDurableObject;
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
@@ -270,12 +296,20 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return this.#config();
   }
 
-  async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
+  async #withAdminConfigMutation<T>(operation: () => Promise<T>): Promise<T> {
     let previousMutation = this.adminConfigMutationTail;
     let release!: () => void;
     this.adminConfigMutationTail = new Promise<void>(resolve => { release = resolve; });
     await previousMutation;
     try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
+    await this.#withAdminConfigMutation(async () => {
       let current = this.#config();
       let next = mutate(current);
       this.storage.adminConfig.put(next);
@@ -285,9 +319,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
         this.storage.adminConfig.put(current);
         throw error;
       }
-    } finally {
-      release();
-    }
+    });
   }
 
   /**
@@ -296,6 +328,126 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
    */
   updateAdminConfig(patch: Partial<AdminConfig>): Promise<void> {
     return this.#mutateAdminConfig(config => ({ ...config, ...patch }));
+  }
+
+  async #deliverAdminMutation(record: StoredAdminMutation): Promise<StoredAdminMutation> {
+    let current = record;
+    if (!current.mirrored) {
+      await this.env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(this.#config()));
+      current = {...current, mirrored: true};
+      this.storage.adminMutations.put(current);
+    }
+    if (!current.delivered) {
+      await this.organizationDirectory.getByName("").recordAdminAuditEvent(current.event);
+      current = {...current, delivered: true};
+      this.storage.adminMutations.put(current);
+    }
+    return current;
+  }
+
+  async #flushAdminAuditOutbox(): Promise<void> {
+    // Snapshot before delivery because delivery updates the same collection and therefore cannot
+    // safely run while its list cursor is open. Filtering the primary collection also keeps this
+    // compatible with outbox records written before T02 was complete, without an index migration.
+    let pending = [...this.storage.adminMutations.list()].filter(record => !record.delivered);
+    for (let record of pending) {
+      await this.#deliverAdminMutation(record);
+    }
+  }
+
+  /**
+   * Change signup availability and record its audit event. The configuration, policy version, and
+   * outbox event are committed in one SQLite transaction; the call returns only after the KV mirror
+   * and directory copy are durable. A failure leaves the outbox retryable and never claims success.
+   */
+  async setSignupsEnabledAudited(enabled: boolean, idempotencyKey: string, userDoId: string)
+      : Promise<AdminMutationReceipt> {
+    if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+      throw new Error("Invalid administrative idempotency key.");
+    }
+    if (!userDoId) throw new Error("An authenticated OS account id is required.");
+
+    let actor = await this.organizationDirectory.getByName("").getOrCreateActor(userDoId);
+    return this.#withAdminConfigMutation(async () => {
+      await this.#flushAdminAuditOutbox();
+
+      let existing = this.storage.adminMutations.get(idempotencyKey);
+      if (existing) {
+        if (existing.requestedSignupsEnabled !== enabled) {
+          throw new Error("Idempotency key was already used for another administrative mutation.");
+        }
+        return (await this.#deliverAdminMutation(existing)).receipt;
+      }
+
+      let current = this.#config();
+      let occurredAt = new Date().toISOString();
+      let beforeVersion = this.storage.policyVersion.get();
+      let afterVersion = beforeVersion + 1;
+      let mutationId = crypto.randomUUID();
+      let event: AdminAuditEvent = {
+        eventId: crypto.randomUUID(),
+        occurredAt,
+        tenantId: actor.tenantId,
+        actorUserId: actor.userId,
+        resourceType: "adminConfig",
+        resourceId: actor.osInstallationId,
+        action: "setSignupsEnabled",
+        beforeVersion,
+        afterVersion,
+        result: "succeeded",
+        reasonCode: "ADMIN_CONFIG_UPDATED",
+        correlationId: mutationId,
+        idempotencyKey,
+        change: {
+          field: "signupsEnabled",
+          before: current.signupsEnabled,
+          after: enabled,
+        },
+      };
+      let receipt: AdminMutationReceipt = {
+        mutationId,
+        policyVersion: afterVersion,
+        confirmedAt: occurredAt,
+      };
+      let record: StoredAdminMutation = {
+        idempotencyKey,
+        requestedSignupsEnabled: enabled,
+        event,
+        receipt,
+        mirrored: false,
+        delivered: false,
+      };
+      let next = {...current, signupsEnabled: enabled};
+
+      // This is the non-negotiable local transaction boundary: the mutation cannot exist in the
+      // authoritative DO without its durable outbox event and idempotency receipt.
+      this.storage.transaction(() => {
+        this.storage.adminConfig.put(next);
+        this.storage.policyVersion.put(afterVersion);
+        this.storage.adminMutations.put(record);
+      });
+
+      return (await this.#deliverAdminMutation(record)).receipt;
+    });
+  }
+
+  /**
+   * Resolve the requesting backend account to this deployment's tenant, flush any pending durable
+   * outbox records, and return its newest local administrative audit events.
+   */
+  async listAdminAuditEvents(userDoId: string, limit = DEFAULT_AUDIT_EVENT_LIMIT)
+      : Promise<AdminAuditEvent[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_EVENT_LIMIT) {
+      throw new Error(`Audit event limit must be between 1 and ${MAX_AUDIT_EVENT_LIMIT}.`);
+    }
+    if (!userDoId) throw new Error("An authenticated OS account id is required.");
+
+    let actor = await this.organizationDirectory.getByName("").getOrCreateActor(userDoId);
+    return this.#withAdminConfigMutation(async () => {
+      await this.#flushAdminAuditOutbox();
+      return this.organizationDirectory.getByName("")
+          .listAdminAuditEvents(actor.tenantId, limit);
+    });
   }
 
   /**
@@ -566,7 +718,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
    * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
    * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string,
+      private adminUserDoId: string) {
     super();
   }
 
@@ -574,8 +727,19 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     return this.admin.getSettings(this.adminUserId);
   }
 
-  async setSignupsEnabled(enabled: boolean): Promise<void> {
-    await this.admin.updateAdminConfig({ signupsEnabled: enabled });
+  setSignupsEnabled(enabled: boolean, idempotencyKey: string): Promise<AdminMutationReceipt> {
+    if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+      throw new Error("Invalid administrative idempotency key.");
+    }
+    return this.admin.setSignupsEnabledAudited(enabled, idempotencyKey, this.adminUserDoId);
+  }
+
+  listAuditEvents(limit?: number): Promise<AdminAuditEvent[]> {
+    if (limit !== undefined &&
+        (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_EVENT_LIMIT)) {
+      throw new Error(`Audit event limit must be between 1 and ${MAX_AUDIT_EVENT_LIMIT}.`);
+    }
+    return this.admin.listAdminAuditEvents(this.adminUserDoId, limit);
   }
 
   async setSiteName(name: string): Promise<void> {
