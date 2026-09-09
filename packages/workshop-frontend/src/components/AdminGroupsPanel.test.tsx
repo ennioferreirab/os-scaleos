@@ -3,7 +3,7 @@
 
 import { act, type ComponentProps, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, type Mock, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import type { AdminApi, Group } from '@gadgets/workshop-shared/api'
 
@@ -18,7 +18,7 @@ vi.mock('@cloudflare/kumo', () => ({
     <label>{label}<input aria-label={String(label)} {...props} /></label>
   ),
   // Kumo returns a new manager and wrapped methods on every render.
-  useKumoToastManager: () => ({add: vi.fn()}),
+  useKumoToastManager: () => ({add: vi.fn<(toast: unknown) => void>()}),
 }))
 
 vi.mock('@phosphor-icons/react', () => ({Users: () => <span />}))
@@ -29,7 +29,9 @@ vi.mock('../i18n', () => {
 
 import AdminGroupsPanel from './AdminGroupsPanel'
 
-function disposableArray<T>(values: T[], dispose: () => void): T[] & Disposable {
+type Disposer = () => void
+
+function disposableArray<T>(values: T[], dispose: Disposer): T[] & Disposable {
   return Object.assign([...values], {[Symbol.dispose]: dispose})
 }
 
@@ -64,11 +66,17 @@ describe('AdminGroupsPanel', () => {
       createdAt: '2026-09-08T12:00:00.000Z',
       updatedAt: '2026-09-08T12:00:00.000Z',
     }
-    const listGroups = vi.fn(async () => disposableArray([group], vi.fn()))
+    const listGroups = vi.fn<AdminApi['listGroups']>(
+      async () => disposableArray([group], vi.fn<Disposer>()),
+    )
     const admin = {
       listGroups,
-      listDirectoryUsers: vi.fn(async () => disposableArray([], vi.fn())),
-      getGroupMembers: vi.fn(async () => disposableArray([], vi.fn())),
+      listDirectoryUsers: vi.fn<AdminApi['listDirectoryUsers']>(
+        async () => disposableArray([], vi.fn<Disposer>()),
+      ),
+      getGroupMembers: vi.fn<AdminApi['getGroupMembers']>(
+        async () => disposableArray([], vi.fn<Disposer>()),
+      ),
     } as unknown as RpcStub<AdminApi>
 
     container = document.createElement('div')
@@ -86,10 +94,10 @@ describe('AdminGroupsPanel', () => {
 
   it('reuses a create mutation id after an uncertain response and disposes every RPC result',
       async () => {
-    const listGroupsDisposals: Array<ReturnType<typeof vi.fn>> = []
-    const listUsersDisposals: Array<ReturnType<typeof vi.fn>> = []
-    const memberDisposal = vi.fn()
-    const createDisposal = vi.fn()
+    const listGroupsDisposals: Array<Mock<Disposer>> = []
+    const listUsersDisposals: Array<Mock<Disposer>> = []
+    const memberDisposal = vi.fn<Disposer>()
+    const createDisposal = vi.fn<Disposer>()
     const createdGroup: Group = {
       groupId: '50000000-0000-4000-8000-000000000005',
       name: 'Retry group',
@@ -97,7 +105,7 @@ describe('AdminGroupsPanel', () => {
       updatedAt: '2026-09-08T12:00:00.000Z',
     }
     let groupLoad = 0
-    const createGroup = vi.fn(async (input: {name: string; mutationId: string}) => {
+    const createGroup = vi.fn<AdminApi['createGroup']>(async (input) => {
       if (createGroup.mock.calls.length === 1) throw new Error('response lost')
       return Object.assign({
         group: createdGroup,
@@ -109,21 +117,23 @@ describe('AdminGroupsPanel', () => {
       }, {[Symbol.dispose]: createDisposal})
     })
     const admin = {
-      listGroups: vi.fn(async () => {
-        const dispose = vi.fn()
+      listGroups: vi.fn<AdminApi['listGroups']>(async () => {
+        const dispose = vi.fn<Disposer>()
         listGroupsDisposals.push(dispose)
         return disposableArray(groupLoad++ === 0 ? [] : [createdGroup], dispose)
       }),
-      listDirectoryUsers: vi.fn(async () => {
-        const dispose = vi.fn()
+      listDirectoryUsers: vi.fn<AdminApi['listDirectoryUsers']>(async () => {
+        const dispose = vi.fn<Disposer>()
         listUsersDisposals.push(dispose)
         return disposableArray([], dispose)
       }),
-      getGroupMembers: vi.fn(async () => disposableArray([], memberDisposal)),
+      getGroupMembers: vi.fn<AdminApi['getGroupMembers']>(
+        async () => disposableArray([], memberDisposal),
+      ),
       createGroup,
-      renameGroup: vi.fn(),
-      replaceGroupMembers: vi.fn(),
-      deleteGroup: vi.fn(),
+      renameGroup: vi.fn<AdminApi['renameGroup']>(),
+      replaceGroupMembers: vi.fn<AdminApi['replaceGroupMembers']>(),
+      deleteGroup: vi.fn<AdminApi['deleteGroup']>(),
     } as unknown as RpcStub<AdminApi>
 
     container = document.createElement('div')

@@ -968,7 +968,8 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
         }
       }
       const nextSet = new Set(userIds);
-      for (const member of [...this.storage.groupMembers.byGroup.get(groupId)]) {
+      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
+      for (const member of members) {
         if (!nextSet.has(member.userId)) this.storage.groupMembers.delete(member.key);
       }
       const now = new Date().toISOString();
@@ -1013,7 +1014,8 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
         return completed.receipt;
       }
       const group = this.#requireGroup(groupId);
-      for (const member of [...this.storage.groupMembers.byGroup.get(groupId)]) {
+      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
+      for (const member of members) {
         this.storage.groupMembers.delete(member.key);
       }
       this.storage.groups.delete(groupId);
