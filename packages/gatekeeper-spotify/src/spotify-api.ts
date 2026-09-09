@@ -243,9 +243,19 @@ type RequestOptions = {
 
 export class SpotifyApi {
   #getToken: () => Promise<string>;
+  #beforeRequest?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, beforeRequest?: () => Promise<void>) {
     this.#getToken = getToken;
+    this.#beforeRequest = beforeRequest;
+  }
+
+  withBeforeRequest(beforeRequest: () => Promise<void>): SpotifyApi {
+    const existing = this.#beforeRequest;
+    return new SpotifyApi(this.#getToken, async () => {
+      await existing?.();
+      await beforeRequest();
+    });
   }
 
   async #request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
@@ -254,6 +264,7 @@ export class SpotifyApi {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
 
+    await this.#beforeRequest?.();
     const headers = new Headers({ Authorization: `Bearer ${await this.#getToken()}` });
     let body: BodyInit | undefined;
     if (options.body !== undefined) {
@@ -261,6 +272,7 @@ export class SpotifyApi {
       body = JSON.stringify(options.body);
     }
 
+    await this.#beforeRequest?.();
     const response = await fetch(url.toString(), {
       method,
       headers,
@@ -303,11 +315,23 @@ export class SpotifyApi {
    * each item individually. Unknown/unavailable ids resolve to null rather than failing the batch.
    */
   async getTracks(trackIds: string[]): Promise<(SpotifyTrackResponse | null)[]> {
-    return Promise.all(trackIds.map(id => this.getTrack(id).then(track => track, () => null)));
+    return Promise.all(trackIds.map(id => this.getTrack(id).then(
+      track => track,
+      error => {
+        if (!(error instanceof SpotifyApiError) || error.isAuthError) throw error;
+        return null;
+      },
+    )));
   }
 
   async getAlbums(albumIds: string[]): Promise<(SpotifyAlbumResponse | null)[]> {
-    return Promise.all(albumIds.map(id => this.getAlbum(id).then(album => album, () => null)));
+    return Promise.all(albumIds.map(id => this.getAlbum(id).then(
+      album => album,
+      error => {
+        if (!(error instanceof SpotifyApiError) || error.isAuthError) throw error;
+        return null;
+      },
+    )));
   }
 
   search(query: string, types: string[], limit: number): Promise<{

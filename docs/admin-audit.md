@@ -50,37 +50,36 @@ member later.
 Group authorization is resolved inside `OrganizationDirectoryDurableObject` at the point of use.
 `resolveAudience()` denies missing, pending, and disabled Subjects, then returns additive sources in
 the stable order `everyone`, `user:<subject>`, and sorted `group:<groupId>` entries. Deleted groups
-are not traversed, so stale audience references do not grant access. This helper remains an internal
-capability for later resource owners; there is no public preview endpoint or test backdoor.
+are not traversed, so stale audience references do not grant access. `resolveAudience()` remains an
+internal capability; the admin-only app-policy preview exposes only effective recipients and sources.
 
-## Registered app policies (T05-A)
+## Registered app policies
 
-`AdminApi.listAppPolicies()` and `setAppPolicy()` use the active-admin guard and the same
-directory-owned receipt, monotonic policy version, idempotency, and atomic audit transaction as the
-other directory mutations. Each policy is keyed by an exact registered vendor ID. The mutation
-normalizes and validates its audience before committing; an absent row means `disabled` with no
-audience, and `enabled` is rejected for a vendor without `autoProvisionsAccount`.
+`AdminApi.listAppPolicies()`, `previewAppPolicy()`, and `setAppPolicy()` recheck both the retained
+human-session guard and current active-admin role. Each policy is keyed by an exact registered
+vendor ID. Mutations canonicalize and validate the complete audience before committing; an absent
+row means `disabled` with no audience, and `enabled` is rejected for a vendor without
+`autoProvisionsAccount`. Preview resolves effective-active recipients and every current additive
+source without changing policy state.
 
-The audit event uses `resourceType="directoryApp"`, `action="setAppPolicy"`, and
+`setAppPolicy()` uses the directory-owned receipt, monotonic policy version, idempotency, and atomic
+audit transaction. The event uses `resourceType="directoryApp"`, `action="setAppPolicy"`, and
 `reasonCode="DIRECTORY_APP_POLICY_CHANGED"`. Its `change.field` is `appPolicy`; `before` and `after`
-contain only a stable bounded summary of mode, the `everyone` bit, and user/group counts. Audience
-IDs are never written to the event, and replay with the same actor, operation, and mutation ID
-returns the original policy and receipt without a second event.
+contain only a bounded summary of mode, the `everyone` bit, and user/group counts. Audience IDs are
+never written to the event. Replaying the same actor, operation, mutation ID, and normalized payload
+returns the original policy and receipt without a second event; changing the payload conflicts.
 
-The T05-A consumer is deliberately limited to the central-auth management-app catalog and direct
-app opening. It does not add policy UI, previews, hooks, provisioning changes, or another audit
-surface; T05 is not accepted by this increment.
-
-T04 is implemented but not accepted. Focused automated checks and review are supporting evidence
-only; the required real containerized positive and denial scenarios are still pending. No UI
-acceptance, session reset, or runtime restart is claimed here.
+The directory decision is consumed at each operational app boundary, including retained UI,
+workspace, binding, queue, and hook capabilities. These checks do not create audit events: the
+administrative policy mutation is the auditable state change, while allow/deny resolution is a live
+authorization read.
 
 ## Stored data and retention
 
 Each event contains stable event, mutation-correlation, and idempotency identifiers; server time;
 tenant and actor ids; resource and action; before/after resource-policy versions; result and reason;
 and a bounded transition. T03 adds directory-local events for first-admin bootstrap, user invitation,
-role changes, and lifecycle changes; T04 adds directory-group events, and T05-A adds app-policy
+role changes, and lifecycle changes; T04 adds directory-group events, and T05 adds app-policy
 events.
 Group membership audit changes record only before/after counts, never the member ID list. The
 `AdminSettings` version and directory authorization version are intentionally separate clocks owned

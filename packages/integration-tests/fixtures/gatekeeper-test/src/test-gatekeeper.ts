@@ -23,9 +23,10 @@
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
-  AccountDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperConnectCallback,
-  GatekeeperUser, GatekeeperUserVerifier, ResourceDescription, ResourceConfiguratorFrame,
-  SupportedResource, VendorDescription,
+  AccountDescription, ActionKind, AppUiContext, ApprovalQueue, Gatekeeper,
+  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVerifierContext,
+  ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription,
+  VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 // Nothing but classes and the default handler may be exported from a Worker entry module: workerd
@@ -158,6 +159,7 @@ function control(exports: Cloudflare.Exports): DurableObjectStub<TestControl> {
 
 type AccountProps = { label: string };
 type BindingProps = AccountProps & { resourceUrl: string; ambient?: true };
+type VerifierProps = AccountProps & {authority: Fetcher<VerifierAppAuthority>};
 
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
@@ -248,8 +250,10 @@ export class TestAccount
 
   /** The capability the overseer hands to addObserver() to say "this is the user asking". */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.TestVerifier({ props: this.ctx.props });
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.TestVerifier({
+      props: {...this.ctx.props, authority: context.authority},
+    });
   }
 
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{ url?: string }> {
@@ -262,7 +266,8 @@ export class TestAccount
 
   async revoke(): Promise<void> {}
 
-  startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  startResourceConfigurator(
+      _resourceUrlPattern: string, _context: AppUiContext): Promise<ResourceConfiguratorFrame> {
     throw new Error("The test gatekeeper has no resource configurator; bind a URL directly.");
   }
 
@@ -284,8 +289,9 @@ export interface TestVerifierApi extends GatekeeperUserVerifier {
 
 @validateRpc()
 export class TestVerifier
-    extends WorkerEntrypoint<Cloudflare.Env, AccountProps> implements TestVerifierApi {
+    extends WorkerEntrypoint<Cloudflare.Env, VerifierProps> implements TestVerifierApi {
   async identify(): Promise<string> {
+    await this.ctx.props.authority.requireAppAccess();
     return this.ctx.props.label;
   }
 }
@@ -311,6 +317,7 @@ class TestSessionTarget extends RpcTarget implements TestSession {
   }
 
   async readValue(): Promise<number> {
+    await this.approvalQueue.assertAppAccess();
     await this.approvalQueue.authorizeObservation({
       title: "Read the test value",
       description: "Read the deterministic value exposed by the integration-test gatekeeper.",
@@ -319,6 +326,7 @@ class TestSessionTarget extends RpcTarget implements TestSession {
   }
 
   async writeValue(value: number): Promise<number> {
+    await this.approvalQueue.assertAppAccess();
     const id = await this.state.stageAction(this.label, value);
     try {
       await this.approvalQueue.submitAction(id, {

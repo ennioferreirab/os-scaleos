@@ -14,6 +14,7 @@ type SlashCommandSource = {
   gatekeeperId: number;
   providerLabel: string;
   gatekeeper: Fetcher<Gatekeeper<any>>;
+  assertAccess?: () => Promise<void>;
 };
 
 /** Collect the complete slash-command catalog from the attached Gatekeepers that advertise one. */
@@ -21,9 +22,12 @@ export async function collectSlashCommands(
     sources: SlashCommandSource[]): Promise<SlashCommandChoice[]> {
   let catalogs = await Promise.all(sources.map(async source => {
     try {
+      await source.assertAccess?.();
       using provider = await (source.gatekeeper as SlashCommandGatekeeper)
           .getSlashCommandProvider();
+      await source.assertAccess?.();
       let commands = await provider.list();
+      await source.assertAccess?.();
       return commands.map(command => ({
         selection: {gatekeeperId: source.gatekeeperId, commandId: command.id},
         name: command.name,
@@ -47,7 +51,12 @@ export async function collectSlashCommands(
 /** Invoke one command on its selected attached Gatekeeper. */
 export async function invokeSlashCommand(
     gatekeeper: Fetcher<Gatekeeper<any>>, request: SlashCommandRequest,
-    authorizer: RpcStub<ObservationAuthorizer>): Promise<SlashCommandResult> {
+    authorizer: RpcStub<ObservationAuthorizer>,
+    assertAccess?: () => Promise<void>): Promise<SlashCommandResult> {
+  await assertAccess?.();
   using provider = await (gatekeeper as SlashCommandGatekeeper).getSlashCommandProvider();
-  return await provider.invoke(request.id.commandId, request.args, authorizer);
+  await assertAccess?.();
+  let result = await provider.invoke(request.id.commandId, request.args, authorizer);
+  await assertAccess?.();
+  return result;
 }

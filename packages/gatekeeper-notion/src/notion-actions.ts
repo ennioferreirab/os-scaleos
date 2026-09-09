@@ -114,6 +114,9 @@ export class NotionStore {
     this.#kv = kv;
     this.#api = api;
   }
+  withBeforeRequest(beforeRequest: () => Promise<void>): NotionStore {
+    return new NotionStore(this.#kv, this.#api.withBeforeRequest(beforeRequest));
+  }
 
   get api(): NotionApi {
     return this.#api;

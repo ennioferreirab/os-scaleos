@@ -224,6 +224,7 @@ export abstract class McpFacetBase<
 
   /** Starts a session with generated per-tool methods when the catalog is available. */
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session> {
+    await approvalQueue.assertAppAccess();
     let SessionClass = this.sessionClass;
     try {
       SessionClass = installToolMethods(SessionClass, await this.tools());

@@ -21,6 +21,8 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 
   async authorizeObservation(_description: ObservationDescription): Promise<void> {}
 
+  async assertAppAccess(): Promise<void> {}
+
   async submitAction(actionId: number, _description: ActionDescription): Promise<void> {
     this.actionId = actionId;
   }

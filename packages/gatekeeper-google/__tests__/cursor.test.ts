@@ -187,8 +187,8 @@ describe("authorization", () => {
     expect(authorized).toEqual([["a"]]);
   });
 
-  // A denied read must not consume the page: the caller may retry after getting approval.
-  it("leaves the position untouched when disclosure is denied", async () => {
+  // A denied read must not consume or refetch the provider page: retry re-authorizes the same data.
+  it("retains the position and fetched page when disclosure is denied", async () => {
     let denied = true;
     let { pager, requested } = makePager([["a"], ["b"]], {
       authorize: async () => {
@@ -199,7 +199,7 @@ describe("authorization", () => {
     await expect(pager.next()).rejects.toThrow("denied");
     denied = false;
     expect(await pager.next()).toEqual(["a"]);
-    expect(requested).toEqual([undefined, undefined]);
+    expect(requested).toEqual([undefined]);
   });
 
   it("does not mark the cursor exhausted when the final page is denied", async () => {
@@ -216,7 +216,7 @@ describe("authorization", () => {
     expect(await pager.next()).toBeNull();
   });
 
-  it("disposes a denied page and rebuilds it for a successful retry", async () => {
+  it("disposes denied entries and rebuilds them from the retained provider page", async () => {
     let server = pageServer([["a", "b"]]);
     let built: DisposableSentinel[][] = [];
     let authorized: DisposableSentinel[][] = [];
@@ -249,7 +249,7 @@ describe("authorization", () => {
     expect(returned?.every(entry => !entry.disposed)).toBe(true);
     expect(built).toHaveLength(2);
     expect(authorized).toEqual(built);
-    expect(server.requested).toEqual([undefined, undefined]);
+    expect(server.requested).toEqual([undefined]);
   });
 
   it("does not mask an authorization error when disposal fails", async () => {
@@ -281,7 +281,7 @@ describe("terminal empty authorization", () => {
     await expect(pager.next()).resolves.toBeNull();
     await expect(pager.next()).resolves.toBeNull();
     expect(authorized).toEqual([[], []]);
-    expect(requested).toEqual([undefined, "1", undefined, "1"]);
+    expect(requested).toEqual([undefined, "1"]);
   });
 });
 

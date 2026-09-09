@@ -89,14 +89,21 @@ const MAX_ACCOUNT_PAGES = 10;
  * query to the endpoint's `name` parameter: `name` is undocumented as to whether it matches exactly
  * or by substring, and there is no `name.contains` variant, so pushing an exact match server-side
  * would silently break the substring search the configurator offers today.
+ *
+ * `beforeRequest`, when provided, is awaited before every page request. Callers should still
+ * preflight before entering this operation so denial is immediate even before token acquisition.
  */
-export async function listAccounts(token: string): Promise<CloudflareAccount[]> {
+export async function listAccounts(
+  token: string,
+  beforeRequest?: () => Promise<void>,
+): Promise<CloudflareAccount[]> {
   const accounts: CloudflareAccount[] = [];
   for (let page = 1; page <= MAX_ACCOUNT_PAGES; page++) {
     const query = new URLSearchParams({
       page: String(page),
       per_page: String(ACCOUNTS_PER_PAGE),
     });
+    await beforeRequest?.();
     const envelope = await cfRequest<Array<{ id: string; name: string }>>(
       token, `/accounts?${query}`,
     );

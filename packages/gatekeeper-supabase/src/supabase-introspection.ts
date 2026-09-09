@@ -7,6 +7,8 @@ import type {
   SupabaseTableDetails,
 } from "./types";
 
+type AssertAppAccess = () => Promise<void>;
+
 /**
  * Schema introspection implemented as read-only catalog queries against the project database.
  *
@@ -57,8 +59,12 @@ function stringArray(value: unknown): string[] {
   }
   return [];
 }
-
-export async function listSchemas(api: SupabaseApi, ref: string): Promise<string[]> {
+export async function listSchemas(
+  api: SupabaseApi,
+  ref: string,
+  assertAppAccess: AssertAppAccess = async () => {},
+): Promise<string[]> {
+  await assertAppAccess();
   const rows = await api.runReadOnlyQuery(
     ref,
     `select n.nspname as schema
@@ -82,15 +88,16 @@ function rowToTable(row: SqlRow): SupabaseTable {
     comment: optionalStr(row.comment),
   };
 }
-
 export async function listTables(
   api: SupabaseApi,
   ref: string,
   options?: SupabaseListTablesOptions,
+  assertAppAccess: AssertAppAccess = async () => {},
 ): Promise<SupabaseTable[]> {
   const schema = options?.schema ?? "public";
   const includeViews = options?.includeViews ?? true;
   // relkind: r = table, p = partitioned table, v = view, m = materialized view. Inlined as a
+  await assertAppAccess();
   // fixed, code-controlled literal so we don't depend on array-parameter binding.
   const relkindsSql = (includeViews ? ["r", "p", "v", "m"] : ["r", "p"]).map(k => `'${k}'`).join(", ");
   const rows = await api.runReadOnlyQuery(
@@ -110,13 +117,14 @@ export async function listTables(
   );
   return rows.map(rowToTable);
 }
-
 async function getTableSummary(
   api: SupabaseApi,
   ref: string,
   schema: string,
   name: string,
+  assertAppAccess: AssertAppAccess,
 ): Promise<SupabaseTable> {
+  await assertAppAccess();
   const rows = await api.runReadOnlyQuery(
     ref,
     `select n.nspname as schema,
@@ -136,13 +144,14 @@ async function getTableSummary(
   }
   return rowToTable(rows[0]);
 }
-
 async function getColumns(
   api: SupabaseApi,
   ref: string,
   schema: string,
   name: string,
+  assertAppAccess: AssertAppAccess,
 ): Promise<SupabaseColumn[]> {
+  await assertAppAccess();
   const rows = await api.runReadOnlyQuery(
     ref,
     `select a.attname as name,
@@ -168,13 +177,14 @@ async function getColumns(
     comment: optionalStr(row.comment),
   }));
 }
-
 async function getPrimaryKey(
   api: SupabaseApi,
   ref: string,
   schema: string,
   name: string,
+  assertAppAccess: AssertAppAccess,
 ): Promise<string[]> {
+  await assertAppAccess();
   const rows = await api.runReadOnlyQuery(
     ref,
     `select a.attname as name
@@ -189,13 +199,14 @@ async function getPrimaryKey(
   );
   return rows.map(row => str(row.name));
 }
-
 async function getForeignKeys(
   api: SupabaseApi,
   ref: string,
   schema: string,
   name: string,
+  assertAppAccess: AssertAppAccess,
 ): Promise<SupabaseForeignKey[]> {
+  await assertAppAccess();
   const rows = await api.runReadOnlyQuery(
     ref,
     `select (select to_json(array_agg(att.attname order by u.ord))
@@ -224,18 +235,22 @@ async function getForeignKeys(
     referencedColumns: stringArray(row.ref_columns),
   }));
 }
-
 export async function describeTable(
   api: SupabaseApi,
   ref: string,
   schema: string,
   name: string,
+  assertAppAccess: AssertAppAccess = async () => {},
 ): Promise<SupabaseTableDetails> {
-  const summary = await getTableSummary(api, ref, schema, name);
+  const summary = await getTableSummary(api, ref, schema, name, assertAppAccess);
   const [columns, primaryKey, foreignKeys] = await Promise.all([
-    getColumns(api, ref, schema, name),
-    summary.kind === "table" ? getPrimaryKey(api, ref, schema, name) : Promise.resolve<string[]>([]),
-    summary.kind === "table" ? getForeignKeys(api, ref, schema, name) : Promise.resolve<SupabaseForeignKey[]>([]),
+    getColumns(api, ref, schema, name, assertAppAccess),
+    summary.kind === "table"
+      ? getPrimaryKey(api, ref, schema, name, assertAppAccess)
+      : Promise.resolve<string[]>([]),
+    summary.kind === "table"
+      ? getForeignKeys(api, ref, schema, name, assertAppAccess)
+      : Promise.resolve<SupabaseForeignKey[]>([]),
   ]);
   return { ...summary, columns, primaryKey, foreignKeys };
 }

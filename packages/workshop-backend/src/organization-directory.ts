@@ -2,7 +2,7 @@ import {
   AUTH_ERROR_CODES,
   AdminAuditEvent,
   AdminMutationReceipt,
-  AppAccessResult,
+  AppPolicyAudiencePreview,
   AppPolicy,
   AppPolicyMode,
   DirectoryInviteResult,
@@ -12,6 +12,7 @@ import {
   createAuthError,
   isAppPolicyMode,
   type Audience,
+  type AppAccessResult,
   type DirectoryAudienceTargets,
   type Group,
   type GroupMember,
@@ -980,6 +981,39 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
           undefined, "directoryApp"));
       return {policy, receipt};
     });
+  }
+
+  /** Preview a proposed app policy from live directory state without changing policy storage. */
+  async previewAppPolicy(actorId: string, input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+  }): Promise<AppPolicyAudiencePreview> {
+    actorId = requireSubject(actorId, "actorId");
+    this.#identity();
+    this.#requireAdmin(actorId);
+    const vendorId = this.#requireRegisteredVendor(input.vendorId);
+    if (!isAppPolicyMode(input.mode)) throw invalidInput("Invalid app policy mode.");
+    const audience = normalizeAudience(input.audience);
+    validateAudience(audience, this.storage);
+    if (input.mode === "enabled" && !(await this.#isAutoProvisioningVendor(vendorId))) {
+      throw invalidInput("Only auto-provisioning gatekeepers may use enabled mode.");
+    }
+    if (input.mode === "disabled") return {users: []};
+
+    const users = [...this.storage.directoryUsers.list()]
+        .filter(user => this.#effectiveStatus(user) === "active")
+        .map(user => {
+          const access = this.resolveAudience(user.userId, audience);
+          return access.allowed
+            ? {userId: user.userId, displayName: user.displayName, sources: access.sources}
+            : null;
+        })
+        .filter((user): user is NonNullable<typeof user> => user !== null)
+        .toSorted((left, right) =>
+          left.displayName.localeCompare(right.displayName, "pt-BR") ||
+          left.userId.localeCompare(right.userId, "pt-BR"));
+    return {users};
   }
 
   /** List groups after rechecking the requesting administrator in this directory invocation. */

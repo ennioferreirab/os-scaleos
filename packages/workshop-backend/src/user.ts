@@ -1,7 +1,7 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, type DirectoryUser } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
-import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, AppAccessResult, createAuthError, type DirectoryUser } from '@gadgets/workshop-shared/api';
+import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperVerifierContext, VerifierAppAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import { canOptIntoAccount, shouldAutoProvisionAccount } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
@@ -12,6 +12,8 @@ import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { hasSupabaseAuthSettings } from "./auth/supabase.js";
+import type { OrganizationDirectoryDurableObject } from "./organization-directory.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -32,14 +34,20 @@ type ConnectedAccountRecord = {
   autoProvisioned?: boolean;
 };
 
+type ConnectedAccountInput = Omit<ConnectedAccountRecord, "description"> & {
+  description?: AccountDescription;
+};
+
 /**
- * Metadata about an auto-provisioned account that provides an agent singleton and/or a management UI.
+ * Metadata about an account that provides an agent singleton and/or a management UI.
  * Returned to the overseer (ambient capsules / catalog) and the management-UI listing.
  */
 export type ProvidedAccountInfo = {
   accountId: number;
   vendorId: string;
   description: AccountDescription;   // carries `singleton` / `providesUi` declarations
+  /** Subject of the User DO that owns this account, supplied by the kernel rather than a caller. */
+  ownerSubject: string;
 };
 
 // The singleton/UI methods (createAccount on GatekeeperVendor; getSingletonGatekeeperClass /
@@ -279,11 +287,33 @@ async function checkGatekeeperVendorFilter(
   }
 }
 
+type GatekeeperVerifierAuthorityProps = {
+  userObjectId: string;
+  accountId: number;
+  vendorId: string;
+};
+
+/**
+ * Persistent, attenuated callback used by vendor verifier entrypoints. Unlike human UI authority,
+ * it survives the browser session and re-enters the owning User DO for every observer access check.
+ */
+export class GatekeeperVerifierAuthority
+    extends WorkerEntrypoint<Cloudflare.Env, GatekeeperVerifierAuthorityProps>
+    implements VerifierAppAuthority {
+  requireAppAccess(): Promise<void> {
+    let users = this.ctx.exports.UserDurableObject;
+    return users.get(users.idFromString(this.ctx.props.userObjectId))
+        .requireConnectedAccountAppAccess(this.ctx.props.accountId, this.ctx.props.vendorId);
+  }
+}
+
 /** Durable Object that stores information about a user. */
 export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  private organizationDirectory: DurableObjectNamespace<OrganizationDirectoryDurableObject>;
+  private centralAuthMode: boolean;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -298,8 +328,28 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     this.storage = makeUserStorage(ctx.storage);
     this.adminSettings = this.ctx.exports.AdminSettings;
+    this.organizationDirectory = this.ctx.exports.OrganizationDirectoryDurableObject;
+    this.centralAuthMode = hasSupabaseAuthSettings(env);
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  private resolveAppAccess(vendorId: string): Promise<AppAccessResult> {
+    if (!this.centralAuthMode) {
+      return Promise.resolve({allowed: true, mode: "optional", sources: ["legacy"]});
+    }
+    return this.organizationDirectory.getByName("").resolveAppAccess(
+        this.storage.profile.get().id, vendorId);
+  }
+
+  private async requireAppAccess(
+      vendorId: string, requiredMode?: AppAccessResult["mode"]): Promise<AppAccessResult> {
+    if (!this.vendors.has(vendorId)) throw new Error("No such service: " + vendorId);
+    const access = await this.resolveAppAccess(vendorId);
+    if (!access.allowed || (requiredMode !== undefined && access.mode !== requiredMode)) {
+      throw new Error(`The "${vendorId}" app is not available to this user.`);
+    }
+    return access;
   }
 
   async authenticate(token: string): Promise<void> {
@@ -624,6 +674,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       let rec: ConnectedAccountRecord | undefined;
       try { rec = this.storage.connectedAccounts.get(id); } catch { continue; }
       if (rec && rec.vendorId === CLOUDFLARE_VENDOR_ID) {
+        await this.requireAppAccess(CLOUDFLARE_VENDOR_ID);
         return rec.account as unknown as Fetcher<CloudflareGatekeeperUser>;
       }
     }
@@ -1098,42 +1149,43 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let options = {
       userId: this.storage.profile.get().id
     };
-
-    // Admin-disabled resources/gatekeepers are filtered out here, which also covers the agent (the
-    // Overseer's connectable-vendor/resource list is sourced from this method).
     let config = await readAdminConfig(this.env);
-    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
-
     let promises: Promise<GatekeeperVendorInfo | null>[] = [];
 
     for (let [id, vendor] of this.vendors) {
-      if (disabledGatekeeperSet.has(id)) {
-        continue;  // Whole gatekeeper disabled by admin.
-      }
       promises.push((async () => {
-        if (filter && !(await checkGatekeeperVendorFilter(vendor, id, filter))) {
-          return null;
-        }
+        // Resolve policy before touching the vendor. A denied app must not trigger describe,
+        // resource discovery, or any other remote gatekeeper RPC.
+        let access = await this.resolveAppAccess(id);
+        if (!access.allowed) return null;
 
+        let description: VendorDescription | undefined;
+        let info: GatekeeperVendorInfo;
         try {
-          let [description, supportedResources] = await Promise.all([
-            vendor.describe(),
-            vendor.getSupportedResources(options),
-          ]);
-          let enabledResources =
-              filterEnabledResources(config, id, supportedResources);
-          if (enabledResources.length == 0) {
-            // Every resource for this vendor is disabled (or it advertised none) — hide the vendor.
-            return null;
-          }
-
-          return {id, description, supportedResources: enabledResources};
+          description = await vendor.describe();
+          // Enabled is auto-provision-only. Ordinary vendors use optional in central auth and
+          // remain available in legacy auth; ambient vendors are surfaced by listAddableGatekeepers.
+          if (description.autoProvisionsAccount && !canOptIntoAccount(access)) return null;
+          if (filter && !(await checkGatekeeperVendorFilter(vendor, id, filter))) return null;
+          let supportedResources = await vendor.getSupportedResources(options);
+          let enabledResources = filterEnabledResources(config, id, supportedResources);
+          if (enabledResources.length === 0) return null;
+          info = {id, description, supportedResources: enabledResources};
         } catch (err) {
           logger.warn("failed to load gatekeeper vendor", {
             event: "gatekeeper.vendor.load.failed", vendorId: id, error: err,
           });
-          return unavailableGatekeeperVendorInfo(id);
+          info = unavailableGatekeeperVendorInfo(id);
         }
+
+        // Vendor discovery can cross several awaits. Re-resolve immediately before the entry is
+        // published so a concurrent policy change never turns a completed remote read into access.
+        access = await this.resolveAppAccess(id);
+        if (!access.allowed ||
+            (description?.autoProvisionsAccount && !canOptIntoAccount(access))) {
+          return null;
+        }
+        return info;
       })());
     }
 
@@ -1142,12 +1194,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
     let vendor = this.vendors.get(vendorId);
-    if (!vendor) {
-      throw new Error("No such service: " + vendorId);
-    }
-    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(vendorId.toLowerCase())) {
-      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
-    }
+    if (!vendor) throw new Error("No such service: " + vendorId);
+    await this.requireAppAccess(vendorId, "optional");
 
     let accountId = this.storage.nextAccountId.get();
     this.storage.nextAccountId.put(accountId + 1);
@@ -1161,6 +1209,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let callback = this.ctx.exports.GatekeeperConnectCallbackImpl({props});
 
     let {url} = await vendor.connectAccount(callback, {resourceUrlPatterns});
+    await this.requireAppAccess(vendorId, "optional");
     logger.info("account connect started", {
       event: "account.connect.started", vendorId, accountId,
     });
@@ -1172,7 +1221,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // deployment (workerd throws "Stub refers to a service that doesn't exist"). Skipping it keeps one
   // stale account from breaking listing, provisioning, and opt-in for all the others — the same
   // resilience subscribeConnectedAccounts relies on (it iterates through this).
-  *#connectedAccountRecords(): Generator<ConnectedAccountRecord> {
+  private *connectedAccountRecords(): Generator<ConnectedAccountRecord> {
     let nextAccountId = this.storage.nextAccountId.get();
     for (let id = 0; id < nextAccountId; id++) {
       let rec: ConnectedAccountRecord | undefined;
@@ -1190,7 +1239,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // Whether this user already has a connected account for the given vendor.
   #hasAccountForVendor(vendorId: string): boolean {
-    for (let rec of this.#connectedAccountRecords()) {
+    for (let rec of this.connectedAccountRecords()) {
       if (rec.vendorId === vendorId) return true;
     }
     return false;
@@ -1199,33 +1248,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // Resolve every bound vendor that auto-provisions an account (VendorDescription.autoProvisionsAccount),
   // describing them in parallel and dropping any whose describe() fails. Shared discovery step for both
   // listing and auto-provisioning ambient gatekeepers; callers apply their own admin-mode filter.
-  async #ambientVendors():
+  async #ambientVendors(requiredMode?: AppAccessResult["mode"]):
       Promise<Array<{vendorId: string, vendor: Service<GatekeeperVendor>, description: VendorDescription}>> {
     let described = await Promise.all([...this.vendors].map(async ([vendorId, vendor]) => {
+      // Policy is resolved before describe() so denied vendors do not receive any external RPC.
+      let access = await this.resolveAppAccess(vendorId);
+      if (!access.allowed || (requiredMode !== undefined && access.mode !== requiredMode)) return null;
+      let description: VendorDescription;
       try {
-        let description = await vendor.describe();
-        return description.autoProvisionsAccount ? {vendorId, vendor, description} : null;
+        description = await vendor.describe();
       } catch (err) {
         logger.warn("failed to describe vendor", {
           event: "vendor.describe.failed", vendorId, error: err,
         });
         return null;
       }
+      access = await this.resolveAppAccess(vendorId);
+      if (!access.allowed || (requiredMode !== undefined && access.mode !== requiredMode)) return null;
+      return description.autoProvisionsAccount ? {vendorId, vendor, description} : null;
     }));
     return described.filter(v => v !== null);
   }
 
   /**
-   * The ambient gatekeepers the user can opt into now: mode "optional" and not yet added. Backs the
-   * Connectors "Available" section. ("enabled" ones are already provisioned; "disabled" ones aren't
-   * offered.)
+   * List ambient gatekeepers the user may opt into, excluding vendors already represented by an
+   * account. Enabled is intentionally not accepted here: it is an auto-provision-only mode.
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
-    let config = await readAdminConfig(this.env);
-    return (await this.#ambientVendors())
-        .filter(({vendorId}) =>
-            ambientGatekeeperMode(config, vendorId) === "optional" && !this.#hasAccountForVendor(vendorId))
-        // Same shape as listGatekeeperVendors; ambient gatekeepers expose no resources.
+    return (await this.#ambientVendors("optional"))
+        .filter(({vendorId}) => !this.#hasAccountForVendor(vendorId))
         .map(({vendorId, description}) => ({id: vendorId, description, supportedResources: []}));
   }
 
@@ -1235,10 +1286,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Opt into an ambient gatekeeper on demand: mint its connected account for this user (no OAuth).
-   * Only when the vendor's mode isn't "disabled" and the user has no account yet. Idempotent.
+   * Enabled is auto-provision-only, so this path accepts optional policy only.
    */
   provisionAmbientAccount(vendorId: string): Promise<void> {
-    vendorId = vendorId.toLowerCase();
     let inFlight = this.#provisionPromises.get(vendorId);
     if (inFlight) return inFlight;
     let promise = this.#provisionAmbientAccount(vendorId)
@@ -1250,28 +1300,46 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async #provisionAmbientAccount(vendorId: string): Promise<void> {
     let vendor = this.vendors.get(vendorId);
     if (!vendor) throw new Error("No such service: " + vendorId);
-
-    if (ambientGatekeeperMode(await readAdminConfig(this.env), vendorId) === "disabled") {
-      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
-    }
+    await this.requireAppAccess(vendorId, "optional");
 
     let description = await vendor.describe();
     if (!description.autoProvisionsAccount) {
       throw new Error(`The "${vendorId}" gatekeeper can't be added this way.`);
     }
+    if (this.#hasAccountForVendor(vendorId)) return;
 
-    if (this.#hasAccountForVendor(vendorId)) return;  // already added
-
-    await this.#createAutoProvisionedAccount(vendorId, vendor);
+    await this.#createAutoProvisionedAccount(vendorId, vendor, "optional");
   }
 
   // Mint a vendor's connected account with no OAuth flow and persist it as auto-provisioned. The
-  // caller must have already confirmed the vendor sets autoProvisionsAccount (so createAccount is
-  // present) and that the user has no account for it yet.
-  async #createAutoProvisionedAccount(vendorId: string, vendor: Service<GatekeeperVendor>): Promise<void> {
+  // caller supplies the required live policy mode so a policy change during account creation can
+  // discard the newly-created account without exposing or persisting it.
+  async #createAutoProvisionedAccount(
+      vendorId: string, vendor: Service<GatekeeperVendor>,
+      requiredMode: AppAccessResult["mode"]): Promise<void> {
+    await this.requireAppAccess(vendorId, requiredMode);
     let account = await (vendor as unknown as AccountCreatorStub).createAccount();
-    // Resolve the description before allocating the id, so a describe() failure doesn't burn a slot.
-    let description = await account.describe();
+
+    // Resolve the account metadata before the final policy check. If either this external read or
+    // the policy recheck fails, the newly-created account is never allocated or persisted.
+    let description: AccountDescription;
+    try {
+      description = await account.describe();
+      let access = await this.resolveAppAccess(vendorId);
+      if (!access.allowed || access.mode !== requiredMode) {
+        throw new Error(`The "${vendorId}" app is not available to this user.`);
+      }
+    } catch (error) {
+      try {
+        await account.revoke();
+      } catch (revokeError) {
+        logger.warn("failed to revoke unpersisted auto-provisioned account", {
+          event: "account.auto.provision.revoke.failed", vendorId, error: revokeError,
+        });
+      }
+      throw error;
+    }
+
     let accountId = this.storage.nextAccountId.get();
     this.storage.nextAccountId.put(accountId + 1);
     this.storage.connectedAccounts.put({
@@ -1302,19 +1370,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async #provisionMissingAccounts(): Promise<void> {
     // Which vendors already have an auto-provisioned account?
     let provisioned = new Set<string>();
-    for (let rec of this.#connectedAccountRecords()) {
+    for (let rec of this.connectedAccountRecords()) {
       if (rec.autoProvisioned) provisioned.add(rec.vendorId);
     }
 
-    let config = await readAdminConfig(this.env);
-    for (let {vendorId, vendor} of await this.#ambientVendors()) {
+    for (let {vendorId, vendor} of await this.#ambientVendors("enabled")) {
       if (provisioned.has(vendorId)) continue;
-      // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
-      // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
-      if (!shouldAutoProvisionAccount(config, vendorId)) continue;
-
       try {
-        await this.#createAutoProvisionedAccount(vendorId, vendor);
+        await this.#createAutoProvisionedAccount(vendorId, vendor, "enabled");
       } catch (err) {
         logger.error("failed to auto-provision account", {
           event: "account.auto.provision.failed", vendorId, error: err,
@@ -1323,56 +1386,102 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  /**
-   * Ensure the user's auto-provisioned accounts exist (idempotent; see #ensureAutoProvisionedAccounts),
-   * then list those that declare an agent singleton and/or a management UI. Folding the ensure in lets
-   * callers (gadget open, app nav) provision and read the accounts back in a single round trip to this
-   * DO. Callers filter on `description.singleton` (ambient capsules / catalog) or
-   * `description.providesUi` (management-UI listing).
-   */
-  async listProvidedAccounts(): Promise<ProvidedAccountInfo[]> {
+  async listProvidedAccounts(includeUnavailable = false): Promise<ProvidedAccountInfo[]> {
     await this.#ensureAutoProvisionedAccounts();
-    let config = await readAdminConfig(this.env);
     let result: ProvidedAccountInfo[] = [];
-    for (let rec of this.#connectedAccountRecords()) {
-      if (!rec.description.singleton && !rec.description.providesUi) continue;
-      // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
-      // or management UI. (Its data is preserved, so re-enabling restores it.)
-      if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
-      result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
+    for (let record of this.connectedAccountRecords()) {
+      if (!record.description.singleton && !record.description.providesUi) continue;
+      if (!includeUnavailable) {
+        let access = await this.resolveAppAccess(record.vendorId);
+        if (!access.allowed) continue;
+        if (record.autoProvisioned) {
+          if (access.mode !== "optional" && access.mode !== "enabled") continue;
+        } else if (this.centralAuthMode && access.mode !== "optional") {
+          continue;
+        }
+      }
+      result.push({
+        accountId: record.id,
+        vendorId: record.vendorId,
+        description: record.description,
+        ownerSubject: this.storage.profile.get().id,
+      });
     }
     return result;
   }
 
   /**
-   * Get the gatekeeper class implementing a singleton account's agent session. The overseer installs
-   * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
-   * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this
-   * DO. The account capability stays encapsulated here; only the class reference crosses out.
+   * Get the gatekeeper class implementing a singleton account's agent session. The owner Subject is
+   * returned beside the class so the kernel can persist it on its internal capability record.
    */
   async getSingletonGatekeeperClass(accountId: number)
-      : Promise<DurableObjectClass<Gatekeeper<any>> | null> {
+      : Promise<{class: DurableObjectClass<Gatekeeper<any>>, ownerSubject: string} | null> {
     let record = this.storage.connectedAccounts.get(accountId);
-    // Present only when description.singleton is set; gate on that, then call through the derived
-    // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
-    return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+    let vendorId = record.vendorId;
+    await this.requireConnectedAccountAppAccess(accountId, vendorId);
+    let cls = await (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+    await this.requireConnectedAccountAppAccess(accountId, vendorId);
+    if (!this.storage.connectedAccounts.get(accountId)?.description.singleton) return null;
+    return {class: cls, ownerSubject: this.storage.profile.get().id};
   }
 
   /**
-   * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
-   * fresh by the caller so admin-gated features reflect the user's current status.
+   * Recheck a retained capability against the exact connected account that minted it. The final
+   * record read closes the disconnect/reconnect race while Directory policy resolution is awaited.
    */
-  async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
-    let record = this.storage.connectedAccounts.get(accountId);
-    if (!record?.description.providesUi) throw new Error("No such app.");
-    return (record.account as unknown as SingletonAccountStub).startAppUi(context);
+  async requireConnectedAccountAppAccess(
+      accountId: number, expectedVendorId: string, expectedOwnerSubject?: string): Promise<void> {
+    let account = this.storage.connectedAccounts.get(accountId);
+    if (account?.vendorId !== expectedVendorId ||
+        (expectedOwnerSubject !== undefined &&
+         this.storage.profile.get().id !== expectedOwnerSubject)) {
+      throw new Error("This connected account is no longer available.");
+    }
+    await this.requireAppAccess(expectedVendorId);
+    account = this.storage.connectedAccounts.get(accountId);
+    if (account?.vendorId !== expectedVendorId ||
+        (expectedOwnerSubject !== undefined &&
+         this.storage.profile.get().id !== expectedOwnerSubject)) {
+      throw new Error("This connected account is no longer available.");
+    }
   }
 
-  async ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+  /** Recheck a retained full-page frame, including the account's management-UI declaration. */
+  async requireAccountAppUiAccess(accountId: number, expectedVendorId: string): Promise<void> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record?.description.providesUi || record.vendorId !== expectedVendorId) {
+      throw new Error("No such app.");
+    }
+    await this.requireConnectedAccountAppAccess(accountId, expectedVendorId);
+    record = this.storage.connectedAccounts.get(accountId);
+    if (!record?.description.providesUi || record.vendorId !== expectedVendorId) {
+      throw new Error("No such app.");
+    }
+  }
+
+  async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record) throw new Error("No such app.");
+    await this.requireAccountAppUiAccess(accountId, record.vendorId);
+    let frame = await (record.account as unknown as SingletonAccountStub).startAppUi(context);
+    try {
+      await this.requireAccountAppUiAccess(accountId, record.vendorId);
+      return frame;
+    } catch (error) {
+      frame.ui[Symbol.dispose]();
+      throw error;
+    }
+  }
+
+  async ensureAccountResources(
+      accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    return record.account.ensureResources(resourceUrlPatterns);
+    await this.requireOptionalConnectedAccountAccess(accountId);
+    let result = await record.account.ensureResources(resourceUrlPatterns);
+    await this.requireOptionalConnectedAccountAccess(accountId);
+    return result;
   }
 
   async subscribeConnectedAccounts(
@@ -1382,31 +1491,28 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     let connectedAccounts = this.storage.connectedAccounts;
     let vendors = this.vendors;
+    let config = await readAdminConfig(this.env);
 
     subscriber = subscriber.dup();  // keep stub after return
 
     let seenIds = new Set<number>();
     let vendorDescriptions = new Map<string, Promise<VendorDescription>>();
-
-    // Snapshot the admin config once for this subscription. Changes take effect when the client
-    // re-subscribes (e.g. on reconnect), matching other deployment config.
-    let config = await readAdminConfig(this.env);
-    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let resolveAppAccess = (vendorId: string) => this.resolveAppAccess(vendorId);
 
     async function notifyAdd(record: ConnectedAccountRecord) {
-      // Ambient (auto-provisioned) accounts only appear in the Connectors list when their vendor is
-      // "optional" — i.e. the user opted in and can manage/remove it. "enabled" (forced) accounts have
-      // nothing to manage, and "disabled" ones are dormant, so both are hidden.
-      // Forced accounts are included when observer verification explicitly requests them.
-      if (record.autoProvisioned) {
-        let mode = ambientGatekeeperMode(config, record.vendorId);
-        if (mode === "disabled" ||
-            (mode === "enabled" && !filter?.includeForcedAutoProvisionedAccounts)) {
-          return;
+      // Resolve the live policy for every notification. A retained subscription must not keep
+      // exposing an account after an audience or mode change.
+      let access = await resolveAppAccess(record.vendorId);
+      let visible = access.allowed &&
+          (!record.autoProvisioned ||
+           (access.mode === "optional" || (access.mode === "enabled" &&
+               !!filter?.includeForcedAutoProvisionedAccounts)));
+      if (!visible) {
+        if (seenIds.has(record.id)) {
+          subscriber.remove(record.id);
+          seenIds.delete(record.id);
         }
-      }
-      if (disabledGatekeeperSet.has(record.vendorId)) {
-        return;  // Whole gatekeeper disabled by admin.
+        return;
       }
       if (filter && !(await checkGatekeeperVendorFilter(
           record.account, record.vendorId, filter))) {
@@ -1455,6 +1561,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
       let credentialsValid = areCredentialsValid(record);
 
+      access = await resolveAppAccess(record.vendorId);
+      visible = access.allowed &&
+          (!record.autoProvisioned ||
+           (access.mode === "optional" || (access.mode === "enabled" &&
+               !!filter?.includeForcedAutoProvisionedAccounts)));
+      if (!visible) {
+        if (seenIds.has(record.id)) {
+          subscriber.remove(record.id);
+          seenIds.delete(record.id);
+        }
+        return;
+      }
+
       seenIds.add(record.id);
       subscriber.add(record.id, record.description, vendorDescription,
           supportedResources, credentialsValid, record.vendorId).catch(unsubscribe)
@@ -1480,9 +1599,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       subscriber[Symbol.dispose]();
     };
 
-    // #connectedAccountRecords() skips any record that fails to load, so a single stale account
+    // connectedAccountRecords() skips any record that fails to load, so a single stale account
     // (e.g. one whose gatekeeper Worker is no longer bound) doesn't prevent surfacing the others.
-    let promises = [...this.#connectedAccountRecords()].map(record => notifyAdd(record));
+    let promises = [...this.connectedAccountRecords()].map(record => notifyAdd(record));
 
     connectedAccounts.subscribe(dbSubscriber);
 
@@ -1500,57 +1619,75 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async disconnectAccount(accountId: number): Promise<void> {
     let account = this.storage.connectedAccounts.get(accountId);
-    if (account) {
-      if (account.autoProvisioned) {
-        // A forced ("enabled") ambient account can't be removed by the user — the admin controls it.
-        if (shouldAutoProvisionAccount(await readAdminConfig(this.env), account.vendorId)) {
-          throw new Error("This account is provided automatically and can't be disconnected.");
-        }
-        // An opt-in ("optional") ambient account: the user added it, so let them remove it. revoke()
-        // gives the gatekeeper a chance to delete its own per-user storage (e.g. the account's
-        // private collections DO) — it's its cleanup hook, not just OAuth revocation. Best-effort:
-        // a gatekeeper that throws (or has nothing to revoke) must not block the user's disconnect.
-        try {
-          await account.account.revoke();
-        } catch (err) {
-          logger.error("revoke() failed during disconnect", {
-            event: "account.revoke.failed",
-            vendorId: account.vendorId, accountId, error: err,
-          });
-        }
-        this.storage.connectedAccounts.delete(accountId);
-        logger.info("account disconnected", {
-          event: "account.disconnected",
-          vendorId: account.vendorId, accountId, autoProvisioned: true,
+    if (!account) return;
+    // Disconnect is cleanup: policy denial must not trap a dormant local account. Only a currently
+    // enabled auto-provisioned account is forced; optional or disabled ambient accounts remain
+    // removable even though every normal app operation is denied while disabled.
+    let access = await this.resolveAppAccess(account.vendorId);
+    if (account.autoProvisioned && access.allowed && shouldAutoProvisionAccount(access)) {
+      throw new Error("This account is provided automatically and can't be disconnected.");
+    }
+    if (account.autoProvisioned) {
+      try {
+        await account.account.revoke();
+      } catch (err) {
+        logger.error("revoke() failed during disconnect", {
+          event: "account.revoke.failed",
+          vendorId: account.vendorId, accountId, error: err,
         });
-        return;
       }
-      await account.account.revoke();
       this.storage.connectedAccounts.delete(accountId);
-      // Disconnecting the Cloudflare account also clears the AI Gateway billing state (selected
-      // account + cached balance), which is meaningless without the underlying grant.
-      if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
-        this.storage.cloudflareBilling.put(null);
-      }
       logger.info("account disconnected", {
         event: "account.disconnected",
-        vendorId: account.vendorId, accountId, autoProvisioned: false,
+        vendorId: account.vendorId, accountId, autoProvisioned: true,
       });
+      return;
     }
+    await account.account.revoke();
+    this.storage.connectedAccounts.delete(accountId);
+    if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
+      this.storage.cloudflareBilling.put(null);
+    }
+    logger.info("account disconnected", {
+      event: "account.disconnected",
+      vendorId: account.vendorId, accountId, autoProvisioned: false,
+    });
   }
 
   async reconnectAccount(accountId: number): Promise<{url: string}> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    return record.account.reconnect();
+    await this.requireOptionalConnectedAccountAccess(accountId);
+    let result = await record.account.reconnect();
+    await this.requireOptionalConnectedAccountAccess(accountId);
+    return result;
+  }
+
+  async requireOptionalConnectedAccountAccess(accountId: number): Promise<void> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record) throw new Error("No such account.");
+    let vendorId = record.vendorId;
+    await this.requireAppAccess(vendorId, "optional");
+    if (this.storage.connectedAccounts.get(accountId)?.vendorId !== vendorId) {
+      throw new Error("No such account.");
+    }
   }
 
   async startResourceConfigurator(
       accountId: number,
-      resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+      resourceUrlPattern: string,
+      context: AppUiContext): Promise<ResourceConfiguratorFrame> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    return record.account.startResourceConfigurator(resourceUrlPattern);
+    await this.requireOptionalConnectedAccountAccess(accountId);
+    let frame = await record.account.startResourceConfigurator(resourceUrlPattern, context);
+    try {
+      await this.requireOptionalConnectedAccountAccess(accountId);
+      return frame;
+    } catch (error) {
+      frame.ui[Symbol.dispose]();
+      throw error;
+    }
   }
 
   /**
@@ -1629,18 +1766,43 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return undefined;
   }
 
-  async putConnectedAccount(record: ConnectedAccountRecord) {
-    let uniqueName = record.description.uniqueName;
+  async putConnectedAccount(record: ConnectedAccountInput): Promise<void> {
+    if (!this.vendors.has(record.vendorId)) throw new Error("No such service: " + record.vendorId);
+    let access = await this.resolveAppAccess(record.vendorId);
+    if (!canOptIntoAccount(access)) {
+      try {
+        await record.account.revoke();
+      } catch (error) {
+        logger.warn("failed to revoke OAuth grant after policy denial", {
+          event: "account.oauth.policy.revoke.failed", vendorId: record.vendorId, error,
+        });
+      }
+      throw new Error(`The "${record.vendorId}" app is not available to this user.`);
+    }
+
+    let description = record.description ?? await record.account.describe();
+    if (record.description === undefined) {
+      let currentAccess = await this.resolveAppAccess(record.vendorId);
+      if (!canOptIntoAccount(currentAccess)) {
+        try {
+          await record.account.revoke();
+        } catch (error) {
+          logger.warn("failed to revoke OAuth grant after concurrent policy denial", {
+            event: "account.oauth.policy.revoke.failed", vendorId: record.vendorId, error,
+          });
+        }
+        throw new Error(`The "${record.vendorId}" app is not available to this user.`);
+      }
+    }
+    let uniqueName = description.uniqueName;
     if (uniqueName &&
         this.#findConnectedAccountByIdentity(record.vendorId, uniqueName, record.id)) {
       // OAuth providers often return the currently logged-in identity when the user tries to add
-      // another account. Avoid showing duplicate account rows: keep the existing record stable for
-      // any UI references, and revoke the newly-created duplicate grant.
+      // another account. Avoid showing duplicate account rows and revoke the new grant.
       await record.account.revoke();
       return;
     }
-
-    this.storage.connectedAccounts.put(record);
+    this.storage.connectedAccounts.put({...record, description});
   }
 
   async markCredentialsExpired(accountId: number) {
@@ -1656,9 +1818,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async markCredentialsRestored(accountId: number, expiresAt?: Date) {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
+    let vendorId = record.vendorId;
+    await this.requireConnectedAccountAppAccess(accountId, vendorId);
 
-    // Re-fetch description since the user may have re-authed with different info.
-    record.description = await record.account.describe();
+    // Re-fetch description since the user may have re-authenticated with different metadata.
+    let description = await record.account.describe();
+    await this.requireConnectedAccountAppAccess(accountId, vendorId);
+    record = this.storage.connectedAccounts.get(accountId);
+    if (!record || record.vendorId !== vendorId) throw new Error("No such account.");
+    record.description = description;
     record.credentialsExpired = false;
     record.credentialExpiresAt = expiresAt;
     this.storage.connectedAccounts.put(record);
@@ -1666,30 +1834,30 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async getGatekeeperClassFor(accountId: number, url: string)
       : Promise<{class: DurableObjectClass<Gatekeeper<any>>, vendorId: string,
-                  typeUrlPattern: string}> {
+                  typeUrlPattern: string, ownerSubject: string}> {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) throw new Error("No such account.");
+    let vendorId = account.vendorId;
+    await this.requireOptionalConnectedAccountAccess(accountId);
     let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
 
-    // Block whole gatekeepers + disabled resources at this single core-side chokepoint where a
-    // resourceUrl becomes a capability (reached only via the user/UI-facing Overseer.newGatekeeper
-    // and blueprint instantiation — never from gadget or agent code).
+    // Resource policy remains a separate soft setting, enforced after app availability but before
+    // the class reference crosses into the workspace kernel.
     let config = await readAdminConfig(this.env);
-    let vendorId = account.vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(vendorId)) {
-      throw new Error(
-          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
-    }
-
-    // Blocking here prevents minting a new capability to a disabled resource even if the request
-    // bypasses the (separately filtered) picker/agent listings.
     if (isResourceDisabled(config, vendorId, resource.urlPattern)) {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
     }
+    await this.requireOptionalConnectedAccountAccess(accountId);
 
-    return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
+    return {
+      class: cls,
+      vendorId,
+      typeUrlPattern: resource.urlPattern,
+      ownerSubject: this.storage.profile.get().id,
+    };
   }
+
 
   /**
    * Mint a verifier from one of THIS user's connected accounts, identified by accountId. The
@@ -1698,8 +1866,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * account no longer exists (or never existed). Throws if the account belongs to a different
    * vendor (not a legitimate UI state — only reachable by bypassing client-side filtering).
    *
-   * Account *selection* (which of the user's accounts to use for a given binding) is done by the
-   * frontend; this method validates and resolves a chosen account to its verifier.
+   * The persistent verifier receives only an attenuated authority that rechecks this account on
+   * every later access question; it never retains the human session or the complete User DO.
    */
   async getVerifier(accountId: number, expectedVendorId: string)
       : Promise<Fetcher<GatekeeperUserVerifier> | null> {
@@ -1712,7 +1880,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
           `!= expected "${expectedVendorId}"`);
       throw new Error("Invalid account selection for this service.");
     }
-    return await account.account.getVerifier();
+    await this.requireConnectedAccountAppAccess(accountId, expectedVendorId);
+    let authority = this.ctx.exports.GatekeeperVerifierAuthority({
+      props: {userObjectId: this.ctx.id.toString(), accountId, vendorId: expectedVendorId},
+    }) as Fetcher<VerifierAppAuthority>;
+    let context: GatekeeperVerifierContext = {authority};
+    let verifier = await account.account.getVerifier(context);
+    try {
+      await this.requireConnectedAccountAppAccess(accountId, expectedVendorId);
+      return verifier;
+    } catch (error) {
+      (verifier as unknown as {[Symbol.dispose]?(): void})[Symbol.dispose]?.();
+      throw error;
+    }
   }
 
   /**
@@ -1742,11 +1922,9 @@ export class GatekeeperConnectCallbackImpl
 
   async complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<void> {
     let userStub = this.#getUserStub();
-
     await userStub.putConnectedAccount({
       id: this.ctx.props.accountId,
       account,
-      description: await account.describe(),
       vendorId: this.ctx.props.vendorId,
       credentialExpiresAt: expiresAt,
     });

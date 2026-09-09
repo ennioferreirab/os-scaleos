@@ -5,7 +5,7 @@ import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type {
-  ObservationAuthorizer, ObservationDescription,
+  ApprovalQueue, ObservationAuthorizer, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextSearchResult, ContextListing, ContextListingEntry, ContextReadResult,
@@ -64,6 +64,10 @@ export class LibraryReadSession extends RpcTarget {
     return (this.#enabledPromise ??= this.#userLib().getEnabledCollections(this.domain));
   }
 
+  async #assertAppAccess(): Promise<void> {
+    await (this.authorizer as unknown as NativeRpcStub<ApprovalQueue>).assertAppAccess();
+  }
+
   async #authorize(
       collectionIds: string[], description: ObservationDescription): Promise<void> {
     let check = collectionIds.length > 0
@@ -74,11 +78,11 @@ export class LibraryReadSession extends RpcTarget {
     });
     check.commit();
   }
-
   async search(query: string, opts?: {
     collectionId?: string;
     limit?: number;
   }): Promise<ContextSearchResult[]> {
+    await this.#assertAppAccess();
     let enabled = await this.#enabled();
     let limit = opts?.limit ?? 20;
 
@@ -131,6 +135,7 @@ export class LibraryReadSession extends RpcTarget {
     collectionId?: string;
     path?: string;
   }): Promise<ContextListing> {
+    await this.#assertAppAccess();
     let listing = await this.#fetchListing(opts);
     // Nothing listed → nothing was observed, so don't record an observation (mirrors read()).
     if (listing.entries.length === 0) return listing;
@@ -153,6 +158,7 @@ export class LibraryReadSession extends RpcTarget {
   }
 
   async read(docId: string): Promise<ContextReadResult | null> {
+    await this.#assertAppAccess();
     let decoded = decodeDocId(docId);
     // Malformed ids are "not found", not RPC errors.
     if (!decoded) return null;

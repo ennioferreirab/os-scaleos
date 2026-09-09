@@ -11,17 +11,21 @@ import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import { createLogger } from "@gadgets/backend-utils/logger";
 import {
   stripTrailingSlashes,
+  type AppUiAuthority,
+  type AppUiContext,
   type AvatarImage,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
   type GatekeeperUser,
   type GatekeeperUserVerifier,
+  type GatekeeperVerifierContext,
   type GatekeeperVendor as GatekeeperVendorIface,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  type VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { ToolCatalog } from "@gadgets/mcp-shared/client";
 import {
@@ -313,27 +317,40 @@ export class GatekeeperUserImpl
     };
   }
 
-  async startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    _resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
     return {
       iframeHtml: MCP_SERVER_CONFIGURATOR_HTML,
-      ui: new RpcStub(new McpServerConfiguratorUI(this.env, this.#account())),
+      ui: new RpcStub(new McpServerConfiguratorUI(
+        this.env, this.#account(), context.authority)),
     };
   }
 
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.McpVerifier({});
+  async getVerifier(
+    context: GatekeeperVerifierContext,
+  ): Promise<Fetcher<GatekeeperUserVerifier>> {
+    return this.ctx.exports.McpVerifier({ props: { authority: context.authority } });
   }
 }
 
 // ---------------------------------------------------------------------------
 // Verifier
 
-// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` refuses
-// everyone. Carries no props for the same reason.
+type McpVerifierProps = {
+  authority: Fetcher<VerifierAppAuthority>;
+};
+
 @validateRpc()
-export class McpVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
-  verify(): void {}
+export class McpVerifier
+  extends WorkerEntrypoint<Env, McpVerifierProps>
+  implements GatekeeperUserVerifier
+{
+  async verify(): Promise<void> {
+    await this.ctx.props.authority.requireAppAccess();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,15 +360,22 @@ export class McpVerifier extends WorkerEntrypoint<Env> implements GatekeeperUser
 class McpServerConfiguratorUI extends RpcTarget implements McpServerConfiguratorRpc {
   #env: Env;
   #account: DurableObjectStub<McpAccount>;
+  #authority: RpcStub<AppUiAuthority>;
   #toolsPromise: Promise<ToolCatalog> | undefined;
 
-  constructor(env: Env, account: DurableObjectStub<McpAccount>) {
+  constructor(
+    env: Env,
+    account: DurableObjectStub<McpAccount>,
+    authority: RpcStub<AppUiAuthority>,
+  ) {
     super();
     this.#env = env;
     this.#account = account;
+    this.#authority = authority.dup();
   }
 
   async getEndpoint(): Promise<string> {
+    await this.#authority.requireAppAccess();
     return (await this.#account.getServer()).endpoint;
   }
 
@@ -366,6 +390,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
 
   // Every tool the grant may cover, annotated with whether calls need approval.
   async listToolOptions(): Promise<ConfiguratorUIOption[]> {
+    await this.#authority.requireAppAccess();
     const { tools, truncated } = await this.#tools();
     requireCompleteCatalogForToolSelection(truncated);
     // `fetchTools` lists with the ordinary catalog cap, so that is the cap reaching it would be
@@ -382,6 +407,10 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
         // Surfaced here so the person granting can see, per tool, whether calls will interrupt them.
         meta: classifyTool(tool, TRUST).mode === "read" ? "read-only" : "needs approval",
       }));
+  }
+
+  [Symbol.dispose](): void {
+    this.#authority[Symbol.dispose]();
   }
 }
 

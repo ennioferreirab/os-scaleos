@@ -38,6 +38,21 @@ it("walks every page rather than stopping at the provider's default page size", 
   expect(urls[1]).toContain("page=2");
 });
 
+it("rechecks access before reading every account page", async () => {
+  const fetchSpy = vi.fn(async () => page(names(50), 50, 62));
+  vi.stubGlobal("fetch", fetchSpy);
+  let checks = 0;
+  const beforeRequest = vi.fn(async () => {
+    checks++;
+    if (checks > 1) throw new Error("app access denied");
+  });
+
+  await expect(listAccounts(TOKEN, beforeRequest)).rejects.toThrow("app access denied");
+
+  expect(beforeRequest).toHaveBeenCalledTimes(2);
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
+});
+
 it("stops on a short page without asking for another", async () => {
   const fetchSpy = vi.fn(async () => page(names(3), 50));
   vi.stubGlobal("fetch", fetchSpy);

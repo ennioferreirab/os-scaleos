@@ -1,4 +1,4 @@
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, AppPolicy, AppPolicyMode, Audience, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, Group, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AppPolicy, AppPolicyAudiencePreview, AppPolicyMode, Audience, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, Group, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -8,7 +8,6 @@ import { createWorkshopLogger } from "./observability";
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, sanitizeBlueprintOutput, serializeFeaturedBlueprints } from './blueprint-archive.js';
 import { AdminConfig, DEFAULT_ADMIN_CONFIG, FormatCuration, MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, reorderFormats, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.js';
-import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
 import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
@@ -286,11 +285,32 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   // --- Deployment admin config ---
 
-  // Every read of the stored config goes through here. A config persisted before a field existed
-  // is missing that field entirely, so reads must backfill from the defaults or the first
-  // deployment to upgrade hits `undefined` on it.
+  // Every read of the stored config goes through here. Rebuild the allowlisted shape rather than
+  // spreading persisted data: older deployments may still contain removed availability keys, and
+  // those keys must never be re-published to the KV mirror or interpreted as policy.
   #config(): AdminConfig {
-    return { ...DEFAULT_ADMIN_CONFIG, ...this.storage.adminConfig.get() };
+    let stored = this.storage.adminConfig.get();
+    return {
+      signupsEnabled: typeof stored.signupsEnabled === "boolean"
+          ? stored.signupsEnabled : DEFAULT_ADMIN_CONFIG.signupsEnabled,
+      siteName: typeof stored.siteName === "string" ? stored.siteName : DEFAULT_ADMIN_CONFIG.siteName,
+      siteLogoConfigured: typeof stored.siteLogoConfigured === "boolean"
+          ? stored.siteLogoConfigured : DEFAULT_ADMIN_CONFIG.siteLogoConfigured,
+      instanceInstructions: typeof stored.instanceInstructions === "string"
+          ? stored.instanceInstructions : DEFAULT_ADMIN_CONFIG.instanceInstructions,
+      announcement: typeof stored.announcement === "string"
+          ? stored.announcement : DEFAULT_ADMIN_CONFIG.announcement,
+      banner: stored.banner && typeof stored.banner.text === "string" &&
+          isBannerColor(stored.banner.color)
+        ? {text: stored.banner.text, color: stored.banner.color}
+        : {...DEFAULT_ADMIN_CONFIG.banner},
+      accentColor: typeof stored.accentColor === "string"
+          ? stored.accentColor : DEFAULT_ADMIN_CONFIG.accentColor,
+      disabledResources: stored.disabledResources &&
+          typeof stored.disabledResources === "object"
+        ? stored.disabledResources : {},
+      formats: Array.isArray(stored.formats) ? stored.formats : [],
+    };
   }
 
   getAdminConfig(): AdminConfig {
@@ -617,102 +637,82 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  /**
-   * Set a gatekeeper's availability atomically (read-modify-write within the DO). Routes by kind: an
-   * auto-provisioning ("ambient") gatekeeper stores its three-state mode in ambientGatekeeperModes
-   * (default stored as absence); an ordinary gatekeeper stores a binary enabled/disabled in
-   * disabledGatekeepers and rejects the ambient-only 'optional'.
-   */
-  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
-    vendorId = vendorId.toLowerCase();
-    let vendor = this.vendors.get(vendorId);
-    let autoProvisions = !!vendor && (await vendor.describe()).autoProvisionsAccount === true;
-    if (autoProvisions) {
-      await this.#mutateAdminConfig(config => {
-        let modes = { ...config.ambientGatekeeperModes };
-        if (mode === DEFAULT_AMBIENT_GATEKEEPER_MODE) delete modes[vendorId]; else modes[vendorId] = mode;
-        return { ...config, ambientGatekeeperModes: modes };
-      });
-    } else {
-      if (mode === "optional") {
-        throw new Error(`"${vendorId}" is not an auto-provisioning gatekeeper; use 'enabled' or 'disabled'.`);
-      }
-      await this.#mutateAdminConfig(config => {
-        let disabled = new Set(config.disabledGatekeepers);
-        if (mode === "enabled") disabled.delete(vendorId); else disabled.add(vendorId);
-        return { ...config, disabledGatekeepers: [...disabled] };
-      });
-    }
-  }
 
-  // Admin view of every bound gatekeeper's resource types, annotated with their enabled state.
-  // Unlike the user-facing listGatekeeperVendors, this does NOT hide disabled resources (so admins
-  // can re-enable them). `adminUserId` is forwarded to getSupportedResources() so RBAC-gated
-  // gatekeepers still surface for an admin who has access to them.
+  // Admin view of every bound gatekeeper's resource types, annotated with resource policy state.
+  // Availability is intentionally absent here: appPolicies in OrganizationDirectory is the sole
+  // authority, while this catalog must continue to expose disabled and resource-less vendors.
   async #listResourceConfig(config: AdminConfig, adminUserId: string): Promise<AdminResourceVendor[]> {
-    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let promises = [...this.vendors].map(async ([id, vendor]): Promise<AdminResourceVendor> => {
+      let description;
+      try {
+        description = await vendor.describe();
+      } catch (error) {
+        logger.warn("failed to describe vendor for admin catalog", {
+          event: "gatekeeper.admin.catalog.describe.failed", gatekeeperId: id, error,
+        });
+        return {
+          vendorId: id,
+          displayName: id,
+          autoProvisions: false,
+          resources: [],
+          unavailable: true,
+        };
+      }
 
-    let promises: Promise<AdminResourceVendor | null>[] = [];
-    for (let [id, vendor] of this.vendors) {
-      promises.push((async () => {
-        try {
-          let [description, supportedResources] = await Promise.all([
-            vendor.describe(),
-            vendor.getSupportedResources({ userId: adminUserId }),
-          ]);
-          if (description.autoProvisionsAccount) {
-            // Auto-provisioning ("ambient") gatekeeper: a three-state mode, no resources to toggle.
-            let mode = ambientGatekeeperMode(config, id);
-            return {
-              vendorId: id,
-              displayName: description.displayName,
-              logo: description.logo,
-              autoProvisions: true,
-              ambientMode: mode,
-            };
-          }
-          if (supportedResources.length === 0) {
-            // Nothing to toggle for this gatekeeper.
-            return null;
-          }
-          let disabled = new Set(config.disabledResources[id] ?? []);
-          return {
-            vendorId: id,
-            displayName: description.displayName,
-            logo: description.logo,
-            autoProvisions: false,
-            enabled: !disabledGatekeeperSet.has(id),
-            resources: supportedResources.map(r => ({
-              urlPattern: r.urlPattern,
-              title: r.title,
-              description: r.description,
-              icon: r.icon,
-              enabled: !disabled.has(r.urlPattern),
-            })),
-          };
-        } catch (err) {
-          logger.warn("failed to read resource config for gatekeeper", {
-            event: "gatekeeper.resource.config.read.failed", gatekeeperId: id, error: err,
-          });
-          return null;
-        }
-      })());
-    }
+      if (description.autoProvisionsAccount) {
+        return {
+          vendorId: id,
+          displayName: description.displayName,
+          logo: description.logo,
+          autoProvisions: true,
+          resources: [],
+        };
+      }
 
-    let vendors = (await Promise.all(promises)).filter((v): v is AdminResourceVendor => v !== null);
-    // Show auto-provisioned ("ambient") gatekeepers first; preserve the existing order otherwise.
-    vendors.sort((a, b) => Number(b.autoProvisions) - Number(a.autoProvisions));
+      let supportedResources;
+      try {
+        supportedResources = await vendor.getSupportedResources({userId: adminUserId});
+      } catch (error) {
+        logger.warn("failed to read vendor resources for admin catalog", {
+          event: "gatekeeper.admin.catalog.resources.failed", gatekeeperId: id, error,
+        });
+        return {
+          vendorId: id,
+          displayName: description.displayName,
+          logo: description.logo,
+          autoProvisions: false,
+          resources: [],
+          unavailable: true,
+        };
+      }
+
+      let disabled = new Set(config.disabledResources[id] ?? []);
+      return {
+        vendorId: id,
+        displayName: description.displayName,
+        logo: description.logo,
+        autoProvisions: false,
+        resources: supportedResources.map(resource => ({
+          urlPattern: resource.urlPattern,
+          title: resource.title,
+          description: resource.description,
+          icon: resource.icon,
+          enabled: !disabled.has(resource.urlPattern),
+        })),
+      };
+    });
+    let vendors = await Promise.all(promises);
+    vendors.sort((left, right) => Number(right.autoProvisions) - Number(left.autoProvisions) ||
+        left.vendorId.localeCompare(right.vendorId));
     return vendors;
   }
 }
 
 // Capability for managing deployment-wide admin settings, obtained via
-// AuthenticatedApi.getAdminApi() (which is null for non-admins). The admin access check happens once
-// when the capability is minted in server.ts, so these methods don't re-check. This is a thin
-// validation+forwarding facade over the AdminSettings DO — fully user-independent — so a disabled
-// gatekeeper/resource can't be re-enabled via a crafted request, and the client never receives a
-// stub to the DO's internal methods. Covers branding, agent instructions, signups, and gatekeeper
-// connector/resource availability; authentication config stays env-var driven.
+// AuthenticatedApi.getAdminApi() (which is null for non-admins). Every method rechecks the retained
+// HumanSessionGuard and current Directory role before forwarding. This is a thin facade over the
+// AdminSettings and OrganizationDirectory DOs; the browser never receives their internal stubs.
+// Authentication config stays env-var driven.
 @validateRpc()
 export class AdminApiImpl extends RpcTarget implements AdminApi {
   /**
@@ -771,6 +771,15 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}> {
     await this.#requireAdmin();
     return this.directory.setAppPolicy(this.guard.subject, input);
+  }
+
+  async previewAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+  }): Promise<AppPolicyAudiencePreview> {
+    await this.#requireAdmin();
+    return this.directory.previewAppPolicy(this.guard.subject, input);
   }
 
   async listPendingUserLifecycle(): Promise<PendingUserLifecycle[]> {
@@ -859,13 +868,6 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     return this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
   }
 
-  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
-    await this.#requireAdmin();
-    if (!isAmbientGatekeeperMode(mode)) {
-      throw new Error(`Invalid gatekeeper mode: ${mode}`);
-    }
-    return this.admin.setGatekeeperMode(vendorId, mode);
-  }
 
   async setAnnouncement(text: string): Promise<void> {
     await this.#requireAdmin();

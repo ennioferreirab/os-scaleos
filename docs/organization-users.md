@@ -70,28 +70,51 @@ profile projection, never a password or alternate credential. Confirmed e-mail c
 the contact address. The existing self-service display-name edit is preserved and is not
 overwritten by later logins.
 
-## Management app policy (T05-A)
+## Registered app policy
 
-The directory's `appPolicies` collection is keyed by the exact vendor ID of a registered
-`GATEKEEPER_*` binding. `listAppPolicies()` includes every registered vendor and supplies an
-implicit `disabled` policy with an empty audience and the organization's `createdAt` as its
-deterministic `updatedAt` value when no row exists. `setAppPolicy()` accepts only those IDs,
-normalizes and deduplicates audience user/group IDs into sorted arrays, and validates that every
-referenced directory user and group exists. `enabled` is accepted only for vendors that declare
-`autoProvisionsAccount`; `disabled` and `optional` remain distinct policy modes.
+The directory's `appPolicies` collection is keyed by the exact canonical vendor ID of every
+registered `GATEKEEPER_*` binding, whether or not the vendor exposes a UI. `listAppPolicies()`
+supplies an implicit `disabled` policy with an empty audience and deterministic timestamp when no
+row exists. `setAppPolicy()` accepts only exact registered IDs, canonicalizes the audience, and
+rejects references to missing users or groups. `enabled` is valid only for vendors declaring
+`autoProvisionsAccount`; ordinary OAuth/resource vendors offer `disabled` and `optional`.
 
-`resolveAppAccess(subject, vendorId)` rereads the current directory user, app policy, and T04
-audience membership. It returns the current mode and bounded additive sources; missing, pending,
-disabled, or unknown users and disabled or absent policies deny access, including for administrators.
-Policy changes use the directory's existing atomic mutation receipt, policy version, idempotency, and
-audit mechanisms. No audience IDs are copied into audit events.
+`resolveAppAccess(subject, vendorId)` is the sole policy decision point in central-auth mode. It
+rereads the effective user status, mode, and T04 additive audience on every call. Missing policy,
+disabled app, missing/pending/disabled user, deleted group, or an audience miss denies access,
+including for administrators. The result names all current sources in stable order. Policy writes,
+previews, receipts, versions, and audit events are owned by the directory; audit summaries never
+contain audience IDs.
 
-This first T05 increment applies the resolver only to `AuthenticatedApi.listGatekeeperApps()` and
-`getGatekeeperApp()`: central-auth sessions filter the app catalog and return the existing `null`
-denial for a direct URL before opening an app. Legacy-auth sessions retain their existing behavior.
-It does not alter provisioning, Connections, hooks, capability issuance, or add an administrative UI,
-preview endpoint, or test backdoor. T05 remains incomplete and this increment is not an acceptance
-claim for T05.
+The backend resolves this policy before vendor/account discovery and connection, optional opt-in,
+forced auto-provisioning, account UI or resource-configurator frames, singleton-class issuance,
+resource-class issuance, gatekeeper binding or session use, slash commands, observations/actions,
+and hook admission. `optional` lets only selected users connect or opt into an auto-provisioned
+vendor. `enabled` automatically provisions only selected users and cannot create OAuth credentials
+for anyone. Legacy-auth deployments keep their prior optional behavior and do not consult directory
+policy.
+
+Human management and resource-configurator frames retain a narrow `AppUiAuthority` bound to the
+exact connected account; every retained UI duplicates it and calls `requireAppAccess()` before
+processing an RPC, including validation-only paths.
+Persistent observer verifiers retain a separate attenuated authority bound to the exact Workshop
+user object, connected-account ID, and vendor. Every verifier use re-enters that user object and
+rejects a removed or mismatched account before resolving current directory policy. Workspace
+gatekeepers and hooks persist their trusted owner Subject from the kernel; ambient singleton use
+also rechecks the exact owner account ID recorded when its class was minted. Reconciliation may
+backfill a missing Subject only from an exact matching ambient account owner and matching vendor
+records; conflicting or unattributable legacy rows stay inert. Retained gatekeeper clients, binding
+loopbacks, approval queues, cursor capabilities, hook callbacks, and hook firings recheck current
+policy rather than treating possession as a permanent grant. A disabled app disappears on the next
+catalog/navigation load and direct URL/RPC use denies immediately; bytes already delivered are not
+recalled.
+
+Disabling policy does not revoke or delete an account, collection, gatekeeper record, binding,
+schedule, or hook. Denied accounts remain explicitly disconnectable, pending actions remain
+rejectable, and bindings and hooks remain listable for local cleanup, while operational methods
+stay inert. Re-enabling resumes only for the current audience; removing a direct or group grant is
+never reversed implicitly. The Admin **Gatekeepers** panel exposes the single mode plus
+everyone/user/group audience controls and a server-computed preview with additive sources.
 
 ## Invitations, roles, and lifecycle
 

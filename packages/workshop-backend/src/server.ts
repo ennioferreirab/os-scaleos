@@ -33,7 +33,7 @@ import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { OrganizationDirectoryDurableObject } from "./organization-directory.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
-import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback, TransientStubLoopback } from "./overseer";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
@@ -69,7 +69,7 @@ export { AdminSettings };
 export { OrganizationDirectoryDurableObject };
 
 // Re-export entrypoint types from user.ts.
-export { UserDurableObject, GatekeeperConnectCallbackImpl };
+export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority };
 
 // Re-export entrypoint types from overseer.ts.
 export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
@@ -142,12 +142,17 @@ async function handleDirectoryUserRequest(
 class AppUiAuthorityImpl extends NativeRpcTarget implements AppUiAuthority {
   constructor(
       private requireActiveCallback: () => Promise<void>,
+      private requireAppAccessCallback: () => Promise<void>,
       private isAdminCallback: () => Promise<boolean>) {
     super();
   }
 
   requireActive(): Promise<void> {
     return this.requireActiveCallback();
+  }
+
+  requireAppAccess(): Promise<void> {
+    return this.requireAppAccessCallback();
   }
 
   isAdmin(): Promise<boolean> {
@@ -466,7 +471,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       accountId: number,
       resourceUrlPattern: string) {
     await this.#requireActive();
-    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern);
+    return this.#user.startResourceConfigurator(accountId, resourceUrlPattern, {
+      authority: new AppUiAuthorityImpl(
+          () => this.#requireActive(),
+          async () => {
+            await this.#requireActive();
+            await this.#user.requireOptionalConnectedAccountAccess(accountId);
+          },
+          () => this.#isAdmin()),
+    });
   }
 
   async dismissSharedGadget(gadgetId: string): Promise<void> {
@@ -730,6 +743,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return user.startAccountAppUi(app.accountId, {
       authority: new AppUiAuthorityImpl(
           () => this.#requireActive(),
+          async () => {
+            await this.#requireActive();
+            await user.requireAccountAppUiAccess(app.accountId, id);
+          },
           () => this.#isAdmin()),
     });
   }

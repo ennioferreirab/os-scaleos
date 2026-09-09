@@ -557,9 +557,9 @@ export interface AuthenticatedApi extends RpcTarget {
   listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]>;
 
   /**
-   * Opt into an ambient gatekeeper: mint its connected account for this user (no OAuth flow). Only
-   * works while the vendor's mode is 'optional' (or 'enabled') and the user has no account yet; the
-   * new account then appears via subscribeConnectedAccounts(). Throws otherwise.
+   * Opt into an ambient gatekeeper: mint its connected account for this user (no OAuth flow).
+   * This is available only while the vendor's mode is `optional` and the user has no account yet;
+   * `enabled` is reserved for automatic provisioning.
    */
   provisionAmbientAccount(vendorId: string): Promise<void>;
 
@@ -721,12 +721,12 @@ export interface AuthenticatedApi extends RpcTarget {
   // - Edit permissions on a connected account.
 }
 
-/** Describes a gatekeeper's management app, for the Workshop nav + page. */
+/** Describes a UI-providing gatekeeper app for the Workshop nav and page. */
 export type GatekeeperAppInfo = {
   /**
-   * The vendor id (the GATEKEEPER_<ID> binding suffix, lowercased), used as the URL slug at
-   * /gatekeepers/$id. This is the vendor, not a specific account: it assumes one management-UI
-   * account per vendor per user, which holds for today's auto-provisioned singletons.
+   * Canonical registered vendor ID, used unchanged as the URL segment at `/gatekeepers/$id`.
+   * This is the vendor, not a specific account; current UI-providing accounts are one per vendor
+   * and user.
    */
   id: string;
   /** Title for the nav entry / page header. */
@@ -790,32 +790,22 @@ export type AdminResource = {
 };
 
 /**
- * Provisioning mode for an auto-provisioning ("ambient") gatekeeper — one that mints a connected
- * account with no OAuth flow (VendorDescription.autoProvisionsAccount), e.g. the Context Library:
- *   - 'disabled': not available; no account is provisioned and any existing one is dormant.
- *   - 'optional': users opt in from the Connectors page; not forced on anyone (the default).
- *   - 'enabled':  auto-provisioned for every user (forced); they can't remove it.
- */
-export const AMBIENT_GATEKEEPER_MODES = ['disabled', 'optional', 'enabled'] as const;
-export type AmbientGatekeeperMode = typeof AMBIENT_GATEKEEPER_MODES[number];
-
-export function isAmbientGatekeeperMode(value: unknown): value is AmbientGatekeeperMode {
-  return AMBIENT_GATEKEEPER_MODES.includes(value as AmbientGatekeeperMode);
-}
-
-/**
- * A bound gatekeeper in the admin gatekeeper-config UI, discriminated by `autoProvisions`:
- *   - an ordinary OAuth/resource gatekeeper has a binary `enabled` flag and `resources` to toggle;
- *   - an auto-provisioning ("ambient") gatekeeper has a three-state `ambientMode` and no resources.
+ * A bound gatekeeper vendor in the administrator's catalog.
+ *
+ * The catalog is deliberately independent of availability: every registered vendor remains
+ * editable even when its app policy is absent or disabled.
  */
 export type AdminResourceVendor = {
   vendorId: string;
   displayName: string;
   logo?: AvatarImage;
-} & (
-  | { autoProvisions: false; enabled: boolean; resources: AdminResource[] }
-  | { autoProvisions: true; ambientMode: AmbientGatekeeperMode }
-);
+  /** True when the vendor can mint an account without an OAuth flow. */
+  autoProvisions: boolean;
+  /** Resource-level soft toggles. Empty for an account-only/ambient vendor. */
+  resources: AdminResource[];
+  /** Present when the vendor could not be queried for metadata. */
+  unavailable?: boolean;
+};
 
 /**
  * A connectable third-party service: its vendor id, display metadata, and the resource types it
@@ -994,13 +984,13 @@ export type Audience = {
   groupIds: string[];
 };
 
-/** Availability modes for a registered gatekeeper management app. */
+/** Availability modes for a registered gatekeeper app. */
 export const APP_POLICY_MODES = ['disabled', 'optional', 'enabled'] as const;
 
-/** The deployment-wide availability mode of one registered gatekeeper management app. */
+/** The deployment-wide availability mode of one registered gatekeeper app. */
 export type AppPolicyMode = typeof APP_POLICY_MODES[number];
 
-/** Return whether an unknown value is one of the registered management-app policy modes. */
+/** Return whether an unknown value is one of the registered app-policy modes. */
 export function isAppPolicyMode(value: unknown): value is AppPolicyMode {
   return APP_POLICY_MODES.includes(value as AppPolicyMode);
 }
@@ -1017,7 +1007,7 @@ export type AppPolicy = {
   updatedAt: string;
 };
 
-/** Result of resolving one subject's current access to a registered management app. */
+/** Result of resolving one subject's current access to a registered gatekeeper app. */
 export type AppAccessResult = {
   /** Whether the subject may use the app at this instant. */
   allowed: boolean;
@@ -1042,6 +1032,19 @@ export type DirectoryAudienceTargets = {
     groupId: string;
     /** Current group display name. */
     name: string;
+  }>;
+};
+
+/** Server-computed recipients and additive audience sources for a proposed app policy. */
+export type AppPolicyAudiencePreview = {
+  /** Effective-active users selected by the proposed policy, in stable display order. */
+  users: Array<{
+    /** Verified Subject of the recipient. */
+    userId: string;
+    /** Current directory display name. */
+    displayName: string;
+    /** Additive policy sources that include this user. */
+    sources: string[];
   }>;
 };
 
@@ -1161,6 +1164,13 @@ export interface AdminApi {
     mutationId: string;
   }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}>;
 
+  /** Preview recipients and authoritative sources for a proposed policy without mutating it. */
+  previewAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+  }): Promise<AppPolicyAudiencePreview>;
+
   /** Invite or explicitly admit a central identity as a member. */
   inviteUser(input: {email: string; displayName: string; mutationId: string})
       : Promise<DirectoryInviteResult>;
@@ -1221,14 +1231,6 @@ export interface AdminApi {
    */
   setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void>;
 
-  /**
-   * Set a gatekeeper's availability. For an auto-provisioning ("ambient") gatekeeper, `mode` is the
-   * full three-state (disabled / optional / enabled); for an ordinary gatekeeper only 'disabled' /
-   * 'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a
-   * gadget already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting
-   * it.
-   */
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
 
   /**
    * Set the top-bar notice (centered text in the top navigation bar). Pass "" to clear. Rejects over

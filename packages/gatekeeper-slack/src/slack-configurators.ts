@@ -1,7 +1,9 @@
 import { RpcTarget } from "cloudflare:workers";
+import type { RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { SlackApi } from "./slack-api";
 import type { SlackConversationInfo } from "./types";
+import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   ConversationConfiguratorRpc, ConfiguratorOption,
 } from "./configurator/conversation-configurator-types";
@@ -15,12 +17,19 @@ const PICKER_MAX_OPTIONS = 100;
 
 // Keep the SlackApi (and thus the token getter) off the public RpcTarget surface.
 const apiByTarget = new WeakMap<object, SlackApi>();
+const authorityByTarget = new WeakMap<object, RpcStub<AppUiAuthority>>();
 const teamIdByTarget = new WeakMap<object, string>();
 
 function apiFor(target: object): SlackApi {
   let api = apiByTarget.get(target);
   if (!api) throw new Error("Slack configurator is not initialized.");
   return api;
+}
+
+function authorityFor(target: object): RpcStub<AppUiAuthority> {
+  let authority = authorityByTarget.get(target);
+  if (!authority) throw new Error("Slack configurator is not initialized.");
+  return authority;
 }
 
 function optionMatches(parts: (string | undefined)[], query: string): boolean {
@@ -32,12 +41,18 @@ function optionMatches(parts: (string | undefined)[], query: string): boolean {
 
 @validateRpc()
 export class WorkspaceConfiguratorUI extends RpcTarget implements WorkspaceConfiguratorRpc {
-  constructor(api: SlackApi) {
+  constructor(api: SlackApi, authority: RpcStub<AppUiAuthority>) {
     super();
     apiByTarget.set(this, api);
+    authorityByTarget.set(this, authority);
+  }
+
+  [Symbol.dispose](): void {
+    authorityFor(this)[Symbol.dispose]();
   }
 
   async getWorkspaceUrl(): Promise<string> {
+    await authorityFor(this).requireAppAccess();
     let info = await apiFor(this).getWorkspaceInfo();
     return `https://app.slack.com/client/${info.teamId}`;
   }
@@ -45,26 +60,45 @@ export class WorkspaceConfiguratorUI extends RpcTarget implements WorkspaceConfi
 
 @validateRpc()
 export class ThreadConfiguratorUI extends RpcTarget implements ThreadConfiguratorRpc {
-  async ping(): Promise<void> {}
+  constructor(authority: RpcStub<AppUiAuthority>) {
+    super();
+    authorityByTarget.set(this, authority);
+  }
+
+  [Symbol.dispose](): void {
+    authorityFor(this)[Symbol.dispose]();
+  }
+
+  async ping(): Promise<void> {
+    await authorityFor(this).requireAppAccess();
+  }
 }
 
 @validateRpc()
 export class ConversationConfiguratorUI extends RpcTarget implements ConversationConfiguratorRpc {
-  constructor(api: SlackApi, teamId: string) {
+  constructor(api: SlackApi, teamId: string, authority: RpcStub<AppUiAuthority>) {
     super();
     apiByTarget.set(this, api);
+    authorityByTarget.set(this, authority);
     teamIdByTarget.set(this, teamId);
   }
 
+  [Symbol.dispose](): void {
+    authorityFor(this)[Symbol.dispose]();
+  }
+
   async getTeamId(): Promise<string> {
+    await authorityFor(this).requireAppAccess();
     return teamIdByTarget.get(this) ?? "";
   }
 
   async listConversations(query: string): Promise<ConfiguratorOption[]> {
+    await authorityFor(this).requireAppAccess();
     let api = apiFor(this);
     let items: SlackConversationInfo[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < PICKER_MAX_PAGES; page++) {
+      if (page > 0) await authorityFor(this).requireAppAccess();
       let result = await api.listUserConversations(
           ["public_channel", "private_channel", "im", "mpim"], cursor, PICKER_PAGE_SIZE);
       items.push(...result.items);

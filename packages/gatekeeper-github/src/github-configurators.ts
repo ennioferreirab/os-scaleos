@@ -1,4 +1,4 @@
-import { RpcTarget } from "cloudflare:workers";
+import { RpcStub as NativeRpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import {
   GitHubApi,
@@ -9,6 +9,7 @@ import {
 import type { GitHubIssueConfiguratorRpc } from "./configurator/github-issue-configurator-types";
 import type { GitHubPullRequestConfiguratorRpc } from "./configurator/github-pull-request-configurator-types";
 import type { GitHubRepoConfiguratorRpc } from "./configurator/github-repo-configurator-types";
+import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
 
 type ConfiguratorOption = { value: string; title: string; subtitle?: string; meta?: string };
 
@@ -17,6 +18,7 @@ const GITHUB_OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
 const GITHUB_REPO_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 const githubTokenGetters = new WeakMap<object, () => Promise<string>>();
+const githubAuthorities = new WeakMap<object, NativeRpcStub<AppUiAuthority>>();
 // Per-instance cache of the authenticated user's login. Used to scope `searchRepos` to repos
 // the user can access. Fetched lazily on first need and reused for the configurator's lifetime.
 const githubViewerLogins = new WeakMap<object, Promise<string>>();
@@ -24,7 +26,10 @@ const githubViewerLogins = new WeakMap<object, Promise<string>>();
 function githubApi(target: object): GitHubApi {
   const getToken = githubTokenGetters.get(target);
   if (!getToken) throw new Error("GitHub configurator is not initialized.");
-  return new GitHubApi(getToken);
+  const authority = githubAuthorities.get(target);
+  return new GitHubApi(getToken).withBeforeRequest(
+    () => authority?.requireAppAccess() ?? Promise.resolve(),
+  );
 }
 
 function viewerLogin(target: object): Promise<string> {
@@ -120,12 +125,17 @@ function pullRequestSearchOption(pullRequest: GitHubIssueResponse) {
 // Capability exposed to the configurator iframe.
 @validateRpc()
 export class GitHubRepoConfiguratorUI extends RpcTarget implements GitHubRepoConfiguratorRpc {
-  constructor(getToken: () => Promise<string>) {
+  protected readonly authority: NativeRpcStub<AppUiAuthority>;
+
+  constructor(getToken: () => Promise<string>, authority: NativeRpcStub<AppUiAuthority>) {
     super();
+    this.authority = authority.dup();
     githubTokenGetters.set(this, getToken);
+    githubAuthorities.set(this, this.authority);
   }
 
   async listRepos(query: string): Promise<ConfiguratorOption[]> {
+    await this.authority.requireAppAccess();
     const trimmedQuery = query.trim();
     const api = githubApi(this);
 
@@ -167,11 +177,15 @@ export class GitHubRepoConfiguratorUI extends RpcTarget implements GitHubRepoCon
     return matches.slice(0, AUTOCOMPLETE_OPTION_LIMIT);
   }
 
+  [Symbol.dispose](): void {
+    this.authority[Symbol.dispose]();
+  }
 }
 
 @validateRpc()
 export class GitHubIssueConfiguratorUI extends GitHubRepoConfiguratorUI implements GitHubIssueConfiguratorRpc {
   async listIssues(repoFullName: string | null | undefined, query: string): Promise<ConfiguratorOption[]> {
+    await this.authority.requireAppAccess();
     if (!repoFullName) return [];
 
     const parsed = splitRepoFullName(repoFullName);
@@ -210,12 +224,13 @@ export class GitHubIssueConfiguratorUI extends GitHubRepoConfiguratorUI implemen
 
     return options.slice(0, 100);
   }
-
 }
+
 
 @validateRpc()
 export class GitHubPullRequestConfiguratorUI extends GitHubRepoConfiguratorUI implements GitHubPullRequestConfiguratorRpc {
   async listPullRequests(repoFullName: string | null | undefined, query: string): Promise<ConfiguratorOption[]> {
+    await this.authority.requireAppAccess();
     if (!repoFullName) return [];
 
     const parsed = splitRepoFullName(repoFullName);
@@ -273,5 +288,4 @@ export class GitHubPullRequestConfiguratorUI extends GitHubRepoConfiguratorUI im
 
     return options.slice(0, 100);
   }
-
 }

@@ -436,7 +436,8 @@ export interface AgentHooks {
    * to the chat. The caller is responsible for getting the addition recorded in the chat log (see
    * `addedBindings` on the "changes" message) so the pending edge gets sequence-stamped.
    */
-  addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number): void;
+  addGadgetBinding(
+      gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number): Promise<void>;
 
   /**
    * Prepare (seeding/naming lazily as needed) and return the chat's seed binding layer, including
@@ -2588,7 +2589,7 @@ export async function runAgent(
           // `addedBindings`), which durably records and sequence-stamps the pending edge (see
           // addChatMessages in overseer.ts). Same-step edits share that message, so a revert
           // keeps or discards the step's work as one unit.
-          hooks.addGadgetBinding(gadgetEntry.id, bindingName, sourceEntry.id, chatId);
+          await hooks.addGadgetBinding(gadgetEntry.id, bindingName, sourceEntry.id, chatId);
           pendingAddedBindings.push(
               {gadgetId: gadgetEntry.id, name: bindingName, target: sourceEntry.id});
 
