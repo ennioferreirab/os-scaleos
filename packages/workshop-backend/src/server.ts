@@ -741,7 +741,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async listAudienceTargets(): Promise<DirectoryAudienceTargets> {
     this.guard.assertValid();
-    return this.organizationDirectory.getByName("")
+    return await this.organizationDirectory.getByName("")
         .listAudienceTargets(this.guard.subject);
   }
 

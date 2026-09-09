@@ -15,14 +15,13 @@ import {
   type AppAccessResult,
   type DirectoryAudienceTargets,
   type Group,
-  type GroupMember,
 } from "@gadgets/workshop-shared/api";
 import { collection, createTypedStorage } from "@gadgets/typed-storage";
 import { DurableObject } from "cloudflare:workers";
 import type { GatekeeperVendor } from "@gadgets/workshop-shared/gatekeeper";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { requireSubject, type SupabaseAuthEnv } from "./auth/supabase.js";
-
+import { CentralGroupsClient } from "./central-groups.js";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const GROUP_NAME_MAX_LENGTH = 80;
 
@@ -60,12 +59,10 @@ type DirectoryMutation = {
   key: string;
   mutationId: string;
   actorId: string;
-  operation: "inviteUser" | "setUserRole" | "setUserStatus" |
-    "createGroup" | "renameGroup" | "replaceGroupMembers" | "deleteGroup" | "setAppPolicy";
+  operation: "inviteUser" | "setUserRole" | "setUserStatus" | "setAppPolicy";
   requestHash: string;
   receipt: AdminMutationReceipt;
   user?: DirectoryUser;
-  group?: Group;
   appPolicy?: AppPolicy;
 };
 type StoredAuditEvent = AdminAuditEvent & {storageKey: string};
@@ -84,19 +81,7 @@ function makeDirectoryStorage(storage: DurableObjectStorage) {
         primaryKey: "mutationId",
         uniqueIndexes: {byEmail: (pending: PendingInvite) => pending.email},
       }),
-      groups: collection<Group>()({
-        primaryKey: "groupId",
-        uniqueIndexes: {
-          byName: (group: Group) => group.name.trim().toLocaleLowerCase("pt-BR"),
-        },
-      }),
-      groupMembers: collection<GroupMember>()({
-        primaryKey: "key",
-        nonUniqueIndexes: {
-          byGroup: (member: GroupMember) => member.groupId,
-          byUser: (member: GroupMember) => member.userId,
-        },
-      }),
+
       appPolicies: collection<AppPolicy>()({primaryKey: "vendorId"}),
       mutations: collection<DirectoryMutation>()({primaryKey: "key"}),
       auditEvents: collection<StoredAuditEvent>()({
@@ -151,12 +136,21 @@ function normalizeAudience(value: unknown): Audience {
   return {everyone: record.everyone, userIds, groupIds};
 }
 
-function validateAudience(audience: Audience, storage: DirectoryStorage): void {
+async function validateAudience(
+  audience: Audience,
+  storage: DirectoryStorage,
+  centralGroups: CentralGroupsClient,
+  orgId: string
+): Promise<void> {
   if (audience.userIds.some(userId => !storage.directoryUsers.get(userId))) {
     throw invalidInput("Audience userIds must reference existing users.");
   }
-  if (audience.groupIds.some(groupId => !storage.groups.get(groupId))) {
-    throw invalidInput("Audience groupIds must reference existing groups.");
+  if (audience.groupIds.length > 0) {
+    const existing = await centralGroups.existingGroupIds(orgId, audience.groupIds);
+    const existingSet = new Set(existing);
+    if (audience.groupIds.some(groupId => !existingSet.has(groupId))) {
+      throw invalidInput("Audience groupIds must reference existing groups.");
+    }
   }
 }
 
@@ -364,6 +358,7 @@ function sameEvent(left: AdminAuditEvent, right: AdminAuditEvent): boolean {
 export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: DirectoryStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
+  private centralGroups: CentralGroupsClient;
   private inviteInFlight = new Map<string, {
     actorId: string;
     email: string;
@@ -375,6 +370,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     super(ctx, env);
     this.storage = makeDirectoryStorage(ctx.storage);
     this.vendors = buildGatekeeperVendorMap(env);
+    this.centralGroups = new CentralGroupsClient(env);
   }
 
   #configuredOrgId(): string {
@@ -433,31 +429,25 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     return user;
   }
 
-  #requireGroup(groupId: string): Group {
-    const group = this.storage.groups.get(requireGroupId(groupId));
-    if (!group) throw notFoundError("Directory group was not found.");
-    return group;
-  }
-
-  #groupMemberIds(groupId: string): string[] {
-    return [...this.storage.groupMembers.byGroup.get(groupId)]
-        .map(member => member.userId).toSorted();
-  }
-
-  #sortedGroups(): Group[] {
-    return [...this.storage.groups.list()].toSorted((left, right) => {
-      const byName = left.name.trim().toLocaleLowerCase("pt-BR")
-          .localeCompare(right.name.trim().toLocaleLowerCase("pt-BR"), "pt-BR");
-      return byName || left.groupId.localeCompare(right.groupId, "pt-BR");
-    });
-  }
-
   #hasAnotherActiveAdmin(userId: string): boolean {
     return [...this.storage.directoryUsers.list()].some(candidate =>
       candidate.userId !== userId && candidate.role === "admin" &&
       candidate.status === "active" && !this.storage.pendingLifecycle.get(candidate.userId));
   }
 
+  async #serialize<T>(fn: () => Promise<T>): Promise<T> {
+    let error: unknown;
+    let result: T | undefined;
+    await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        result = await fn();
+      } catch (e) {
+        error = e;
+      }
+    });
+    if (error) throw error;
+    return result as T;
+  }
   #event(actorId: string, resourceId: string,
       action: AdminAuditEvent["action"], reasonCode: AdminAuditEvent["reasonCode"],
       mutationId: string, change: AdminAuditEvent["change"], beforeVersion: number,
@@ -746,34 +736,36 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   async setUserRole(actorId: string,
       input: {userId: string; role: "admin" | "member"; mutationId: string})
       : Promise<AdminMutationReceipt> {
-    actorId = requireSubject(actorId, "actorId");
-    const userId = requireSubject(input.userId);
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const hash = await requestHash({userId, role: input.role});
-    const key = mutationKey(actorId, "setUserRole", mutationId);
-    return this.storage.transaction(() => {
-      this.#requireAdmin(actorId);
-      const replay = this.storage.mutations.get(key);
-      if (replay) {
-        if (replay.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return replay.receipt;
-      }
-      const user = this.#requireActive(userId);
-      if (user.role === input.role) throw createAuthError(AUTH_ERROR_CODES.conflict);
-      if (user.role === "admin" && input.role === "member" && !this.#hasAnotherActiveAdmin(userId)) {
-        throw createAuthError(AUTH_ERROR_CODES.conflict);
-      }
-      const now = new Date().toISOString();
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      this.storage.directoryUsers.put({...user, role: input.role, updatedAt: now});
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "setUserRole", requestHash: hash, receipt,
+    return this.#serialize(async () => {
+      actorId = requireSubject(actorId, "actorId");
+      const userId = requireSubject(input.userId);
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const hash = await requestHash({userId, role: input.role});
+      const key = mutationKey(actorId, "setUserRole", mutationId);
+      return this.storage.transaction(() => {
+        this.#requireAdmin(actorId);
+        const replay = this.storage.mutations.get(key);
+        if (replay) {
+          if (replay.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+          return replay.receipt;
+        }
+        const user = this.#requireActive(userId);
+        if (user.role === input.role) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        if (user.role === "admin" && input.role === "member" && !this.#hasAnotherActiveAdmin(userId)) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        const now = new Date().toISOString();
+        const version = this.#nextVersion();
+        const receipt = this.#receipt(mutationId, now, version.after);
+        this.storage.directoryUsers.put({...user, role: input.role, updatedAt: now});
+        this.storage.mutations.put({
+          key, mutationId, actorId, operation: "setUserRole", requestHash: hash, receipt,
+        });
+        this.#storeEvent(this.#event(actorId, userId, "setUserRole", "DIRECTORY_USER_ROLE_CHANGED",
+            mutationId, {field: "role", before: user.role, after: input.role},
+            version.before, version.after, key));
+        return receipt;
       });
-      this.#storeEvent(this.#event(actorId, userId, "setUserRole", "DIRECTORY_USER_ROLE_CHANGED",
-          mutationId, {field: "role", before: user.role, after: input.role},
-          version.before, version.after, key));
-      return receipt;
     });
   }
 
@@ -781,62 +773,64 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   async setUserStatus(actorId: string,
       input: {userId: string; status: "active" | "disabled"; mutationId: string})
       : Promise<AdminMutationReceipt> {
-    actorId = requireSubject(actorId, "actorId");
-    const userId = requireSubject(input.userId);
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const hash = await requestHash({userId, status: input.status});
-    const key = mutationKey(actorId, "setUserStatus", mutationId);
-    const replay = this.storage.transaction(() => {
-      this.#requireAdmin(actorId);
-      if (actorId === userId && input.status === "disabled") throw selfDisableError();
-      const completed = this.storage.mutations.get(key);
-      const pending = this.storage.pendingLifecycle.get(userId);
-      if (completed) {
-        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return completed.receipt;
-      }
-      const user = this.#requireUser(userId);
-      if (pending) {
-        if (pending.mutationId !== mutationId || pending.actorId !== actorId ||
-            pending.desiredStatus !== input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
-      } else {
-        if (user.status === input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        if (input.status === "disabled" && user.role === "admin" &&
-            !this.#hasAnotherActiveAdmin(userId)) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        this.storage.pendingLifecycle.put({
-          userId, mutationId, actorId, desiredStatus: input.status,
-          startedAt: new Date().toISOString(),
-        });
-      }
-      return undefined;
-    });
-    if (replay) return replay;
-
-    await new SupabaseAdminClient(this.env).setUserBanned(userId, input.status === "disabled");
-    return this.storage.transaction(() => {
-      const completed = this.storage.mutations.get(key);
-      if (completed) {
-        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return completed.receipt;
-      }
-      const pending = this.storage.pendingLifecycle.get(userId);
-      if (!pending || pending.mutationId !== mutationId || pending.desiredStatus !== input.status) {
-        throw createAuthError(AUTH_ERROR_CODES.conflict);
-      }
-      const user = this.#requireUser(userId);
-      const now = new Date().toISOString();
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      this.storage.directoryUsers.put({...user, status: input.status, updatedAt: now});
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "setUserStatus", requestHash: hash, receipt,
+    return this.#serialize(async () => {
+      actorId = requireSubject(actorId, "actorId");
+      const userId = requireSubject(input.userId);
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const hash = await requestHash({userId, status: input.status});
+      const key = mutationKey(actorId, "setUserStatus", mutationId);
+      const replay = this.storage.transaction(() => {
+        this.#requireAdmin(actorId);
+        if (actorId === userId && input.status === "disabled") throw selfDisableError();
+        const completed = this.storage.mutations.get(key);
+        const pending = this.storage.pendingLifecycle.get(userId);
+        if (completed) {
+          if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+          return completed.receipt;
+        }
+        const user = this.#requireUser(userId);
+        if (pending) {
+          if (pending.mutationId !== mutationId || pending.actorId !== actorId ||
+              pending.desiredStatus !== input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        } else {
+          if (user.status === input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
+          if (input.status === "disabled" && user.role === "admin" &&
+              !this.#hasAnotherActiveAdmin(userId)) throw createAuthError(AUTH_ERROR_CODES.conflict);
+          this.storage.pendingLifecycle.put({
+            userId, mutationId, actorId, desiredStatus: input.status,
+            startedAt: new Date().toISOString(),
+          });
+        }
+        return undefined;
       });
-      this.#storeEvent(this.#event(actorId, userId, "setUserStatus",
-          input.status === "active" ? "DIRECTORY_USER_REACTIVATED" : "DIRECTORY_USER_DISABLED",
-          mutationId, {field: "status", before: user.status, after: input.status},
-          version.before, version.after, key));
-      this.storage.pendingLifecycle.delete(userId);
-      return receipt;
+      if (replay) return replay;
+
+      await new SupabaseAdminClient(this.env).setUserBanned(userId, input.status === "disabled");
+      return this.storage.transaction(() => {
+        const completed = this.storage.mutations.get(key);
+        if (completed) {
+          if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+          return completed.receipt;
+        }
+        const pending = this.storage.pendingLifecycle.get(userId);
+        if (!pending || pending.mutationId !== mutationId || pending.desiredStatus !== input.status) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        const user = this.#requireUser(userId);
+        const now = new Date().toISOString();
+        const version = this.#nextVersion();
+        const receipt = this.#receipt(mutationId, now, version.after);
+        this.storage.directoryUsers.put({...user, status: input.status, updatedAt: now});
+        this.storage.mutations.put({
+          key, mutationId, actorId, operation: "setUserStatus", requestHash: hash, receipt,
+        });
+        this.#storeEvent(this.#event(actorId, userId, "setUserStatus",
+            input.status === "active" ? "DIRECTORY_USER_REACTIVATED" : "DIRECTORY_USER_DISABLED",
+            mutationId, {field: "status", before: user.status, after: input.status},
+            version.before, version.after, key));
+        this.storage.pendingLifecycle.delete(userId);
+        return receipt;
+      });
     });
   }
 
@@ -946,7 +940,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       }
       return {policy: replay.appPolicy, receipt: replay.receipt};
     }
-    validateAudience(audience, this.storage);
+    await validateAudience(audience, this.storage, this.centralGroups, this.#identity().orgId);
     if (mode === "enabled" && !(await this.#isAutoProvisioningVendor(vendorId))) {
       throw invalidInput("Only auto-provisioning gatekeepers may use enabled mode.");
     }
@@ -962,7 +956,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       }
       const current = this.storage.appPolicies.get(vendorId) ??
         defaultAppPolicy(vendorId, identity.createdAt);
-      validateAudience(audience, this.storage);
+
       const now = new Date().toISOString();
       const policy: AppPolicy = {vendorId, mode, audience, updatedAt: now};
       const version = this.#nextVersion();
@@ -990,23 +984,45 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     audience: Audience;
   }): Promise<AppPolicyAudiencePreview> {
     actorId = requireSubject(actorId, "actorId");
-    this.#identity();
+    const identity = this.#identity();
     this.#requireAdmin(actorId);
     const vendorId = this.#requireRegisteredVendor(input.vendorId);
     if (!isAppPolicyMode(input.mode)) throw invalidInput("Invalid app policy mode.");
     const audience = normalizeAudience(input.audience);
-    validateAudience(audience, this.storage);
+    await validateAudience(audience, this.storage, this.centralGroups, identity.orgId);
     if (input.mode === "enabled" && !(await this.#isAutoProvisioningVendor(vendorId))) {
       throw invalidInput("Only auto-provisioning gatekeepers may use enabled mode.");
     }
     if (input.mode === "disabled") return {users: []};
 
-    const users = [...this.storage.directoryUsers.list()]
-        .filter(user => this.#effectiveStatus(user) === "active")
+    const activeUsers = [...this.storage.directoryUsers.list()]
+        .filter(user => this.#effectiveStatus(user) === "active");
+    const candidateGroupIds = [...new Set(audience.groupIds.filter(g => typeof g === "string"))].toSorted();
+    const groupMembersMap = new Map<string, Set<string>>();
+    if (candidateGroupIds.length > 0) {
+      const pairs = await this.centralGroups.getGroupsMembers(identity.orgId, candidateGroupIds);
+      for (const pair of pairs) {
+        let set = groupMembersMap.get(pair.groupId);
+        if (!set) {
+          set = new Set();
+          groupMembersMap.set(pair.groupId, set);
+        }
+        set.add(pair.userId);
+      }
+    }
+
+    const users = activeUsers
         .map(user => {
-          const access = this.resolveAudience(user.userId, audience);
-          return access.allowed
-            ? {userId: user.userId, displayName: user.displayName, sources: access.sources}
+          const sources: string[] = [];
+          if (audience.everyone) sources.push("everyone");
+          if (audience.userIds.includes(user.userId)) sources.push(`user:${user.userId}`);
+          for (const groupId of candidateGroupIds) {
+            if (groupMembersMap.get(groupId)?.has(user.userId)) {
+              sources.push(`group:${groupId}`);
+            }
+          }
+          return sources.length > 0
+            ? {userId: user.userId, displayName: user.displayName, sources}
             : null;
         })
         .filter((user): user is NonNullable<typeof user> => user !== null)
@@ -1017,24 +1033,23 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   }
 
   /** List groups after rechecking the requesting administrator in this directory invocation. */
-  listGroups(actorId: string): Group[] {
+  async listGroups(actorId: string): Promise<Group[]> {
     this.#identity();
     this.#requireAdmin(actorId);
-    return this.#sortedGroups();
+    return await this.centralGroups.listGroups(this.#configuredOrgId());
   }
 
   /** Return group member Subjects after rechecking the administrator in this invocation. */
-  getGroupMembers(actorId: string, groupId: string): string[] {
+  async getGroupMembers(actorId: string, groupId: string): Promise<string[]> {
     this.#identity();
     this.#requireAdmin(actorId);
     const normalizedGroupId = requireGroupId(groupId);
-    this.#requireGroup(normalizedGroupId);
-    return this.#groupMemberIds(normalizedGroupId);
+    return await this.centralGroups.getGroupMembers(this.#configuredOrgId(), normalizedGroupId);
   }
 
   /** Return only active-user names and live-group names to an authenticated audience picker. */
-  listAudienceTargets(actorId: string): DirectoryAudienceTargets {
-    this.#identity();
+  async listAudienceTargets(actorId: string): Promise<DirectoryAudienceTargets> {
+    const identity = this.#identity();
     this.#requireActive(actorId);
     const users = [...this.storage.directoryUsers.list()]
         .filter(user => this.#effectiveStatus(user) === "active")
@@ -1043,143 +1058,89 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
           const byName = left.displayName.localeCompare(right.displayName, "pt-BR");
           return byName || left.userId.localeCompare(right.userId, "pt-BR");
         });
-    const groups = this.#sortedGroups()
+    const centralGroups = await this.centralGroups.listGroups(identity.orgId);
+    const groups = centralGroups
         .map(group => ({groupId: group.groupId, name: group.name}));
     return {users, groups};
   }
 
-  /** Create a group, its receipt, and its local audit event in one directory transaction. */
+  /** Create a group and its receipt atomically via central storage. */
   async createGroup(actorId: string, input: {name: string; mutationId: string})
       : Promise<{group: Group; receipt: AdminMutationReceipt}> {
-    actorId = requireSubject(actorId, "actorId");
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const name = normalizeGroupName(input.name);
-    const hash = await requestHash({name: name.display});
-    const key = mutationKey(actorId, "createGroup", mutationId);
-    return this.storage.transaction(() => {
+    return this.#serialize(async () => {
+      this.#identity();
       this.#requireAdmin(actorId);
-      const completed = this.storage.mutations.get(key);
-      if (completed) {
-        if (completed.requestHash !== hash || !completed.group) {
-          throw createAuthError(AUTH_ERROR_CODES.conflict);
-        }
-        return {group: completed.group, receipt: completed.receipt};
-      }
-      if (this.storage.groups.byName.get(name.index)) {
-        throw createAuthError(AUTH_ERROR_CODES.conflict);
-      }
-      const now = new Date().toISOString();
-      const group: Group = {
-        groupId: crypto.randomUUID(),
-        name: name.display,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      const event = this.#event(actorId, group.groupId, "createGroup", "DIRECTORY_GROUP_CREATED",
-          mutationId, {field: "name", before: null, after: group.name}, version.before,
-          version.after, key, undefined, "directoryGroup");
-      this.storage.groups.put(group);
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "createGroup", requestHash: hash, receipt, group,
-      });
-      this.#storeEvent(event);
-      return {group, receipt};
+      actorId = requireSubject(actorId, "actorId");
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const name = normalizeGroupName(input.name);
+      const hash = await requestHash({name: name.display});
+      const result = await this.centralGroups.applyGroupMutation(
+        this.#configuredOrgId(),
+        actorId,
+        "createGroup",
+        mutationId,
+        hash,
+        {name: name.display, nameKey: name.index}
+      );
+      this.#requireAdmin(actorId);
+      return result;
     });
   }
 
-  /** Rename a group while preserving its id and membership atomically. */
   async renameGroup(actorId: string,
       input: {groupId: string; name: string; mutationId: string}): Promise<AdminMutationReceipt> {
-    actorId = requireSubject(actorId, "actorId");
-    const groupId = requireGroupId(input.groupId);
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const name = normalizeGroupName(input.name);
-    const hash = await requestHash({groupId, name: name.display});
-    const key = mutationKey(actorId, "renameGroup", mutationId);
-    return this.storage.transaction(() => {
+    return this.#serialize(async () => {
+      this.#identity();
       this.#requireAdmin(actorId);
-      const completed = this.storage.mutations.get(key);
-      if (completed) {
-        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return completed.receipt;
-      }
-      const group = this.#requireGroup(groupId);
-      const existing = this.storage.groups.byName.get(name.index);
-      if (existing && existing.groupId !== groupId) {
-        throw createAuthError(AUTH_ERROR_CODES.conflict);
-      }
-      const now = new Date().toISOString();
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      const event = this.#event(actorId, groupId, "renameGroup", "DIRECTORY_GROUP_RENAMED",
-          mutationId, {field: "name", before: group.name, after: name.display}, version.before,
-          version.after, key, undefined, "directoryGroup");
-      this.storage.groups.put({...group, name: name.display, updatedAt: now});
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "renameGroup", requestHash: hash, receipt,
-      });
-      this.#storeEvent(event);
+      actorId = requireSubject(actorId, "actorId");
+      const groupId = requireGroupId(input.groupId);
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const name = normalizeGroupName(input.name);
+      const hash = await requestHash({groupId, name: name.display});
+      const receipt = await this.centralGroups.applyGroupMutation(
+        this.#configuredOrgId(),
+        actorId,
+        "renameGroup",
+        mutationId,
+        hash,
+        {groupId, name: name.display, nameKey: name.index}
+      );
+      this.#requireAdmin(actorId);
       return receipt;
     });
   }
 
-  /** Replace the complete group member set in one transaction, validating every new member first. */
+  /** Replace the complete group member set atomically, validating new members first. */
   async replaceGroupMembers(actorId: string,
       input: {groupId: string; userIds: string[]; mutationId: string})
       : Promise<AdminMutationReceipt> {
-    actorId = requireSubject(actorId, "actorId");
-    const groupId = requireGroupId(input.groupId);
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const userIds = normalizeMemberIds(input.userIds);
-    const hash = await requestHash({groupId, userIds});
-    const key = mutationKey(actorId, "replaceGroupMembers", mutationId);
-    return this.storage.transaction(() => {
+    return this.#serialize(async () => {
+      this.#identity();
       this.#requireAdmin(actorId);
-      const completed = this.storage.mutations.get(key);
-      if (completed) {
-        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return completed.receipt;
-      }
-      this.#requireGroup(groupId);
-      const before = this.#groupMemberIds(groupId);
-      const beforeSet = new Set(before);
+      actorId = requireSubject(actorId, "actorId");
+      const groupId = requireGroupId(input.groupId);
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const userIds = normalizeMemberIds(input.userIds);
+      const hash = await requestHash({groupId, userIds});
+      const currentMembers = await this.centralGroups.getGroupMembers(this.#configuredOrgId(), groupId);
+      const currentMemberSet = new Set(currentMembers);
       for (const userId of userIds) {
         const user = this.storage.directoryUsers.get(userId);
-        if (!user || (!beforeSet.has(userId) && this.#effectiveStatus(user) !== "active")) {
+        if (!user || (!currentMemberSet.has(userId) && this.#effectiveStatus(user) !== "active")) {
           throw Object.assign(new TypeError("Group members must be existing active users."), {
             code: AUTH_ERROR_CODES.invalidInput,
           });
         }
       }
-      const nextSet = new Set(userIds);
-      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
-      for (const member of members) {
-        if (!nextSet.has(member.userId)) this.storage.groupMembers.delete(member.key);
-      }
-      const now = new Date().toISOString();
-      for (const userId of userIds) {
-        if (!beforeSet.has(userId)) {
-          this.storage.groupMembers.put({
-            key: `${groupId}:${userId}`,
-            groupId,
-            userId,
-          });
-        }
-      }
-      const group = this.#requireGroup(groupId);
-      this.storage.groups.put({...group, updatedAt: now});
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      const event = this.#event(actorId, groupId, "replaceGroupMembers",
-          "DIRECTORY_GROUP_MEMBERS_CHANGED", mutationId,
-          {field: "members", before: String(before.length), after: String(userIds.length)},
-          version.before, version.after, key, undefined, "directoryGroup");
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "replaceGroupMembers", requestHash: hash, receipt,
-      });
-      this.#storeEvent(event);
+      const receipt = await this.centralGroups.applyGroupMutation(
+        this.#configuredOrgId(),
+        actorId,
+        "replaceGroupMembers",
+        mutationId,
+        hash,
+        {groupId, userIds}
+      );
+      this.#requireAdmin(actorId);
       return receipt;
     });
   }
@@ -1187,59 +1148,59 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   /** Delete a group and its membership rows atomically; audience references then grant nothing. */
   async deleteGroup(actorId: string,
       input: {groupId: string; mutationId: string}): Promise<AdminMutationReceipt> {
-    actorId = requireSubject(actorId, "actorId");
-    const groupId = requireGroupId(input.groupId);
-    const mutationId = requireSubject(input.mutationId, "mutationId");
-    const hash = await requestHash({groupId});
-    const key = mutationKey(actorId, "deleteGroup", mutationId);
-    return this.storage.transaction(() => {
+    return this.#serialize(async () => {
+      this.#identity();
       this.#requireAdmin(actorId);
-      const completed = this.storage.mutations.get(key);
-      if (completed) {
-        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
-        return completed.receipt;
-      }
-      const group = this.#requireGroup(groupId);
-      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
-      for (const member of members) {
-        this.storage.groupMembers.delete(member.key);
-      }
-      this.storage.groups.delete(groupId);
-      const now = new Date().toISOString();
-      const version = this.#nextVersion();
-      const receipt = this.#receipt(mutationId, now, version.after);
-      const event = this.#event(actorId, groupId, "deleteGroup", "DIRECTORY_GROUP_DELETED",
-          mutationId, {field: "name", before: group.name, after: null}, version.before,
-          version.after, key, undefined, "directoryGroup");
-      this.storage.mutations.put({
-        key, mutationId, actorId, operation: "deleteGroup", requestHash: hash, receipt,
-      });
-      this.#storeEvent(event);
+      actorId = requireSubject(actorId, "actorId");
+      const groupId = requireGroupId(input.groupId);
+      const mutationId = requireSubject(input.mutationId, "mutationId");
+      const hash = await requestHash({groupId});
+      const receipt = await this.centralGroups.applyGroupMutation(
+        this.#configuredOrgId(),
+        actorId,
+        "deleteGroup",
+        mutationId,
+        hash,
+        {groupId}
+      );
+      this.#requireAdmin(actorId);
       return receipt;
     });
   }
 
-  /** Resolve an audience from current directory state without caching or external I/O. */
-  resolveAudience(subject: string, audience: Audience): {allowed: boolean; sources: string[]} {
-    this.#identity();
+  /** Resolve an audience from current directory state and central groups. */
+  async resolveAudience(subject: string, audience: Audience): Promise<{allowed: boolean; sources: string[]}> {
+    const identity = this.#identity();
     subject = requireSubject(subject);
     const user = this.storage.directoryUsers.get(subject);
     if (!user || this.#effectiveStatus(user) !== "active") return {allowed: false, sources: []};
 
-    const sources: string[] = [];
-    if (audience.everyone) sources.push("everyone");
-    if (audience.userIds.includes(subject)) sources.push(`user:${subject}`);
-    const groupIds = [...new Set(audience.groupIds.filter(groupId => typeof groupId === "string"))]
-        .toSorted();
-    for (const groupId of groupIds) {
-      if (!this.storage.groups.get(groupId)) continue;
-      if (this.storage.groupMembers.get(`${groupId}:${subject}`)) sources.push(`group:${groupId}`);
+    const directSources: string[] = [];
+    if (audience.everyone) directSources.push("everyone");
+    if (audience.userIds.includes(subject)) directSources.push(`user:${subject}`);
+
+    const candidateGroupIds = [...new Set(audience.groupIds.filter(g => typeof g === "string"))].toSorted();
+    if (candidateGroupIds.length === 0) {
+      return {allowed: directSources.length > 0, sources: directSources};
     }
-    return {allowed: sources.length > 0, sources};
+
+    if (directSources.length > 0) {
+      try {
+        const matched = await this.centralGroups.resolveGroupMemberships(identity.orgId, subject, candidateGroupIds);
+        const groupSources = matched.toSorted().map(id => `group:${id}`);
+        return {allowed: true, sources: [...directSources, ...groupSources]};
+      } catch {
+        return {allowed: true, sources: directSources};
+      }
+    }
+
+    const matched = await this.centralGroups.resolveGroupMemberships(identity.orgId, subject, candidateGroupIds);
+    const groupSources = matched.toSorted().map(id => `group:${id}`);
+    return {allowed: groupSources.length > 0, sources: groupSources};
   }
 
   /** Resolve one subject's current access to a registered app from its policy and audience. */
-  resolveAppAccess(subject: string, vendorId: string): AppAccessResult {
+  async resolveAppAccess(subject: string, vendorId: string): Promise<AppAccessResult> {
     this.#identity();
     subject = requireSubject(subject);
     const policy = typeof vendorId === "string" && this.vendors.has(vendorId)
@@ -1247,7 +1208,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       : undefined;
     const mode: AppPolicyMode = policy && isAppPolicyMode(policy.mode) ? policy.mode : "disabled";
     if (!policy || mode === "disabled") return {allowed: false, mode, sources: []};
-    const audience = this.resolveAudience(subject, policy.audience);
+    const audience = await this.resolveAudience(subject, policy.audience);
     return {allowed: audience.allowed, mode, sources: audience.sources};
   }
 
@@ -1285,11 +1246,20 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
   }
 
   /** Return newest audit events for the configured organization. */
-  listAdminAuditEvents(orgId: string, limit: number): AdminAuditEvent[] {
+  async listAdminAuditEvents(orgId: string, limit?: number): Promise<AdminAuditEvent[]> {
     if (orgId !== this.#identity().orgId) throw createAuthError(AUTH_ERROR_CODES.forbidden);
-    return [...this.storage.auditEvents.list({reverse: true, limit})].map(stored => {
-      const {storageKey: _storageKey, ...event} = stored;
-      return event;
+    const effectiveLimit = Math.min(Math.max(Number.isInteger(limit) ? (limit as number) : 50, 1), 200);
+
+    const sqlGroupEvents = await this.centralGroups.listGroupAuditEvents(orgId, effectiveLimit);
+    const localEvents = [...this.storage.auditEvents.list({reverse: true, limit: effectiveLimit})]
+      .map(({storageKey: _, ...event}) => event);
+
+    const combined = [...sqlGroupEvents, ...localEvents].toSorted((left, right) => {
+      const byTime = right.occurredAt.localeCompare(left.occurredAt);
+      if (byTime !== 0) return byTime;
+      return right.eventId.localeCompare(left.eventId);
     });
+
+    return combined.slice(0, effectiveLimit);
   }
 }

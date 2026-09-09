@@ -173,6 +173,103 @@ administration endpoint and Vault must not use it as continuous human-session au
 
 See [admin-audit.md](admin-audit.md) for audit fields and retention.
 
+## Central directory groups
+
+Central directory groups, memberships, mutation receipts, and group audit events are housed in the
+`scaleos_directory` schema within the central PostgreSQL database. This moves group authority from
+local Durable Objects into shared, consistent SQL structures across OS and Vault.
+
+### Data model
+
+The `scaleos_directory` schema defines six tables with mandatory organization scoping:
+
+- `groups (org_id, group_id, name, name_key, revision, created_at, updated_at)`:
+  Authoritative group entity. `group_id` is an immutable UUID; `name` is trimmed and validated
+  between 1 and 80 characters; `name_key` enforces unique names per organization via `lower(name)`
+  normalized by the caller; `revision` starts at 1 and increments on each rename or membership replacement.
+- `group_members (org_id, group_id, user_id)`:
+  Group-to-user membership rows with composite primary key `(org_id, group_id, user_id)`.
+  Foreign key `(org_id, group_id)` cascades on group deletion; `user_id` references `auth.users(id)`
+  with `ON DELETE RESTRICT`. Indexed by `(org_id, user_id, group_id)`.
+- `group_versions (org_id, version)`:
+  Monotonic version counter per organization, starting at 0 and incremented under advisory and row
+  locks on every newly committed mutation. It represents an opaque domain version, not a global lease.
+- `group_mutations (org_id, actor_id, operation, mutation_id, request_hash, result, created_at)`:
+  Idempotent mutation journal with primary key `(org_id, actor_id, operation, mutation_id)`.
+  Stores the SHA-256 request hash and public result (`Group` + receipt or receipt alone).
+- `group_audit_events (org_id, event_id, event, timestamp)`:
+  Durable local audit events adhering to the `AdminAuditEvent` schema. New group events are committed
+  atomically with their mutation.
+- `reader_bindings (login_role, org_id)`:
+  Maps a database login role (such as `vault_app`) to its assigned organization ID. Only explicit
+  provisioning writes to this table; it is immutable at runtime.
+
+### APIs and interfaces
+
+The schema is accessed via PostgREST RPC using HTTP headers `Content-Profile: scaleos_directory`
+and `Accept-Profile: scaleos_directory`, called over PostgREST with short timeouts (3s):
+
+- Backend OS functions (`service_role`):
+  - `list_groups(p_org_id)`: Returns all groups for the organization ordered by `name_key` and `group_id`.
+  - `get_group_members(p_org_id, p_group_id)`: Returns member UUID array; raises `NOT_FOUND` if missing.
+  - `get_groups_members(p_org_id, p_group_ids)`: Returns group-to-member `{groupId, userId}` mappings for candidate groups in one batch.
+  - `resolve_group_memberships(p_org_id, p_subject, p_group_ids)`: Resolves existing group memberships for a subject.
+  - `existing_group_ids(p_org_id, p_group_ids)`: Returns the subset of candidate group IDs existing in the organization.
+  - `list_group_audit_events(p_org_id, p_limit)`: Returns newest audit events (limit clamped 1..200, default 50).
+  - `apply_group_mutation(p_org_id, p_actor_id, p_operation, p_mutation_id, p_request_hash, p_payload)`:
+    Executes group mutations (`createGroup`, `renameGroup`, `replaceGroupMembers`, `deleteGroup`)
+    atomically with replay detection, version clock increment, receipt generation, and audit event logging.
+- Vault reader functions (`vault_app`):
+  - `get_reader_binding()`: Returns `{orgId}` derived solely from `reader_bindings` for `session_user`.
+  - `list_invitable_groups()`: Lists groups with active member count for the caller's bound organization.
+  - `get_group_invitation_snapshot(p_group_id)`: Returns `{groupId, name, revision, members: [{userId, email, displayName}]}`
+    for an invitable group in the bound organization. Display names are derived from user metadata with fallback to email.
+
+### OS Backend Integration (#29)
+
+The OS integrates central directory groups through the private `CentralGroupsClient` over
+PostgREST RPC (`AUTH_PUBLIC_URL/rest/v1/rpc`) using backend `apikey` and `Bearer` `SUPABASE_SECRET_KEY`,
+with 3-second timeouts and strict response validation:
+
+- **Directory facade**: `OrganizationDirectoryDurableObject` acts as the facade for users, admissions,
+  and app policies. Operational `groups` and `groupMembers` collections are cut from local Durable
+  Object storage. Group entities, memberships, mutation receipts, and audit records reside in SQL.
+- **Serialized authority and mutations**: Group mutations (`createGroup`, `renameGroup`,
+  `replaceGroupMembers`, `deleteGroup`) are serialized using `this.ctx.blockConcurrencyWhile`
+  in the same queue as `setUserRole` and `setUserStatus`, preventing role/status interleaving
+  during remote I/O. Session guards and active-admin privileges are validated before prepare
+  and re-validated after SQL completion before returning success. Retries reuse the same `mutationId`
+  and receipt.
+- **Membership replacement**: `replaceGroupMembers` preserves the rule that new members must be
+  active directory users, while existing members who became disabled may remain.
+- **Batch audience resolution**: `resolveAudience` and `resolveAppAccess` resolve memberships
+  asynchronously. Missing, pending, or disabled local users are denied immediately. When group
+  membership is required, candidate groups are evaluated in a single batch RPC via
+  `resolve_group_memberships`. Direct access (`everyone`, `user:<subject>`) remains additive;
+  remote SQL failures never concede access by group and do not invalidate valid direct access.
+- **Policy preview**: `previewAppPolicy` evaluates audience recipients in a single batch without
+  per-user HTTP queries and without mapping promises as objects.
+- **Combined audit log**: `listAdminAuditEvents` combines SQL group audit events with local
+  domain events, ordered by timestamp and eventId descending, enforcing the limit. Remote SQL
+  errors are explicit (`DEPENDENCY_UNAVAILABLE`) rather than silently dropped.
+
+### Permissions and provisioning
+- `service_role`: Trusted OS backend privilege with full schema USAGE, table DML, and function EXECUTE.
+- `vault_app`: Read-only Vault login role with schema USAGE and EXECUTE restricted to `get_reader_binding`,
+  `list_invitable_groups`, and `get_group_invitation_snapshot`. No direct table privileges, no DML,
+  and no direct access to `auth.users`.
+- `PUBLIC`, `anon`, `authenticated`: Explicitly revoked of all privileges on schema, tables, and functions.
+- Provisioning is managed by `packages/workshop-backend/sql/scaleos-directory/provision.sql`, which
+  requires explicit `TARGET_ORG_ID` and aborts via `RAISE EXCEPTION` if omitted. It configures the
+  `vault_app` binding without remapping existing organizations and verifies role separation.
+
+### Scope and limits
+
+Issue #28 introduces the central SQL schema, functions, and provisioning without data migration
+from legacy Durable Objects. The central directory starts empty with clock 0. Dual-mode fallback,
+legacy receipt imports, and cross-organization access are strictly prohibited.
+The central directory schema, functions, and reader bindings remain unprovisioned in the live acceptance database.
+
 ## Verified scope and limits
 
 On 2026-09-08 the containerized development stack demonstrated the real OS flow: central Supabase
