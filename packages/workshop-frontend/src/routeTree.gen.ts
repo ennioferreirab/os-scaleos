@@ -20,6 +20,11 @@ import { Route as ProfileRouteImport } from './routes/profile'
 import { Route as ProvidersRouteImport } from './routes/providers'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as WorkspacesRouteImport } from './routes/workspaces'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
+import { Route as AuthCentralRouteImport } from './routes/auth.central'
+import { Route as AuthConsentRouteImport } from './routes/auth.consent'
+import { Route as AuthLogoutRouteImport } from './routes/auth.logout'
+import { Route as AuthRecoveryRouteImport } from './routes/auth.recovery'
 import { Route as BlueprintIdRouteImport } from './routes/blueprint.$id'
 import { Route as GadgetIdRouteImport } from './routes/gadget.$id'
 import { Route as GatekeepersAppIdRouteImport } from './routes/gatekeepers_.$appId'
@@ -80,6 +85,31 @@ const WorkspacesRoute = WorkspacesRouteImport.update({
   path: '/workspaces',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/auth/callback',
+  path: '/auth/callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthCentralRoute = AuthCentralRouteImport.update({
+  id: '/auth/central',
+  path: '/auth/central',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthConsentRoute = AuthConsentRouteImport.update({
+  id: '/auth/consent',
+  path: '/auth/consent',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthLogoutRoute = AuthLogoutRouteImport.update({
+  id: '/auth/logout',
+  path: '/auth/logout',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthRecoveryRoute = AuthRecoveryRouteImport.update({
+  id: '/auth/recovery',
+  path: '/auth/recovery',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const BlueprintIdRoute = BlueprintIdRouteImport.update({
   id: '/blueprint/$id',
   path: '/blueprint/$id',
@@ -113,6 +143,11 @@ export interface FileRoutesByFullPath {
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
   '/workspaces': typeof WorkspacesRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/auth/central': typeof AuthCentralRoute
+  '/auth/consent': typeof AuthConsentRoute
+  '/auth/logout': typeof AuthLogoutRoute
+  '/auth/recovery': typeof AuthRecoveryRoute
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
@@ -130,6 +165,11 @@ export interface FileRoutesByTo {
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
   '/workspaces': typeof WorkspacesRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/auth/central': typeof AuthCentralRoute
+  '/auth/consent': typeof AuthConsentRoute
+  '/auth/logout': typeof AuthLogoutRoute
+  '/auth/recovery': typeof AuthRecoveryRoute
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
@@ -148,6 +188,11 @@ export interface FileRoutesById {
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
   '/workspaces': typeof WorkspacesRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/auth/central': typeof AuthCentralRoute
+  '/auth/consent': typeof AuthConsentRoute
+  '/auth/logout': typeof AuthLogoutRoute
+  '/auth/recovery': typeof AuthRecoveryRoute
   '/blueprint/$id': typeof BlueprintIdRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers_/$appId': typeof GatekeepersAppIdRoute
@@ -167,6 +212,11 @@ export interface FileRouteTypes {
     | '/providers'
     | '/signup'
     | '/workspaces'
+    | '/auth/callback'
+    | '/auth/central'
+    | '/auth/consent'
+    | '/auth/logout'
+    | '/auth/recovery'
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
@@ -184,6 +234,11 @@ export interface FileRouteTypes {
     | '/providers'
     | '/signup'
     | '/workspaces'
+    | '/auth/callback'
+    | '/auth/central'
+    | '/auth/consent'
+    | '/auth/logout'
+    | '/auth/recovery'
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
@@ -201,6 +256,11 @@ export interface FileRouteTypes {
     | '/providers'
     | '/signup'
     | '/workspaces'
+    | '/auth/callback'
+    | '/auth/central'
+    | '/auth/consent'
+    | '/auth/logout'
+    | '/auth/recovery'
     | '/blueprint/$id'
     | '/gadget/$id'
     | '/gatekeepers_/$appId'
@@ -219,6 +279,11 @@ export interface RootRouteChildren {
   ProvidersRoute: typeof ProvidersRoute
   SignupRoute: typeof SignupRoute
   WorkspacesRoute: typeof WorkspacesRoute
+  AuthCallbackRoute: typeof AuthCallbackRoute
+  AuthCentralRoute: typeof AuthCentralRoute
+  AuthConsentRoute: typeof AuthConsentRoute
+  AuthLogoutRoute: typeof AuthLogoutRoute
+  AuthRecoveryRoute: typeof AuthRecoveryRoute
   BlueprintIdRoute: typeof BlueprintIdRoute
   GadgetIdRoute: typeof GadgetIdRoute
   GatekeepersAppIdRoute: typeof GatekeepersAppIdRoute
@@ -304,6 +369,41 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WorkspacesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/auth/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/central': {
+      id: '/auth/central'
+      path: '/auth/central'
+      fullPath: '/auth/central'
+      preLoaderRoute: typeof AuthCentralRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/consent': {
+      id: '/auth/consent'
+      path: '/auth/consent'
+      fullPath: '/auth/consent'
+      preLoaderRoute: typeof AuthConsentRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/logout': {
+      id: '/auth/logout'
+      path: '/auth/logout'
+      fullPath: '/auth/logout'
+      preLoaderRoute: typeof AuthLogoutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/recovery': {
+      id: '/auth/recovery'
+      path: '/auth/recovery'
+      fullPath: '/auth/recovery'
+      preLoaderRoute: typeof AuthRecoveryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/blueprint/$id': {
       id: '/blueprint/$id'
       path: '/blueprint/$id'
@@ -347,6 +447,11 @@ const rootRouteChildren: RootRouteChildren = {
   ProvidersRoute: ProvidersRoute,
   SignupRoute: SignupRoute,
   WorkspacesRoute: WorkspacesRoute,
+  AuthCallbackRoute: AuthCallbackRoute,
+  AuthCentralRoute: AuthCentralRoute,
+  AuthConsentRoute: AuthConsentRoute,
+  AuthLogoutRoute: AuthLogoutRoute,
+  AuthRecoveryRoute: AuthRecoveryRoute,
   BlueprintIdRoute: BlueprintIdRoute,
   GadgetIdRoute: GadgetIdRoute,
   GatekeepersAppIdRoute: GatekeepersAppIdRoute,

@@ -2,9 +2,7 @@ import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
 import { useState, useEffect, useRef } from 'react'
 import { AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
-import { hashPassword } from './passwordHash'
-import { CF_ACCESS_MODE } from './useAuth'
-import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash } from '@phosphor-icons/react'
+import { User, Pencil, Check, X, Camera, Copy } from '@phosphor-icons/react'
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import UsageSettings from './components/billing/UsageSettings'
@@ -37,64 +35,6 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
   )
 }
 
-// On-language password field: same input/focus treatment as the rest of the app, with an inline
-// show/hide toggle (replacing Kumo's SensitiveInput, which read as dated against the new look).
-function PasswordField({
-  label,
-  value,
-  onChange,
-  placeholder,
-  description,
-  error,
-  autoComplete,
-  showPasswordLabel,
-  hidePasswordLabel,
-}: {
-  label: string
-  value: string
-  onChange: (v: string) => void
-  placeholder?: string
-  description?: string
-  error?: string | null
-  autoComplete?: string
-  showPasswordLabel: string
-  hidePasswordLabel: string
-}) {
-  const [show, setShow] = useState(false)
-  return (
-    <div>
-      <FieldLabel>{label}</FieldLabel>
-      <div className="relative mt-1.5">
-        <input
-          type={show ? 'text' : 'password'}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          autoComplete={autoComplete}
-          className={`${INPUT} pr-10 ${error ? 'border-kumo-danger focus:border-kumo-danger' : ''}`}
-        />
-        <button
-          type="button"
-          onClick={() => setShow((s) => !s)}
-          aria-label={show ? hidePasswordLabel : showPasswordLabel}
-          className="absolute right-1.5 top-1/2 grid h-7 w-7 -translate-y-1/2 cursor-pointer place-items-center rounded-md text-kumo-inactive transition-colors hover:text-kumo-default"
-        >
-          {show ? <EyeSlash size={15} /> : <Eye size={15} />}
-        </button>
-      </div>
-      {error ? (
-        <p className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-danger">{error}</p>
-      ) : description ? (
-        <p className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-subtle">{description}</p>
-      ) : null}
-    </div>
-  )
-}
-
-type PasswordError =
-  | { key: 'profile.passwordMinimum' | 'profile.passwordsDoNotMatch' | 'profile.passwordChangeFailed' }
-  | { message: string }
-
 export default function SettingsPage() {
   const { t } = useLocale()
   useDocumentTitle(t('profile.title'))
@@ -120,28 +60,7 @@ export default function SettingsPage() {
     }
   }, [localAvatarPreview])
 
-  // Password change state
-  const [currentPassword, setCurrentPassword] = useState('')
-  const [newPassword, setNewPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
-  const [passwordLoading, setPasswordLoading] = useState(false)
-  const [passwordError, setPasswordError] = useState<PasswordError | null>(null)
-  // Whether this account has a password (false for OAuth-created accounts). Null while loading.
-  const [hasPassword, setHasPassword] = useState<boolean | null>(null)
-
   const avatarUrl = useAvatar(authenticatedApi, userInfo?.id)
-  const passwordErrorMessage = passwordError
-    ? 'key' in passwordError ? t(passwordError.key) : passwordError.message
-    : null
-
-  // Determine whether to show the change-password section.
-  useEffect(() => {
-    let cancelled = false
-    authenticatedApi.hasPasswordLogin()
-      .then((v: boolean) => { if (!cancelled) setHasPassword(v) })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [authenticatedApi])
 
   // Fetch user info
   useEffect(() => {
@@ -218,36 +137,6 @@ export default function SettingsPage() {
       toasts.add({ title: t('profile.avatarUpdateFailed'), variant: 'error' })
     } finally {
       setAvatarUploading(false)
-    }
-  }
-
-  const handleChangePassword = async () => {
-    if (!userInfo) return
-    if (!currentPassword || !newPassword || !confirmPassword) return
-    if (newPassword.length < 8) {
-      setPasswordError({ key: 'profile.passwordMinimum' })
-      return
-    }
-    if (newPassword !== confirmPassword) {
-      setPasswordError({ key: 'profile.passwordsDoNotMatch' })
-      return
-    }
-
-    setPasswordLoading(true)
-    setPasswordError(null)
-
-    try {
-      const oldHash = await hashPassword(userInfo.id, currentPassword)
-      const newHash = await hashPassword(userInfo.id, newPassword)
-      await authenticatedApi.changePassword(oldHash, newHash)
-      toasts.add({ title: t('profile.passwordChanged'), variant: 'success' })
-      setCurrentPassword('')
-      setNewPassword('')
-      setConfirmPassword('')
-    } catch (err) {
-      setPasswordError(err instanceof Error ? { message: err.message } : { key: 'profile.passwordChangeFailed' })
-    } finally {
-      setPasswordLoading(false)
     }
   }
 
@@ -405,59 +294,6 @@ export default function SettingsPage() {
         {/* Usage & billing — only when the Cloudflare limits flow is enabled server-side */}
         <UsageSettings />
 
-        {/* Security — only for password accounts (hidden under CF Access or gatekeeper sign-in) */}
-        {!CF_ACCESS_MODE && hasPassword === true && (
-          <section className="flex flex-col gap-3">
-            <SectionLabel>{t('profile.security')}</SectionLabel>
-            <div className="rounded-xl border border-kumo-line bg-kumo-base p-5">
-              <div className="flex max-w-sm flex-col gap-4">
-                <PasswordField
-                  label={t('profile.currentPassword')}
-                  value={currentPassword}
-                  onChange={setCurrentPassword}
-                  placeholder={t('profile.enterCurrentPassword')}
-                  autoComplete="current-password"
-                  showPasswordLabel={t('profile.showPassword')}
-                  hidePasswordLabel={t('profile.hidePassword')}
-                />
-
-                <PasswordField
-                  label={t('profile.newPassword')}
-                  value={newPassword}
-                  onChange={setNewPassword}
-                  placeholder={t('profile.enterNewPassword')}
-                  description={t('profile.newPasswordMinimum')}
-                  autoComplete="new-password"
-                  showPasswordLabel={t('profile.showPassword')}
-                  hidePasswordLabel={t('profile.hidePassword')}
-                />
-
-                <PasswordField
-                  label={t('profile.confirmNewPassword')}
-                  value={confirmPassword}
-                  onChange={setConfirmPassword}
-                  placeholder={t('profile.confirmNewPasswordPlaceholder')}
-                  autoComplete="new-password"
-                  error={passwordErrorMessage}
-                  showPasswordLabel={t('profile.showPassword')}
-                  hidePasswordLabel={t('profile.hidePassword')}
-                />
-
-                <div className="pt-1">
-                  <button
-                    type="button"
-                    onClick={handleChangePassword}
-                    disabled={passwordLoading || !currentPassword || !newPassword || !confirmPassword}
-                    className={PRIMARY_BTN}
-                  >
-                    <Lock size={14} weight="bold" />
-                    {passwordLoading ? t('profile.changingPassword') : t('profile.changePassword')}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
       </div>
     </div>
   )

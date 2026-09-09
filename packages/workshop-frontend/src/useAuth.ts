@@ -1,9 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import { RpcStub } from 'capnweb'
-import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import {
+  AUTH_ERROR_CODES,
+  AuthenticatedApi,
+  getAuthErrorCode,
+  PublicApi,
+} from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
+import { getOsUserManager, hasPublicAuthConfig, logoutOs } from './auth/supabase'
 
-const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
+const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true' && !hasPublicAuthConfig()
 
 interface AuthState {
   token: string | null
@@ -14,142 +20,253 @@ interface AuthState {
 
 export { CF_ACCESS_MODE }
 
+function callbackReturnPath(state: unknown): string {
+  if (typeof state !== 'object' || state === null || !('returnPath' in state)) return '/'
+  const candidate = state.returnPath
+  return typeof candidate === 'string' && candidate.startsWith('/') && !candidate.startsWith('//')
+    ? candidate
+    : '/'
+}
+
+/** OIDC callback processing is global because the UserManager is global as well. */
+const osCallbackPromises = new Map<
+  string,
+  Promise<Awaited<ReturnType<ReturnType<typeof getOsUserManager>['signinRedirectCallback']>>>
+>()
+
+function consumeOsCallback(manager: ReturnType<typeof getOsUserManager>, url: string) {
+  let promise = osCallbackPromises.get(url)
+  if (!promise) {
+    promise = manager.signinRedirectCallback(url)
+    osCallbackPromises.set(url, promise)
+    void promise.then(
+      () => { if (osCallbackPromises.get(url) === promise) osCallbackPromises.delete(url) },
+      () => { if (osCallbackPromises.get(url) === promise) osCallbackPromises.delete(url) },
+    )
+  }
+  return promise
+}
+
+function errorMessage(caught: unknown): string {
+  return caught instanceof Error ? caught.message : 'Authentication failed.'
+}
+
+function shouldClearAuthUser(caught: unknown): boolean {
+  const code = getAuthErrorCode(caught)
+  return code === AUTH_ERROR_CODES.unauthenticated || code === AUTH_ERROR_CODES.invalidSessionToken
+}
+
 export function useAuth(publicApi: RpcStub<PublicApi>) {
   const [authState, setAuthState] = useState<AuthState>({
     token: null,
     authenticatedApi: null,
     isLoading: true,
-    error: null
+    error: null,
   })
-
-  // Track current authenticated API stub for cleanup on unmount.
-  // State closures go stale in cleanup functions, so we use a ref.
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
+  const generationRef = useRef(0)
+  const initialAuthRef = useRef<{
+    publicApi: RpcStub<PublicApi>
+    promise: Promise<{
+      user: { access_token?: string; expired?: boolean; state?: unknown } | null
+      silentRenewFailed: boolean
+    }>
+  } | null>(null)
+
   authenticatedApiRef.current = authState.authenticatedApi
 
-  /**
-   * Names the signed-in user on error reports, for as long as this stub is the current one.
-   *
-   * Keyed on the stub rather than called from each authenticate path, so it covers however the
-   * session was established — stored token, inline login, or CF Access. This is why the claim lives
-   * in the hook and not in `AuthProvider`: the public blueprint page renders outside that provider
-   * and logs in inline, so reports from the rest of its session would otherwise name nobody.
-   *
-   * `whoami` is pipelined rather than awaited, so its answer can outlive the session that asked.
-   * The cleanup drops it when the stub is replaced or cleared, which is what stops a logout or a
-   * newer login from being overwritten by the previous user. Disposal would not be enough on its
-   * own: capnweb does not guarantee that disposing a stub rejects calls already in flight.
-   *
-   * Nothing is cleared here. Cleanup also runs on unmount, and two instances of this hook can be
-   * mounted at once — the blueprint page runs its own inside the root's — so an inner one going
-   * away must not blank an identity the outer still holds. `logout` is the only thing that clears.
-   */
-  useEffect(() => {
-    const authenticatedApi = authState.authenticatedApi
-    if (!authenticatedApi) return
-    let cancelled = false
-    authenticatedApi.whoami().then((info) => {
-      // Only a real user account names a person: for a gadget author `id` is its owner's id.
-      if (!cancelled && info.type === 'user') setReportedUserId(info.id)
-    }).catch(() => {})
-    return () => { cancelled = true }
-  }, [authState.authenticatedApi])
+  const disposeAuthenticatedApi = () => {
+    const api = authenticatedApiRef.current
+    authenticatedApiRef.current = null
+    try { api?.[Symbol.dispose]() } catch { /* already disposed */ }
+  }
+
+  const installAuthenticatedApi = async (
+    token: string | null,
+    generation: number,
+    cancelled: () => boolean,
+    fromCfAccess = false,
+  ) => {
+    if (cancelled() || generationRef.current !== generation) return
+    const api = fromCfAccess
+      ? publicApi.authenticateFromCfAccess()
+      : publicApi.authenticate(token!)
+    try {
+      const info = await api.whoami()
+      if (cancelled() || generationRef.current !== generation) {
+        api[Symbol.dispose]()
+        return
+      }
+      authenticatedApiRef.current = api
+      setAuthState({ token, authenticatedApi: api, isLoading: false, error: null })
+      if (info.type === 'user') setReportedUserId(info.id)
+    } catch (caught) {
+      api[Symbol.dispose]()
+      if (!cancelled() && generationRef.current === generation) {
+        setAuthState({ token: null, authenticatedApi: null, isLoading: false,
+          error: errorMessage(caught) })
+      }
+      throw caught
+    }
+  }
 
   useEffect(() => {
-    if (CF_ACCESS_MODE) {
-      authenticateWithCfAccess()
-    } else {
-      const storedToken = localStorage.getItem('authToken')
-      if (storedToken) {
-        authenticateWithToken(storedToken)
-      } else {
-        setAuthState(prev => ({ ...prev, isLoading: false }))
+    let cancelled = false
+    const generation = ++generationRef.current
+    // A replacement public socket invalidates the derived capability from the old socket. The
+    // cleanup also performs this disposal, while the generation/cancel checks below keep an
+    // in-flight old authenticate from installing itself after the new effect starts.
+    disposeAuthenticatedApi()
+    setAuthState((previous) => ({ ...previous, authenticatedApi: null, isLoading: true, error: null }))
+
+    if (hasPublicAuthConfig()) {
+      const manager = getOsUserManager()
+      let initialAuthenticationComplete = false
+      const onUserLoaded = (user: { access_token: string }) => {
+        if (!initialAuthenticationComplete || cancelled) return
+        ++generationRef.current
+        disposeAuthenticatedApi()
+        setAuthState({ token: user.access_token, authenticatedApi: null, isLoading: true, error: null })
+        // A socket is bound to the first verified token that authenticated it. Disposing the
+        // PublicApi makes the connection manager create a fresh socket for the renewed token.
+        publicApi[Symbol.dispose]()
+      }
+      const onSilentRenewError = async () => {
+        if (cancelled) return
+        ++generationRef.current
+        try { await manager.removeUser() } catch { /* redirect remains the safe recovery */ }
+        if (cancelled) return
+        disposeAuthenticatedApi()
+        setAuthState({ token: null, authenticatedApi: null, isLoading: false, error: null })
+        window.location.assign('/auth/central')
+      }
+      const removeUserLoaded = manager.events.addUserLoaded(onUserLoaded)
+      const removeSilentRenewError = manager.events.addSilentRenewError(onSilentRenewError)
+
+      void (async () => {
+        // Errors while loading the OIDC user/callback indicate stale local OIDC state and may be
+        // cleared. Once that state is loaded, an RPC dependency failure must not log the user out.
+        let clearUserOnError = true
+        try {
+          let user: { access_token?: string; expired?: boolean; state?: unknown } | null
+          let silentRenewFailed = false
+          if (window.location.pathname === '/auth/callback') {
+            user = await consumeOsCallback(manager, window.location.href)
+            if (cancelled || generationRef.current !== generation) return
+            const returnPath = callbackReturnPath(user.state)
+            window.history.replaceState(null, '', returnPath)
+          } else {
+            const existing = initialAuthRef.current
+            const promise = existing?.publicApi === publicApi
+              ? existing.promise
+              : manager.getUser().then(async (stored) => {
+                if (stored?.expired) {
+                  try { return { user: await manager.signinSilent(), silentRenewFailed: false } }
+                  catch { return { user: null, silentRenewFailed: true } }
+                }
+                return { user: stored, silentRenewFailed: false }
+              })
+            if (!existing || existing.publicApi !== publicApi) {
+              initialAuthRef.current = { publicApi, promise }
+            }
+            const initial = await promise
+            user = initial.user
+            silentRenewFailed = initial.silentRenewFailed
+            if (cancelled || generationRef.current !== generation) return
+          }
+          if (cancelled || generationRef.current !== generation) return
+          if (silentRenewFailed) {
+            // Only the active effect may clear/redirect after a failed silent renewal. A canceled
+            // StrictMode pass must never remove a session loaded by its replacement.
+            try { await manager.removeUser() } catch { /* redirect remains the safe recovery */ }
+            if (cancelled || generationRef.current !== generation) return
+            setAuthState({ token: null, authenticatedApi: null, isLoading: false, error: null })
+            window.location.assign('/auth/central')
+            return
+          }
+          if (!user?.access_token) {
+            if (!cancelled) setAuthState((previous) => ({ ...previous, isLoading: false }))
+            return
+          }
+          clearUserOnError = false
+          await installAuthenticatedApi(user.access_token, generation, () => cancelled)
+        } catch (caught) {
+          if (cancelled || generationRef.current !== generation) return
+          // A stale StrictMode callback must never clear a current OIDC session. This catch is
+          // reached only by the active effect, after every awaited operation checked cancellation.
+          if (clearUserOnError || shouldClearAuthUser(caught)) {
+            try { await manager.removeUser() } catch { /* preserve the original auth error */ }
+          }
+          if (cancelled || generationRef.current !== generation) return
+          if (!cancelled && generationRef.current === generation) {
+            setAuthState({ token: null, authenticatedApi: null, isLoading: false,
+              error: errorMessage(caught) })
+          }
+        } finally {
+          initialAuthenticationComplete = true
+        }
+      })()
+
+      return () => {
+        cancelled = true
+        ++generationRef.current
+        removeUserLoaded()
+        removeSilentRenewError()
+        disposeAuthenticatedApi()
       }
     }
+
+    // Compatibility path for upstream deployments which have not enabled the T03 Supabase mode.
+    void (async () => {
+      try {
+        if (cancelled || generationRef.current !== generation) return
+        if (CF_ACCESS_MODE) {
+          await installAuthenticatedApi(null, generation, () => cancelled, true)
+        } else {
+          const storedToken = localStorage.getItem('authToken')
+          if (storedToken) await installAuthenticatedApi(storedToken, generation, () => cancelled)
+          else if (!cancelled) setAuthState((previous) => ({ ...previous, isLoading: false }))
+        }
+      } catch (caught) {
+        if (!cancelled && generationRef.current === generation) {
+          setAuthState({ token: null, authenticatedApi: null, isLoading: false,
+            error: errorMessage(caught) })
+        }
+      }
+    })()
     return () => {
-      // The authenticateWithXxx functions also dispose the old stub via their setAuthState
-      // updater, so this may double-dispose on reconnect. That's fine — dispose is idempotent.
-      authenticatedApiRef.current?.[Symbol.dispose]()
+      cancelled = true
+      ++generationRef.current
+      disposeAuthenticatedApi()
     }
   }, [publicApi])
 
-  const authenticateWithCfAccess = () => {
-    setAuthState(prev => {
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return { ...prev, authenticatedApi: null, isLoading: true, error: null }
-    })
-
-    // Use promise pipelining - no need to await. The CF Access JWT is already attached
-    // to the request by the browser (injected by the Access service worker/cookie), so
-    // the server validates it and returns an authenticated stub immediately.
-    const authenticatedApi = publicApi.authenticateFromCfAccess()
-    setAuthState({
-      token: null,
-      authenticatedApi,
-      isLoading: false,
-      error: null
-    })
-  }
-
-  const authenticateWithToken = (token: string) => {
-    setAuthState(prev => {
-      // Dispose the previous authenticated API stub if it exists
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return {
-        ...prev,
-        authenticatedApi: null, // Clear the disposed stub
-        isLoading: true,
-        error: null
-      }
-    })
-
-    // Use promise pipelining - we can use the returned promise as a stub immediately
-    // without awaiting. Authentication errors will be handled when the stub is actually used.
-    const authenticatedApi = publicApi.authenticate(token)
-    setAuthState({
-      token,
-      authenticatedApi,
-      isLoading: false,
-      error: null
-    })
-  }
-
   const login = (token: string) => {
-    authenticateWithToken(token)
+    localStorage.setItem('authToken', token)
+    const generation = ++generationRef.current
+    disposeAuthenticatedApi()
+    setAuthState({ token: null, authenticatedApi: null, isLoading: true, error: null })
+    void installAuthenticatedApi(token, generation, () => false).catch(() => {})
   }
 
   const logout = () => {
+    ++generationRef.current
     setReportedUserId(undefined)
-
-    if (CF_ACCESS_MODE) {
+    disposeAuthenticatedApi()
+    setAuthState({ token: null, authenticatedApi: null, isLoading: false, error: null })
+    if (hasPublicAuthConfig()) {
+      void logoutOs()
+    } else if (CF_ACCESS_MODE) {
       window.location.assign('/cdn-cgi/access/logout')
-      return
+    } else {
+      localStorage.removeItem('authToken')
     }
-
-    // Use functional updater to read current state (avoids stale closure).
-    setAuthState(prev => {
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return {
-        token: null,
-        authenticatedApi: null,
-        isLoading: false,
-        error: null
-      }
-    })
-
-    localStorage.removeItem('authToken')
   }
 
   return {
     ...authState,
     login,
     logout,
-    isAuthenticated: !!authState.authenticatedApi
+    isAuthenticated: !!authState.authenticatedApi,
   }
 }

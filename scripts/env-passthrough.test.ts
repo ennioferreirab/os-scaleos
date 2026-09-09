@@ -57,12 +57,19 @@ const EXPECTED: Record<string, ExpectedArea> = {
   // package can depend on is open-ended and the wildcard is the only honest declaration.
   "packages/workshop-frontend": {
     forwarded: [
+      "VITE_AUTH_ISSUER",
+      "VITE_AUTH_OS_CLIENT_ID",
+      "VITE_AUTH_PUBLIC_URL",
+      "VITE_AUTH_VAULT_CLIENT_ID",
       "VITE_BACKEND_HOST",
       "VITE_CF_ACCESS_MODE",
       "VITE_DEV_AUTO_LOGIN",
       "VITE_DEV_PASSWORD",
       "VITE_DEV_USERNAME",
       "VITE_FRONTEND_ERROR_REPORTING",
+      "VITE_OS_PUBLIC_URL",
+      "VITE_SUPABASE_PUBLISHABLE_KEY",
+      "VITE_VAULT_PUBLIC_URL",
     ],
     injected: ["NODE_ENV"],
   },

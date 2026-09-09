@@ -1,41 +1,75 @@
-import { AdminAuditEvent } from "@gadgets/workshop-shared/api";
+import {
+  AUTH_ERROR_CODES,
+  AdminAuditEvent,
+  AdminMutationReceipt,
+  DirectoryInviteResult,
+  DirectoryUser,
+  PendingUserLifecycle,
+  ResumeUserStatusInput,
+  createAuthError,
+} from "@gadgets/workshop-shared/api";
 import { collection, createTypedStorage } from "@gadgets/typed-storage";
 import { DurableObject } from "cloudflare:workers";
+import { requireSubject, type SupabaseAuthEnv } from "./auth/supabase.js";
 
-/** Backend-resolved directory identity for one authenticated OS account. */
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Stable actor shape retained for the T02 AdminSettings audit outbox. */
 export type DirectoryActor = {
-  /** Canonical authority identifier for this OS installation. */
+  /** Configured organization UUID. */
   authorityId: string;
-  /** Canonical organization identifier for the installation's single MVP tenant. */
+  /** Configured organization UUID, stored in the historical tenantId envelope. */
   tenantId: string;
-  /** Stable opaque identifier for this OS installation. */
+  /** Stable deployment resource id used by existing AdminSettings events. */
   osInstallationId: string;
-  /** Canonical directory user identifier bound to the authenticated OS account. */
+  /** Verified Supabase subject. */
   userId: string;
 };
 
-type DirectoryIdentity = Omit<DirectoryActor, "userId">;
-
-type OsAccountBinding = {
-  userDoId: string;
-  tenantId: string;
+type Organization = {orgId: string; createdAt: string};
+type OsAccountBinding = {userId: string; userDoId: string; createdAt: string};
+type Admission = {userId: string; invitedBy: string; invitedAt: string; acceptedAt?: string};
+type PendingLifecycle = {
   userId: string;
-  createdAt: string;
+  mutationId: string;
+  actorId: string;
+  desiredStatus: "active" | "disabled";
+  startedAt: string;
 };
-
-type StoredAuditEvent = AdminAuditEvent & {
-  storageKey: string;
+type PendingInvite = {
+  mutationId: string;
+  actorId: string;
+  email: string;
+  displayName: string;
+  startedAt: string;
+  providerUserId?: string;
 };
+type DirectoryMutation = {
+  key: string;
+  mutationId: string;
+  actorId: string;
+  operation: "inviteUser" | "setUserRole" | "setUserStatus";
+  requestHash: string;
+  receipt: AdminMutationReceipt;
+  user?: DirectoryUser;
+};
+type StoredAuditEvent = AdminAuditEvent & {storageKey: string};
 
 function makeDirectoryStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
+      directoryUsers: collection<DirectoryUser>()({primaryKey: "userId"}),
       osAccounts: collection<OsAccountBinding>()({
-        primaryKey: "userDoId",
-        uniqueIndexes: {
-          byUserId: (binding: OsAccountBinding) => binding.userId,
-        },
+        primaryKey: "userId",
+        uniqueIndexes: {byUserDoId: (binding: OsAccountBinding) => binding.userDoId},
       }),
+      admissions: collection<Admission>()({primaryKey: "userId"}),
+      pendingLifecycle: collection<PendingLifecycle>()({primaryKey: "userId"}),
+      pendingInvites: collection<PendingInvite>()({
+        primaryKey: "mutationId",
+        uniqueIndexes: {byEmail: (pending: PendingInvite) => pending.email},
+      }),
+      mutations: collection<DirectoryMutation>()({primaryKey: "key"}),
       auditEvents: collection<StoredAuditEvent>()({
         primaryKey: "storageKey",
         uniqueIndexes: {
@@ -44,122 +78,716 @@ function makeDirectoryStorage(storage: DurableObjectStorage) {
         },
       }),
     },
-    singletons: {
-      identity: <DirectoryIdentity | null>null,
-    },
+    singletons: {identity: <Organization | null>null, policyVersion: 0},
   });
 }
 
 type DirectoryStorage = ReturnType<typeof makeDirectoryStorage>;
 
-function canonicalId(authorityId: string, kind: "tenant" | "user"): string {
-  return `scaleos:${authorityId}:${kind}:${crypto.randomUUID()}`;
+type ProviderUser = {
+  id: string;
+  email: string;
+  emailConfirmed: boolean;
+  displayName?: string;
+};
+
+class DependencyUnavailableError extends Error {
+  readonly code = AUTH_ERROR_CODES.dependencyUnavailable;
 }
 
-function sameAuditEvent(left: AdminAuditEvent, right: AdminAuditEvent): boolean {
+function configured(env: SupabaseAuthEnv & {ORG_ID?: string; BOOTSTRAP_ADMIN_SUB?: string},
+    name: "AUTH_PUBLIC_URL" | "OS_PUBLIC_URL" | "SUPABASE_SECRET_KEY" | "ORG_ID" |
+      "BOOTSTRAP_ADMIN_SUB"): string {
+  const value = env[name]?.trim();
+  if (!value) throw new DependencyUnavailableError(`Required backend setting ${name} is missing.`);
+  return value.replace(/\/$/, "");
+}
+
+function normalizeEmail(email: string): string {
+  const normalized = email.trim().toLowerCase();
+  if (normalized.length > 320 || !EMAIL_PATTERN.test(normalized)) {
+    throw new TypeError("A valid invitation email is required.");
+  }
+  return normalized;
+}
+
+function normalizeDisplayName(displayName: string): string {
+  const normalized = displayName.trim();
+  if (!normalized || normalized.length > 100) {
+    throw new TypeError("Display name must be between 1 and 100 characters.");
+  }
+  return normalized;
+}
+
+async function requestHash(value: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
+  return new Uint8Array(digest).toHex();
+}
+
+function mutationKey(actorId: string, operation: DirectoryMutation["operation"], mutationId: string) {
+  return `${actorId}\u0000${operation}\u0000${mutationId}`;
+}
+
+function selfDisableError(): Error & {code: typeof AUTH_ERROR_CODES.forbidden} {
+  return Object.assign(new Error("Administrators cannot disable their own account."),
+      {code: AUTH_ERROR_CODES.forbidden});
+}
+
+function notFoundError(message: string): Error & {code: "NOT_FOUND"} {
+  return Object.assign(new Error(message), {code: "NOT_FOUND" as const});
+}
+
+function publicProviderUser(value: unknown): ProviderUser {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new DependencyUnavailableError("Supabase returned an invalid user record.");
+  }
+  const outer = value as Record<string, unknown>;
+  const record = typeof outer.user === "object" && outer.user !== null && !Array.isArray(outer.user)
+    ? outer.user as Record<string, unknown>
+    : outer;
+  const id = typeof record.id === "string" ? requireSubject(record.id, "provider user id") : "";
+  const email = typeof record.email === "string" ? normalizeEmail(record.email) : "";
+  const metadata = typeof record.user_metadata === "object" && record.user_metadata !== null &&
+      !Array.isArray(record.user_metadata)
+    ? record.user_metadata as Record<string, unknown>
+    : undefined;
+  const candidateName = metadata && (typeof metadata.full_name === "string"
+    ? metadata.full_name : typeof metadata.name === "string" ? metadata.name : undefined);
+  return {
+    id,
+    email,
+    emailConfirmed: typeof record.email_confirmed_at === "string",
+    ...(candidateName?.trim() ? {displayName: candidateName.trim().slice(0, 100)} : {}),
+  };
+}
+
+class SupabaseAdminClient {
+  readonly #baseUrl: string;
+  readonly #secret: string;
+  readonly #redirectTo: string;
+
+  constructor(env: SupabaseAuthEnv) {
+    this.#baseUrl = configured(env, "AUTH_PUBLIC_URL");
+    this.#secret = configured(env, "SUPABASE_SECRET_KEY");
+    this.#redirectTo = `${configured(env, "OS_PUBLIC_URL")}/auth/recovery`;
+  }
+
+  async #request(path: string, init: RequestInit = {}): Promise<unknown> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.#baseUrl}/auth/v1${path}`, {
+        ...init,
+        headers: {
+          apikey: this.#secret,
+          ...(init.body ? {"Content-Type": "application/json"} : {}),
+          ...init.headers,
+        },
+      });
+    } catch {
+      throw new DependencyUnavailableError("Supabase Auth is unavailable.");
+    }
+    if (!response.ok) {
+      throw new DependencyUnavailableError(`Supabase Auth request failed with status ${response.status}.`);
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new DependencyUnavailableError("Supabase Auth returned an invalid response.");
+    }
+  }
+
+  async getUserById(userId: string): Promise<ProviderUser> {
+    return publicProviderUser(await this.#request(`/admin/users/${requireSubject(userId)}`));
+  }
+
+  async findUserByEmail(email: string): Promise<ProviderUser | undefined> {
+    const target = normalizeEmail(email);
+    for (let page = 1; page <= 10_000; page++) {
+      const raw = await this.#request(`/admin/users?page=${page}&per_page=1000`);
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw) ||
+          !Array.isArray((raw as Record<string, unknown>).users)) {
+        throw new DependencyUnavailableError("Supabase Auth returned an invalid user list.");
+      }
+      const users = (raw as {users: unknown[]}).users;
+      for (const candidate of users) {
+        const user = publicProviderUser(candidate);
+        if (user.email === target) return user;
+      }
+      if (users.length < 1000) return undefined;
+    }
+    throw new DependencyUnavailableError("Supabase Auth user pagination did not terminate.");
+  }
+
+  async inviteUser(email: string, displayName: string): Promise<ProviderUser> {
+    const query = new URLSearchParams({redirect_to: this.#redirectTo});
+    return publicProviderUser(await this.#request(`/invite?${query}`, {
+      method: "POST",
+      body: JSON.stringify({email, data: {display_name: displayName}}),
+    }));
+  }
+
+  async setUserBanned(userId: string, disabled: boolean): Promise<void> {
+    await this.#request(`/admin/users/${requireSubject(userId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ban_duration: disabled ? "876000h" : "none"}),
+    });
+  }
+}
+
+function sameEvent(left: AdminAuditEvent, right: AdminAuditEvent): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-/**
- * Authoritative single-tenant directory and local administrative audit store for this deployment.
- * The singleton is always addressed by the reserved name `""`; browser clients never receive its
- * capability directly.
- */
+/** Authoritative organization directory for the configured single organization. */
 export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: DirectoryStorage;
+  private inviteInFlight = new Map<string, {
+    actorId: string;
+    email: string;
+    displayName: string;
+    promise: Promise<DirectoryInviteResult>;
+  }>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.storage = makeDirectoryStorage(ctx.storage);
   }
 
-  /**
-   * Resolve the canonical actor bound to a backend-observed User Durable Object id, creating the
-   * installation identity and opaque account binding on first use. No username, email, tenant, or
-   * role supplied by a browser participates in this mapping.
-   */
-  getOrCreateActor(userDoId: string): DirectoryActor {
-    if (!userDoId) throw new Error("An authenticated OS account id is required.");
-
-    return this.storage.transaction(() => {
-      let identity = this.storage.identity.get();
-      if (!identity) {
-        let authorityId = crypto.randomUUID();
-        identity = {
-          authorityId,
-          tenantId: canonicalId(authorityId, "tenant"),
-          osInstallationId: crypto.randomUUID(),
-        };
-        this.storage.identity.put(identity);
-      }
-
-      let binding = this.storage.osAccounts.get(userDoId);
-      if (!binding) {
-        binding = {
-          userDoId,
-          tenantId: identity.tenantId,
-          userId: canonicalId(identity.authorityId, "user"),
-          createdAt: new Date().toISOString(),
-        };
-        this.storage.osAccounts.put(binding);
-      }
-      if (binding.tenantId !== identity.tenantId) {
-        throw new Error("OS account binding belongs to another tenant.");
-      }
-
-      return {...identity, userId: binding.userId};
-    });
+  #configuredOrgId(): string {
+    return requireSubject(configured(this.env, "ORG_ID"), "ORG_ID");
   }
 
-  /**
-   * Persist an event delivered from the AdminSettings transactional outbox. Replaying the same
-   * idempotency key is harmless only when the complete event is identical; conflicting reuse fails
-   * closed. Actor, tenant, and installation identifiers must match this directory's own records.
-   */
-  recordAdminAuditEvent(event: AdminAuditEvent): void {
-    this.storage.transaction(() => {
-      let identity = this.storage.identity.get();
-      if (!identity || event.tenantId !== identity.tenantId ||
-          event.resourceId !== identity.osInstallationId) {
-        throw new Error("Audit event does not belong to this OS installation.");
-      }
-      let actor = this.storage.osAccounts.byUserId.get(event.actorUserId);
-      if (!actor || actor.tenantId !== event.tenantId) {
-        throw new Error("Audit actor is not bound to this tenant.");
-      }
+  #identity(): Organization {
+    const identity = this.storage.identity.get();
+    if (!identity) throw new Error("The organization has not been bootstrapped.");
+    if (identity.orgId !== this.#configuredOrgId()) {
+      throw new Error("Configured ORG_ID does not match the durable organization.");
+    }
+    return identity;
+  }
 
-      let existing = this.storage.auditEvents.byIdempotencyKey.get(event.idempotencyKey);
-      if (existing) {
-        let {storageKey: _storageKey, ...storedEvent} = existing;
-        if (!sameAuditEvent(storedEvent, event)) {
-          throw new Error("Idempotency key was already used for another audit event.");
+  #effectiveStatus(user: DirectoryUser): "active" | "disabled" {
+    return this.storage.pendingLifecycle.get(user.userId) ? "disabled" : user.status;
+  }
+
+  #publicUser(user: DirectoryUser): DirectoryUser {
+    const status = this.#effectiveStatus(user);
+    return status === user.status ? user : {...user, status};
+  }
+
+  #requireUser(userId: string): DirectoryUser {
+    const user = this.storage.directoryUsers.get(requireSubject(userId));
+    if (!user) throw Object.assign(new Error("Organization user was not found."), {code: "NOT_FOUND"});
+    return user;
+  }
+
+  #requireActive(userId: string): DirectoryUser {
+    const user = this.#requireUser(userId);
+    if (this.#effectiveStatus(user) !== "active") {
+      throw createAuthError(AUTH_ERROR_CODES.forbidden);
+    }
+    return user;
+  }
+
+  #requireAdmin(userId: string): DirectoryUser {
+    const user = this.#requireActive(userId);
+    if (user.role !== "admin") throw createAuthError(AUTH_ERROR_CODES.forbidden);
+    return user;
+  }
+
+  #hasAnotherActiveAdmin(userId: string): boolean {
+    return [...this.storage.directoryUsers.list()].some(candidate =>
+      candidate.userId !== userId && candidate.role === "admin" &&
+      candidate.status === "active" && !this.storage.pendingLifecycle.get(candidate.userId));
+  }
+
+  #event(actorId: string, resourceId: string,
+      action: AdminAuditEvent["action"], reasonCode: AdminAuditEvent["reasonCode"],
+      mutationId: string, change: AdminAuditEvent["change"], beforeVersion: number,
+      afterVersion: number, idempotencyKey = mutationId,
+      resumedByUserId?: string): AdminAuditEvent {
+    const orgId = this.#identity().orgId;
+    return {
+      eventId: crypto.randomUUID(),
+      occurredAt: new Date().toISOString(),
+      tenantId: orgId,
+      actorUserId: actorId,
+      ...(resumedByUserId ? {resumedByUserId} : {}),
+      resourceType: resourceId === orgId ? "adminConfig" : "directoryUser",
+      resourceId,
+      action,
+      beforeVersion,
+      afterVersion,
+      result: "succeeded",
+      reasonCode,
+      correlationId: mutationId,
+      idempotencyKey,
+      change,
+    };
+  }
+
+  #storeEvent(event: AdminAuditEvent): void {
+    const existing = this.storage.auditEvents.byIdempotencyKey.get(event.idempotencyKey);
+    if (existing) {
+      const {storageKey: _storageKey, ...value} = existing;
+      if (!sameEvent(value, event)) throw new Error("Audit mutation id was reused.");
+      return;
+    }
+    this.storage.auditEvents.put({...event,
+      storageKey: `${event.occurredAt}\u0000${event.eventId}`});
+  }
+
+  #nextVersion(): {before: number; after: number} {
+    const before = this.storage.policyVersion.get();
+    const after = before + 1;
+    this.storage.policyVersion.put(after);
+    return {before, after};
+  }
+
+  #receipt(mutationId: string, now: string, policyVersion: number): AdminMutationReceipt {
+    return {mutationId, policyVersion, confirmedAt: now};
+  }
+
+  /** Bootstrap the configured admin or admit an existing active directory user on verified login. */
+  async authenticateHuman(subject: string, userDoId: string,
+      verifiedEmail?: string): Promise<DirectoryUser> {
+    subject = requireSubject(subject);
+    const existingIdentity = this.storage.identity.get();
+    if (!existingIdentity) {
+      const bootstrapSub = requireSubject(configured(this.env, "BOOTSTRAP_ADMIN_SUB"),
+          "BOOTSTRAP_ADMIN_SUB");
+      if (subject !== bootstrapSub) throw createAuthError(AUTH_ERROR_CODES.forbidden);
+      const providerUser = await new SupabaseAdminClient(this.env).getUserById(subject);
+      if (providerUser.id !== subject || !providerUser.emailConfirmed) {
+        throw createAuthError(AUTH_ERROR_CODES.forbidden);
+      }
+      const now = new Date().toISOString();
+      const user: DirectoryUser = {
+        userId: subject,
+        email: providerUser.email,
+        displayName: providerUser.displayName ?? providerUser.email.split("@")[0],
+        role: "admin",
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      };
+      return this.storage.transaction(() => {
+        const concurrentIdentity = this.storage.identity.get();
+        if (concurrentIdentity) {
+          if (concurrentIdentity.orgId !== this.#configuredOrgId()) {
+            throw new Error("Stored organization does not match ORG_ID.");
+          }
+          return this.#publicUser(this.#requireActive(subject));
         }
-        return;
-      }
-      if (this.storage.auditEvents.byEventId.get(event.eventId)) {
-        throw new Error("Audit event id was already used.");
-      }
-
-      this.storage.auditEvents.put({
-        ...event,
-        storageKey: `${event.occurredAt}\u0000${event.eventId}`,
+        const orgId = this.#configuredOrgId();
+        this.storage.identity.put({orgId, createdAt: now});
+        this.storage.directoryUsers.put(user);
+        this.storage.osAccounts.put({userId: subject, userDoId, createdAt: now});
+        this.storage.admissions.put({
+          userId: subject, invitedBy: subject, invitedAt: now, acceptedAt: now,
+        });
+        const version = this.#nextVersion();
+        this.#storeEvent(this.#event(subject, subject, "bootstrapAdmin",
+            "DIRECTORY_ADMIN_BOOTSTRAPPED", `bootstrap:${subject}`,
+            {field: "role", before: null, after: "admin"}, version.before, version.after));
+        return user;
       });
-    });
-  }
-
-  /**
-   * Return the newest audit events for the requested tenant. The caller is the already-authorized
-   * AdminApi capability; this method still rejects any tenant other than the directory singleton's
-   * own tenant so an internal caller cannot accidentally widen the query.
-   */
-  listAdminAuditEvents(tenantId: string, limit: number): AdminAuditEvent[] {
-    let identity = this.storage.identity.get();
-    if (!identity || tenantId !== identity.tenantId) {
-      throw new Error("Audit history is not available for this tenant.");
     }
 
+    this.#identity();
+    return this.storage.transaction(() => {
+      let user = this.#requireActive(subject);
+      const binding = this.storage.osAccounts.get(subject);
+      const byDo = this.storage.osAccounts.byUserDoId.get(userDoId);
+      if ((binding && binding.userDoId !== userDoId) || (byDo && byDo.userId !== subject)) {
+        throw new Error("Supabase subject is bound to another OS account.");
+      }
+      if (!binding) {
+        this.storage.osAccounts.put({userId: subject, userDoId, createdAt: new Date().toISOString()});
+      }
+      const admission = this.storage.admissions.get(subject);
+      if (!admission) throw new Error("Organization admission is missing.");
+      if (!admission.acceptedAt) {
+        this.storage.admissions.put({...admission, acceptedAt: new Date().toISOString()});
+      }
+      if (verifiedEmail) {
+        const email = normalizeEmail(verifiedEmail);
+        if (email !== user.email) {
+          user = {...user, email, updatedAt: new Date().toISOString()};
+          this.storage.directoryUsers.put(user);
+        }
+      }
+      return this.#publicUser(user);
+    });
+  }
+
+  /** Create the deterministic User DO binding target for a verified Subject. */
+  userDoName(subject: string): string {
+    return `supabase:${requireSubject(subject)}`;
+  }
+
+  /** Verify that the subject is currently active; pending lifecycle changes deny access. */
+  requireActiveUser(userId: string): DirectoryUser {
+    this.#identity();
+    return this.#publicUser(this.#requireActive(userId));
+  }
+
+  /** Verify that the subject is a current active organization administrator. */
+  requireAdminUser(userId: string): DirectoryUser {
+    this.#identity();
+    return this.#publicUser(this.#requireAdmin(userId));
+  }
+
+  /** Update a directory display name only for that same verified subject. */
+  setOwnDisplayName(userId: string, displayName: string): void {
+    const user = this.#requireActive(userId);
+    const normalized = normalizeDisplayName(displayName);
+    this.storage.directoryUsers.put({...user, displayName: normalized,
+      updatedAt: new Date().toISOString()});
+  }
+
+  /** List directory users for a freshly rechecked administrator. */
+  listUsers(actorId: string): DirectoryUser[] {
+    this.#requireAdmin(actorId);
+    return [...this.storage.directoryUsers.list()].map(user => this.#publicUser(user))
+        .toSorted((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  /** List only recoverable provider mutations for a freshly rechecked administrator. */
+  listPendingUserLifecycle(actorId: string): PendingUserLifecycle[] {
+    this.#requireAdmin(actorId);
+    return [...this.storage.pendingLifecycle.list()].map(pending => ({
+      userId: pending.userId,
+      status: pending.desiredStatus,
+      mutationId: pending.mutationId,
+      actorUserId: pending.actorId,
+      startedAt: pending.startedAt,
+    })).toSorted((left, right) => left.userId.localeCompare(right.userId));
+  }
+
+  /** Coalesce identical in-flight retries; durable pending state remains the recovery authority. */
+  async inviteUser(actorId: string, input: {email: string; displayName: string; mutationId: string})
+      : Promise<DirectoryInviteResult> {
+    actorId = requireSubject(actorId, "actorId");
+    const email = normalizeEmail(input.email);
+    const displayName = normalizeDisplayName(input.displayName);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const existing = this.inviteInFlight.get(mutationId);
+    if (existing) {
+      if (existing.actorId !== actorId || existing.email !== email ||
+          existing.displayName !== displayName) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      return existing.promise;
+    }
+    const promise = this.#inviteUser(actorId, {email, displayName, mutationId});
+    this.inviteInFlight.set(mutationId, {actorId, email, displayName, promise});
+    try {
+      return await promise;
+    } finally {
+      if (this.inviteInFlight.get(mutationId)?.promise === promise) {
+        this.inviteInFlight.delete(mutationId);
+      }
+    }
+  }
+
+  /** Invite through Supabase Auth and atomically record member admission, receipt, and audit. */
+  async #inviteUser(actorId: string, input: {email: string; displayName: string; mutationId: string})
+      : Promise<DirectoryInviteResult> {
+    actorId = requireSubject(actorId, "actorId");
+    const email = normalizeEmail(input.email);
+    const displayName = normalizeDisplayName(input.displayName);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const hash = await requestHash({email, displayName});
+    const key = mutationKey(actorId, "inviteUser", mutationId);
+
+    const replay = this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash || !completed.user) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        return {user: completed.user, receipt: completed.receipt};
+      }
+      let pending = this.storage.pendingInvites.get(mutationId);
+      if (pending) {
+        if (pending.actorId !== actorId || pending.email !== email ||
+            pending.displayName !== displayName) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      } else {
+        const byEmail = this.storage.pendingInvites.byEmail.get(email);
+        if (byEmail) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        pending = {mutationId, actorId, email, displayName, startedAt: new Date().toISOString()};
+        this.storage.pendingInvites.put(pending);
+      }
+      return undefined;
+    });
+    if (replay) return replay;
+
+    const provider = new SupabaseAdminClient(this.env);
+    let pending = this.storage.pendingInvites.get(mutationId)!;
+    let providerUser = pending.providerUserId
+      ? await provider.getUserById(pending.providerUserId)
+      : await provider.findUserByEmail(email);
+    if (!providerUser) providerUser = await provider.inviteUser(email, displayName);
+    if (providerUser.email !== email) throw new DependencyUnavailableError(
+        "Supabase Auth returned a different invitation email.");
+    const completedAfterProvider = this.storage.transaction(() => {
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash || !completed.user) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        return {user: completed.user, receipt: completed.receipt};
+      }
+      const current = this.storage.pendingInvites.get(mutationId);
+      if (!current || current.actorId !== actorId) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      if (current.providerUserId && current.providerUserId !== providerUser.id) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      this.storage.pendingInvites.put({...current, providerUserId: providerUser.id});
+      return undefined;
+    });
+    if (completedAfterProvider) return completedAfterProvider;
+
+    return this.storage.transaction(() => {
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash || !completed.user) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        return {user: completed.user, receipt: completed.receipt};
+      }
+      if (this.storage.directoryUsers.get(providerUser.id)) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const now = new Date().toISOString();
+      const user: DirectoryUser = {
+        userId: providerUser.id,
+        email,
+        displayName,
+        role: "member",
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      this.storage.directoryUsers.put(user);
+      this.storage.admissions.put({userId: user.userId, invitedBy: actorId, invitedAt: now});
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "inviteUser", requestHash: hash, receipt, user,
+      });
+      this.#storeEvent(this.#event(actorId, user.userId, "inviteUser", "DIRECTORY_USER_INVITED",
+          mutationId, {field: "status", before: null, after: "active"},
+          version.before, version.after, key));
+      this.storage.pendingInvites.delete(mutationId);
+      return {user, receipt};
+    });
+  }
+
+  /** Change an organization role and protect the last usable administrator. */
+  async setUserRole(actorId: string,
+      input: {userId: string; role: "admin" | "member"; mutationId: string})
+      : Promise<AdminMutationReceipt> {
+    actorId = requireSubject(actorId, "actorId");
+    const userId = requireSubject(input.userId);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const hash = await requestHash({userId, role: input.role});
+    const key = mutationKey(actorId, "setUserRole", mutationId);
+    return this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const replay = this.storage.mutations.get(key);
+      if (replay) {
+        if (replay.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return replay.receipt;
+      }
+      const user = this.#requireActive(userId);
+      if (user.role === input.role) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      if (user.role === "admin" && input.role === "member" && !this.#hasAnotherActiveAdmin(userId)) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const now = new Date().toISOString();
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      this.storage.directoryUsers.put({...user, role: input.role, updatedAt: now});
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "setUserRole", requestHash: hash, receipt,
+      });
+      this.#storeEvent(this.#event(actorId, userId, "setUserRole", "DIRECTORY_USER_ROLE_CHANGED",
+          mutationId, {field: "role", before: user.role, after: input.role},
+          version.before, version.after, key));
+      return receipt;
+    });
+  }
+
+  /** Reserve, apply at Supabase, and complete an idempotent lifecycle change. */
+  async setUserStatus(actorId: string,
+      input: {userId: string; status: "active" | "disabled"; mutationId: string})
+      : Promise<AdminMutationReceipt> {
+    actorId = requireSubject(actorId, "actorId");
+    const userId = requireSubject(input.userId);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const hash = await requestHash({userId, status: input.status});
+    const key = mutationKey(actorId, "setUserStatus", mutationId);
+    const replay = this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      if (actorId === userId && input.status === "disabled") throw selfDisableError();
+      const completed = this.storage.mutations.get(key);
+      const pending = this.storage.pendingLifecycle.get(userId);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      const user = this.#requireUser(userId);
+      if (pending) {
+        if (pending.mutationId !== mutationId || pending.actorId !== actorId ||
+            pending.desiredStatus !== input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      } else {
+        if (user.status === input.status) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        if (input.status === "disabled" && user.role === "admin" &&
+            !this.#hasAnotherActiveAdmin(userId)) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        this.storage.pendingLifecycle.put({
+          userId, mutationId, actorId, desiredStatus: input.status,
+          startedAt: new Date().toISOString(),
+        });
+      }
+      return undefined;
+    });
+    if (replay) return replay;
+
+    await new SupabaseAdminClient(this.env).setUserBanned(userId, input.status === "disabled");
+    return this.storage.transaction(() => {
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      const pending = this.storage.pendingLifecycle.get(userId);
+      if (!pending || pending.mutationId !== mutationId || pending.desiredStatus !== input.status) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const user = this.#requireUser(userId);
+      const now = new Date().toISOString();
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      this.storage.directoryUsers.put({...user, status: input.status, updatedAt: now});
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "setUserStatus", requestHash: hash, receipt,
+      });
+      this.#storeEvent(this.#event(actorId, userId, "setUserStatus",
+          input.status === "active" ? "DIRECTORY_USER_REACTIVATED" : "DIRECTORY_USER_DISABLED",
+          mutationId, {field: "status", before: user.status, after: input.status},
+          version.before, version.after, key));
+      this.storage.pendingLifecycle.delete(userId);
+      return receipt;
+    });
+  }
+
+  /** Resume an exact pending lifecycle operation under a different, currently-active admin. */
+  async resumeUserStatus(resumerId: string, input: ResumeUserStatusInput)
+      : Promise<AdminMutationReceipt> {
+    resumerId = requireSubject(resumerId, "resumerId");
+    const userId = requireSubject(input.userId);
+    const actorId = requireSubject(input.actorUserId, "actorUserId");
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    if (input.status !== "active" && input.status !== "disabled") {
+      throw new TypeError("status must be active or disabled.");
+    }
+    if (resumerId === userId && input.status === "disabled") throw selfDisableError();
+    const hash = await requestHash({userId, status: input.status});
+    const key = mutationKey(actorId, "setUserStatus", mutationId);
+    const replay = this.storage.transaction(() => {
+      this.#requireAdmin(resumerId);
+      const completed = this.storage.mutations.get(key);
+      const pending = this.storage.pendingLifecycle.get(userId);
+      if (!completed && !pending) {
+        throw notFoundError("Pending lifecycle operation was not found.");
+      }
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      if (pending!.mutationId !== mutationId || pending!.actorId !== actorId ||
+          pending!.desiredStatus !== input.status) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const user = this.#requireUser(userId);
+      if (input.status === "disabled" && user.role === "admin" &&
+          !this.#hasAnotherActiveAdmin(userId)) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      return undefined;
+    });
+    if (replay) return replay;
+
+    await new SupabaseAdminClient(this.env).setUserBanned(userId, input.status === "disabled");
+    return this.storage.transaction(() => {
+      this.#requireAdmin(resumerId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      const pending = this.storage.pendingLifecycle.get(userId);
+      if (!pending) throw notFoundError("Pending lifecycle operation was not found.");
+      if (pending.mutationId !== mutationId || pending.actorId !== actorId ||
+          pending.desiredStatus !== input.status) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const user = this.#requireUser(userId);
+      if (input.status === "disabled" && user.role === "admin" &&
+          !this.#hasAnotherActiveAdmin(userId)) throw createAuthError(AUTH_ERROR_CODES.conflict);
+      const now = new Date().toISOString();
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      this.storage.directoryUsers.put({...user, status: input.status, updatedAt: now});
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "setUserStatus", requestHash: hash, receipt,
+      });
+      this.#storeEvent(this.#event(actorId, userId, "setUserStatus",
+          input.status === "active" ? "DIRECTORY_USER_REACTIVATED" : "DIRECTORY_USER_DISABLED",
+          mutationId, {field: "status", before: user.status, after: input.status},
+          version.before, version.after, key, resumerId));
+      this.storage.pendingLifecycle.delete(userId);
+      return receipt;
+    });
+  }
+
+  /** Resolve an admitted user for the private backend-to-backend directory endpoint. */
+  getDirectoryUser(userId: string): DirectoryUser | null {
+    this.#identity();
+    const user = this.storage.directoryUsers.get(requireSubject(userId));
+    return user ? this.#publicUser(user) : null;
+  }
+
+  /** Resolve the verified actor used by the existing AdminSettings audit outbox. */
+  getOrCreateActor(userDoId: string): DirectoryActor {
+    const identity = this.#identity();
+    const binding = this.storage.osAccounts.byUserDoId.get(userDoId);
+    if (!binding) throw createAuthError(AUTH_ERROR_CODES.forbidden);
+    this.#requireAdmin(binding.userId);
+    return {
+      authorityId: identity.orgId,
+      tenantId: identity.orgId,
+      osInstallationId: identity.orgId,
+      userId: binding.userId,
+    };
+  }
+
+  /** Persist an event delivered from the existing AdminSettings transactional outbox. */
+  recordAdminAuditEvent(event: AdminAuditEvent): void {
+    this.storage.transaction(() => {
+      const identity = this.#identity();
+      if (event.tenantId !== identity.orgId || event.resourceId !== identity.orgId) {
+        throw new Error("Audit event does not belong to this organization.");
+      }
+      this.#requireAdmin(event.actorUserId);
+      this.#storeEvent(event);
+    });
+  }
+
+  /** Return newest audit events for the configured organization. */
+  listAdminAuditEvents(orgId: string, limit: number): AdminAuditEvent[] {
+    if (orgId !== this.#identity().orgId) throw createAuthError(AUTH_ERROR_CODES.forbidden);
     return [...this.storage.auditEvents.list({reverse: true, limit})].map(stored => {
-      let {storageKey: _storageKey, ...event} = stored;
+      const {storageKey: _storageKey, ...event} = stored;
       return event;
     });
   }

@@ -72,7 +72,7 @@ export function putAction(
  */
 export async function openFakeOverseer(
     storage: object,
-    opts: { role?: "build" | "use", exports?: object } = {}): Promise<Overseer> {
+    opts: { role?: "build" | "use", exports?: object, expiresAtMs?: number } = {}): Promise<Overseer> {
   let role = opts.role ?? "build";
   let ownerId = "owner-id";
   let userId = role === "build" ? ownerId : "viewer-id";
@@ -86,6 +86,11 @@ export async function openFakeOverseer(
       joinOutputsFanout: () => () => {},
       ensureObserver: async () => {},
       syncOutputsTo: async () => {},
+      getGadgetRecord: (id: number) => {
+        const record = (storage as {gadgets: {get(id: number): unknown}}).gadgets.get(id);
+        if (!record) throw new Error(`No such gadget: ${id}`);
+        return record;
+      },
       getSharingManager: async () => ({ getEffectiveRole: () => role }),
       ctx: { id: { toString: () => "workspace-id" }, exports: opts.exports ?? {} },
       users: {
@@ -101,5 +106,7 @@ export async function openFakeOverseer(
       }),
     },
   } satisfies Pick<OverseerDurableObject, "open"> & { impl: object };
-  return overseer.open(userId, `${userId}-profile`, new NativeRpcStub<() => void>(() => {}));
+  return overseer.open(
+      userId, `${userId}-profile`, new NativeRpcStub<() => void>(() => {}),
+      opts.expiresAtMs ?? Number.MAX_SAFE_INTEGER);
 }

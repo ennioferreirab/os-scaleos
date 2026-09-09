@@ -77,6 +77,18 @@ declare global {
       // Public base URL of the deployment.
       PUBLIC_BASE_URL?: string;
 
+      // Central Supabase Auth / organization-directory configuration. Only public values are
+      // mirrored into the frontend build; SUPABASE_SECRET_KEY and DIRECTORY_SERVICE_TOKEN remain
+      // backend-only secret bindings.
+      AUTH_ISSUER?: string;
+      AUTH_PUBLIC_URL?: string;
+      AUTH_OS_CLIENT_ID?: string;
+      OS_PUBLIC_URL?: string;
+      ORG_ID?: string;
+      BOOTSTRAP_ADMIN_SUB?: string;
+      SUPABASE_SECRET_KEY?: string;
+      DIRECTORY_SERVICE_TOKEN?: string;
+
       // Daily free-tier LLM-call limit (per user). Defaults to DEFAULT_DAILY_LLM_CALL_LIMIT.
       DAILY_LLM_CALL_LIMIT?: string;
 

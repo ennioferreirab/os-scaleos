@@ -12,6 +12,7 @@ import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
 import LanguageSelector from './components/LanguageSelector'
 import { useLocale } from './i18n'
+import { beginOsLogin, hasPublicAuthConfig } from './auth/supabase'
 
 
 interface LoginPageProps {
@@ -28,6 +29,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<LoginError | null>(null)
+  const [centralBusy, setCentralBusy] = useState(false)
   const serverConfig = useServerConfig()
   const serverConfigError = useServerConfigError()
   const siteName = useSiteName()
@@ -63,6 +65,46 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
     } finally {
       setLoading(false)
     }
+  }
+
+  if (hasPublicAuthConfig()) {
+    const handleCentralLogin = async () => {
+      setCentralBusy(true)
+      setError(null)
+      try {
+        await beginOsLogin(`${window.location.pathname}${window.location.search}`)
+      } catch (err) {
+        setError(err instanceof Error ? { message: err.message } : { key: 'auth.signIn.failed' })
+        setCentralBusy(false)
+      }
+    }
+    return (
+      <div className="relative flex h-full min-h-0 flex-col items-center justify-center bg-kumo-base px-4 py-8">
+        <LanguageSelector className="absolute right-4 top-4 z-10 w-[170px]" />
+        <div className="w-full max-w-sm rounded-2xl border border-kumo-line bg-kumo-elevated p-7">
+          <div className="mb-7 flex flex-col items-center">
+            <SiteLogo size={40} className="mb-3">
+              <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-brand">
+                <Hexagon size={20} className="text-white" weight="bold" />
+              </div>
+            </SiteLogo>
+            <h1 className="text-xl font-semibold text-kumo-default">{siteName}</h1>
+            <p className="mt-1 text-center text-sm text-kumo-subtle">
+              Entre com a identidade central da organização.
+            </p>
+          </div>
+          {errorMessage && <Banner variant="error" title={errorMessage} className="mb-4" />}
+          <Button
+            variant="primary"
+            className="w-full justify-center"
+            loading={centralBusy}
+            onClick={handleCentralLogin}
+          >
+            Continuar para entrar
+          </Button>
+        </div>
+      </div>
+    )
   }
 
   // Until the deployment config loads we don't know which auth methods are enabled, so don't guess:

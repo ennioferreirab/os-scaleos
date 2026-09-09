@@ -8,6 +8,8 @@ import { Button, Dialog, DropdownMenu, Select, Tooltip, useKumoToastManager } fr
 import { ArrowsOutSimple, ArrowLeft, ArrowSquareOut, DotsThree, DownloadSimple, Lightning, Plus, Robot, Sparkle, Star, Trash, X } from '@phosphor-icons/react'
 
 import { useAuth } from './useAuth'
+import { useOptionalAuthenticatedApi } from './AuthContext'
+import { hasPublicAuthConfig } from './auth/supabase'
 import LoginPage from './LoginPage'
 import { normalizeResourceUrl } from './resourceMatching'
 import {
@@ -31,16 +33,62 @@ interface Props {
   rpcStub: RpcStub<PublicApi>
 }
 
+interface AuthProps {
+  isAuthenticated: boolean
+  authenticatedApi: RpcStub<AuthenticatedApi> | null
+  authLoading: boolean
+  login: (token: string) => void
+}
+
 // Using `any` for form state to avoid complex discriminated union issues with spread.
 type BindingFormState = Record<string, any>
 const NO_AGENT_MODEL_ID = 'gadgets:sentinel:no-agent-model'
 
-export default function BlueprintLandingPage({ rpcStub }: Props) {
+/**
+ * In central-auth mode the root route owns the only useAuth instance. Signed-in blueprint pages
+ * are already below AuthProvider, while signed-out pages remain public until the root completes
+ * the redirect. Keeping this wrapper auth-free in that mode prevents a second authenticate() on
+ * the same PublicApi socket. Legacy deployments retain the old standalone hook below.
+ */
+export default function BlueprintLandingPage(props: Props) {
+  const authenticated = useOptionalAuthenticatedApi()
+  if (hasPublicAuthConfig()) {
+    return (
+      <BlueprintLandingContent
+        {...props}
+        auth={authenticated ? {
+          isAuthenticated: true,
+          authenticatedApi: authenticated.authenticatedApi,
+          authLoading: false,
+          login: () => {},
+        } : {
+          isAuthenticated: false,
+          authenticatedApi: null,
+          authLoading: false,
+          login: () => {},
+        }}
+      />
+    )
+  }
+  return <LegacyBlueprintLandingPage {...props} />
+}
+
+function LegacyBlueprintLandingPage({ rpcStub }: Props) {
+  const auth = useAuth(rpcStub)
+  return <BlueprintLandingContent rpcStub={rpcStub} auth={{
+    isAuthenticated: auth.isAuthenticated,
+    authenticatedApi: auth.authenticatedApi,
+    authLoading: auth.isLoading,
+    login: auth.login,
+  }} />
+}
+
+function BlueprintLandingContent({ rpcStub, auth }: Props & { auth: AuthProps }) {
   const params = useParams({ strict: false }) as { id?: string }
   const id = params.id ?? ''
   const navigate = useNavigate()
   const router = useRouter()
-  const { isAuthenticated, authenticatedApi, isLoading: authLoading, login } = useAuth(rpcStub)
+  const { isAuthenticated, authenticatedApi, authLoading, login } = auth
   const { t, formatDate, locale } = useLocale()
   const siteName = useSiteName()
   const toasts = useKumoToastManager()

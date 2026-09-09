@@ -1,4 +1,4 @@
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -14,6 +14,7 @@ import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
 import { OrganizationDirectoryDurableObject } from './organization-directory.js';
+import { HumanSessionGuard } from './auth/human-session.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -718,23 +719,33 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
    * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
    * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string,
-      private adminUserDoId: string) {
+  constructor(private admin: DurableObjectStub<AdminSettings>,
+      private directory: DurableObjectStub<OrganizationDirectoryDurableObject>,
+      private adminUserId: string, private adminUserDoId: string,
+      private guard: HumanSessionGuard) {
     super();
   }
 
-  getSettings(): Promise<AdminSettingsView> {
+  async #requireAdmin(): Promise<void> {
+    this.guard.assertValid();
+    await this.directory.requireAdminUser(this.guard.subject);
+  }
+
+  async getSettings(): Promise<AdminSettingsView> {
+    await this.#requireAdmin();
     return this.admin.getSettings(this.adminUserId);
   }
 
-  setSignupsEnabled(enabled: boolean, idempotencyKey: string): Promise<AdminMutationReceipt> {
+  async setSignupsEnabled(enabled: boolean, idempotencyKey: string): Promise<AdminMutationReceipt> {
+    await this.#requireAdmin();
     if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
       throw new Error("Invalid administrative idempotency key.");
     }
     return this.admin.setSignupsEnabledAudited(enabled, idempotencyKey, this.adminUserDoId);
   }
 
-  listAuditEvents(limit?: number): Promise<AdminAuditEvent[]> {
+  async listAuditEvents(limit?: number): Promise<AdminAuditEvent[]> {
+    await this.#requireAdmin();
     if (limit !== undefined &&
         (!Number.isInteger(limit) || limit < 1 || limit > MAX_AUDIT_EVENT_LIMIT)) {
       throw new Error(`Audit event limit must be between 1 and ${MAX_AUDIT_EVENT_LIMIT}.`);
@@ -742,7 +753,42 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     return this.admin.listAdminAuditEvents(this.adminUserDoId, limit);
   }
 
+  async listDirectoryUsers(): Promise<DirectoryUser[]> {
+    await this.#requireAdmin();
+    return this.directory.listUsers(this.guard.subject);
+  }
+
+  async listPendingUserLifecycle(): Promise<PendingUserLifecycle[]> {
+    await this.#requireAdmin();
+    return this.directory.listPendingUserLifecycle(this.guard.subject);
+  }
+
+  async inviteUser(input: {email: string; displayName: string; mutationId: string})
+      : Promise<DirectoryInviteResult> {
+    await this.#requireAdmin();
+    return this.directory.inviteUser(this.guard.subject, input);
+  }
+
+  async setUserRole(input: {userId: string; role: "admin" | "member"; mutationId: string})
+      : Promise<AdminMutationReceipt> {
+    await this.#requireAdmin();
+    return this.directory.setUserRole(this.guard.subject, input);
+  }
+
+  async setUserStatus(
+      input: {userId: string; status: "active" | "disabled"; mutationId: string})
+      : Promise<AdminMutationReceipt> {
+    await this.#requireAdmin();
+    return this.directory.setUserStatus(this.guard.subject, input);
+  }
+
+  async resumeUserStatus(input: PendingUserLifecycle): Promise<AdminMutationReceipt> {
+    await this.#requireAdmin();
+    return this.directory.resumeUserStatus(this.guard.subject, input);
+  }
+
   async setSiteName(name: string): Promise<void> {
+    await this.#requireAdmin();
     if (name.length > MAX_SITE_NAME_LENGTH) {
       throw new Error(`Site name too long (max ${MAX_SITE_NAME_LENGTH} characters).`);
     }
@@ -750,22 +796,26 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setSiteLogo(data: Uint8Array | null): Promise<AdminSettingsView['siteLogo']> {
+    await this.#requireAdmin();
     if (data !== null) validateSiteLogo(data);
     return siteLogoImage(await this.admin.setSiteLogo(data));
   }
 
   async setInstanceInstructions(text: string): Promise<void> {
+    await this.#requireAdmin();
     if (text.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH) {
       throw new Error(`Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`);
     }
     await this.admin.updateAdminConfig({ instanceInstructions: text });
   }
 
-  setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+  async setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
   }
 
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+    await this.#requireAdmin();
     if (!isAmbientGatekeeperMode(mode)) {
       throw new Error(`Invalid gatekeeper mode: ${mode}`);
     }
@@ -773,6 +823,7 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setAnnouncement(text: string): Promise<void> {
+    await this.#requireAdmin();
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
       throw new Error(`Announcement too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
     }
@@ -780,6 +831,7 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setBanner(text: string, color: BannerColor): Promise<void> {
+    await this.#requireAdmin();
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
       throw new Error(`Banner too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
     }
@@ -790,33 +842,40 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setAccentColor(color: string): Promise<void> {
+    await this.#requireAdmin();
     if (color !== "" && !isHexColor(color)) {
       throw new Error(`Invalid accent color: ${color}`);
     }
     await this.admin.updateAdminConfig({ accentColor: color });
   }
 
-  isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
+  async isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
+    await this.#requireAdmin();
     return this.admin.isBlueprintFeatured(blueprintId);
   }
 
-  setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
+  async setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.setBlueprintFeatured(blueprintId, featured);
   }
 
-  promoteFormat(blueprintId: string): Promise<void> {
+  async promoteFormat(blueprintId: string): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.promoteFormat(blueprintId);
   }
 
-  removeFormat(blueprintId: string): Promise<void> {
+  async removeFormat(blueprintId: string): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.removeFormat(blueprintId);
   }
 
-  updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
+  async updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.updateFormat(blueprintId, patch);
   }
 
-  setFormatOrder(blueprintIds: string[]): Promise<void> {
+  async setFormatOrder(blueprintIds: string[]): Promise<void> {
+    await this.#requireAdmin();
     return this.admin.setFormatOrder(blueprintIds);
   }
 }

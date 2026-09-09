@@ -49,6 +49,7 @@ import { createWorkshopLogger, obsContext, traced } from "./observability";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import { HumanSessionGuard } from "./auth/human-session.js";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
@@ -4087,7 +4088,8 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number): Promise<RpcStub<any>> {
+  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number,
+      sessionGuard?: HumanSessionGuard): Promise<RpcStub<any>> {
     let facet = this.getGadgetFacetFetcher(gadgetId, chatId);
 
     let self = this;
@@ -4112,6 +4114,7 @@ class OverseerImpl implements AgentHooks {
         //   possibly a runtime bug which needs investigation.
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
+          sessionGuard?.assertValid();
           let result: Promise<any> = Reflect.apply(method, target, args);
           return result.catch((err: any) => {
             let msg = err;
@@ -4332,7 +4335,8 @@ class OverseerImpl implements AgentHooks {
     return this.#preparingChatMessages.get(chatId);
   }
 
-  async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec)
+  async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec,
+      sessionGuard?: HumanSessionGuard)
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
@@ -4354,7 +4358,7 @@ class OverseerImpl implements AgentHooks {
       throw error;
     }
 
-    return new GatekeeperClientImpl<any>(this, id, facet);
+    return new GatekeeperClientImpl<any>(this, id, facet, {from: "user"}, sessionGuard);
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -8257,8 +8261,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async open(userId: string, profileId: string,
              notifyClosed: NativeRpcStub<() => void>,
+             expiresAtMs: number,
              shareKey?: string,
              configureObservers?: RpcStub<ObserverConfigCallback>): Promise<Overseer> {
+    const sessionGuard = new HumanSessionGuard(profileId, expiresAtMs);
+    sessionGuard.assertValid();
     let firstOpen = !this.impl.ownerId;
     if (firstOpen) {
       // This Overseer hasn't been initialized yet.
@@ -8387,12 +8394,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
-          this.impl, profileId, userId, notifyClosed.dup());
+          this.impl, profileId, userId, notifyClosed.dup(), sessionGuard);
     }
 
     return new OverseerClientInterface(
         this.impl, profileId, userId, isOwner, notifyClosed.dup(),
-        ensureCapsules);
+        ensureCapsules, sessionGuard);
   }
 
   #getExternalChat(externalChatKey: string): ExternalChatRecord | undefined {
@@ -9057,19 +9064,29 @@ function joinSessionPresence(
 @validateRpc()
 class OverseerClientInterface extends RpcTarget implements Overseer {
   #clientProfilePromise: Promise<AiChatAuthorInfo> | undefined;
+  private implementation: OverseerImpl;
 
-  constructor(private impl: OverseerImpl,
+  constructor(impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
               private isOwner: boolean,
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
               // this so ambient providers are attached when possible.
-               private slashCommandsReady: Promise<void>) {
+              private slashCommandsReady: Promise<void>,
+              private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "build", () => this.#getClientProfile());
     this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  // Every public method reaches the implementation through this accessor, making expiry a
+  // per-entry capability check instead of relying only on deadline WebSocket cleanup.
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // We create a new stub for every call so that we don't have to worry about detecting when a
@@ -9274,14 +9291,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, record.id, this.clientUserId, this.sessionGuard);
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.sessionGuard);
   }
 
   async deleteSelf(): Promise<void> {
@@ -9353,7 +9370,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (gatekeeper === undefined) {
       throw new Error(`No such gatekeeper id: ${id}`);
     }
-    return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id));
+    return new GatekeeperClientImpl(
+        this.impl, id, this.impl.getGatekeeperFacet(id), {from: "user"}, this.sessionGuard);
   }
 
   private async recordConnectionCreated(
@@ -9379,7 +9397,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       resourceUrl,
       typeUrlPattern,
     };
-    let result = await this.impl.addGatekeeper(cls, creationSpec);
+    let result = await this.impl.addGatekeeper(cls, creationSpec, this.sessionGuard);
     await this.recordConnectionCreated(result, "gatekeeper", vendorId);
     return result;
   }
@@ -9406,7 +9424,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec, this.sessionGuard);
     await this.recordConnectionCreated(result, "ai_model");
     return result;
   }
@@ -9451,7 +9469,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec, this.sessionGuard);
     await this.recordConnectionCreated(result, "agent_spawner");
     return result;
   }
@@ -10555,15 +10573,24 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 // whether "use" callers may invoke it.
 @validateRpc()
 class UseOverseerInterface extends RpcTarget implements Overseer {
-  constructor(private impl: OverseerImpl,
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
-              private notifyClosed: NativeRpcStub<() => void>) {
+              private notifyClosed: NativeRpcStub<() => void>,
+              private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "use",
         () => retryOnDoReset(() => this.#clientUser.whoami(), this.impl.logger));
     this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -10592,6 +10619,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   // Throws "Unauthorized" for any method not available to "use" collaborators.
   #deny(): never {
+    this.sessionGuard.assertValid();
     throw new Error("Unauthorized: this collaborator only has permission to use the gadget's UI.");
   }
 
@@ -10663,7 +10691,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
+    return new UseGadgetClientInterface(this.impl, id, this.clientUserId, this.sessionGuard);
   }
 
   // --- Denied methods (build-only) ---
@@ -10809,9 +10837,17 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 // Overseer.createGadget()/getGadget().
 @validateRpc()
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
-  constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: WorkpieceId,
+      private clientUserId: string, private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -10822,6 +10858,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async getId(): Promise<WorkpieceId> {
+    this.sessionGuard?.assertValid();
     return this.id;
   }
 
@@ -10850,7 +10887,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       chat_id: chatId,
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, chatId);
+    return this.impl.getGadgetFacet(this.id, chatId, this.sessionGuard);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -10883,7 +10920,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     let edge = record.bindings[name];
     if (!edge || edge.pending || !this.impl.storage.gatekeepers.get(edge.target)) return null;
     return new GatekeeperClientImpl(
-        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target));
+        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target),
+        {from: "user"}, this.sessionGuard);
   }
 
   async bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
@@ -11061,9 +11099,17 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 // fails to compile here until a developer decides whether "use" callers may invoke it.
 @validateRpc()
 class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
-  constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: WorkpieceId,
+      private clientUserId: string, private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -11074,12 +11120,14 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   }
 
   #deny(): never {
+    this.sessionGuard.assertValid();
     throw new Error("Unauthorized: this collaborator only has permission to use the gadget's UI.");
   }
 
   // --- Allowed methods ---
 
   async getId(): Promise<WorkpieceId> {
+    this.sessionGuard.assertValid();
     return this.id;
   }
 
@@ -11104,7 +11152,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       user_id: this.#clientUser.id.toString(),
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, undefined);
+    return this.impl.getGadgetFacet(this.id, undefined, this.sessionGuard);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -11141,10 +11189,19 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 @validateRpc()
 class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     extends RpcTarget implements GatekeeperClient<Session> {
-  constructor(private impl: OverseerImpl, private id: number,
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: number,
       private facet: Fetcher<Gatekeeper<Session>>,
-      private caller: GatekeeperCaller = {from: "user"}) {
+      private caller: GatekeeperCaller = {from: "user"},
+      private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
   }
 
   async remove(): Promise<void> {
@@ -11159,6 +11216,7 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 
   async getId(): Promise<number> {
+    this.sessionGuard?.assertValid();
     return this.id;
   }
 
@@ -11181,12 +11239,14 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 
   async describe(): Promise<ResourceDescription> {
+    this.sessionGuard?.assertValid();
     return this.facet.describe();
   }
 
   async openSession(): Promise<RpcStub<Session>> {
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return this.facet.startSession(new ApprovalQueueImpl(this.impl, this.id, this.caller));
+    return this.facet.startSession(
+        new ApprovalQueueImpl(this.impl, this.id, this.caller, this.sessionGuard));
   }
 
   async getCreationSpec(): Promise<GatekeeperCreationSpec> {
@@ -11214,9 +11274,17 @@ class SlashCommandAuthorizerImpl extends NativeRpcTarget implements ObservationA
 
 @validateRpc()
 class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
-  constructor(private impl: OverseerImpl, private gatekeeperId: number,
-              private caller: GatekeeperCaller) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private gatekeeperId: number,
+              private caller: GatekeeperCaller, private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {

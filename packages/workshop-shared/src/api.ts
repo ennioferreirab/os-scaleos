@@ -336,6 +336,10 @@ export const getOpenGadgetErrorCode = openGadgetErrors.getCode;
 export const AUTH_ERROR_CODES = {
   invalidSessionToken: "INVALID_SESSION_TOKEN",
   notAuthenticatedWithAccess: "NOT_AUTHENTICATED_WITH_ACCESS",
+  unauthenticated: "UNAUTHENTICATED",
+  forbidden: "FORBIDDEN",
+  conflict: "CONFLICT",
+  dependencyUnavailable: "DEPENDENCY_UNAVAILABLE",
 } as const;
 
 /** An expected authentication failure code. */
@@ -346,6 +350,10 @@ export type AuthErrorCode = typeof AUTH_ERROR_CODES[keyof typeof AUTH_ERROR_CODE
 export const AUTH_ERROR_MESSAGES: Record<AuthErrorCode, string> = {
   [AUTH_ERROR_CODES.invalidSessionToken]: "invalid session token",
   [AUTH_ERROR_CODES.notAuthenticatedWithAccess]: "Not authenticated with Access.",
+  [AUTH_ERROR_CODES.unauthenticated]: "Authentication is required.",
+  [AUTH_ERROR_CODES.forbidden]: "This operation is not permitted.",
+  [AUTH_ERROR_CODES.conflict]: "The requested operation conflicts with current state.",
+  [AUTH_ERROR_CODES.dependencyUnavailable]: "An authentication dependency is unavailable.",
 };
 
 const authErrors = codedErrorFamily(AUTH_ERROR_MESSAGES);
@@ -363,19 +371,6 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;
-
-  /**
-   * Change the user's password, if using password-based authentication.
-   *
-   * See `PublicApi.login()` for an explanation of the hashing algorithm.
-   */
-  changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void>;
-
-  /**
-   * Whether this account has a password set. False for accounts created via an OAuth provider, in
-   * which case the change-password UI should be hidden.
-   */
-  hasPasswordLogin(): Promise<boolean>;
 
   /**
    * List the user's configured AI models.
@@ -711,6 +706,7 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   getAdminApi(): Promise<RpcStub<AdminApi> | null>;
 
+
   // TODO:
   // - Edit permissions on a connected account.
 }
@@ -866,11 +862,11 @@ export type AdminMutationReceipt = {
 /** A bounded, non-sensitive description of one field changed by an administrative mutation. */
 export type AdminAuditChange = {
   /** Stable field name from the administrative resource schema. */
-  field: "signupsEnabled";
-  /** Value before the mutation. */
-  before: boolean;
-  /** Value after the mutation. */
-  after: boolean;
+  field: "signupsEnabled" | "role" | "status";
+  /** Bounded value before the mutation; never contains invitation secrets or user content. */
+  before: boolean | string | null;
+  /** Bounded value after the mutation; never contains invitation secrets or user content. */
+  after: boolean | string | null;
 };
 
 /** A durable local audit event for a deployment administrative mutation. */
@@ -883,14 +879,17 @@ export type AdminAuditEvent = {
   tenantId: string;
   /** Canonical directory user identifier resolved from the authenticated OS account. */
   actorUserId: string;
+  /** Active administrator who resumed the original actor's pending provider mutation, if any. */
+  resumedByUserId?: string;
   /** Optional executor principal for future product adapters; absent for local OS administration. */
   executorPrincipalId?: string;
   /** Stable kind of resource affected by the event. */
-  resourceType: "adminConfig";
+  resourceType: "adminConfig" | "directoryUser";
   /** Backend-owned identifier of the affected OS installation. */
   resourceId: string;
   /** Stable administrative operation name. */
-  action: "setSignupsEnabled";
+  action: "setSignupsEnabled" | "bootstrapAdmin" | "inviteUser" |
+      "setUserRole" | "setUserStatus";
   /** Policy version before the mutation. */
   beforeVersion: number;
   /** Policy version after the mutation. */
@@ -898,7 +897,9 @@ export type AdminAuditEvent = {
   /** Outcome of the durably committed mutation. */
   result: "succeeded";
   /** Stable reason describing the outcome without carrying private content. */
-  reasonCode: "ADMIN_CONFIG_UPDATED";
+  reasonCode: "ADMIN_CONFIG_UPDATED" | "DIRECTORY_ADMIN_BOOTSTRAPPED" |
+      "DIRECTORY_USER_INVITED" | "DIRECTORY_USER_ROLE_CHANGED" |
+      "DIRECTORY_USER_DISABLED" | "DIRECTORY_USER_REACTIVATED";
   /** Backend-generated identifier for correlating this event with its mutation receipt. */
   correlationId: string;
   /** Caller-generated operation key used only for idempotent retry detection. */
@@ -928,6 +929,52 @@ export type AdminSettingsView = {
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
 };
+
+/** Canonical organization-directory record shown to an administrator. */
+export type DirectoryUser = {
+  /** Immutable verified Supabase subject. */
+  userId: string;
+  /** Confirmed contact address. It is never used as an authorization key. */
+  email: string;
+  /** Presentation name initialized by the inviter and editable by the user. */
+  displayName: string;
+  /** Organization role; invited users always start as members. */
+  role: "admin" | "member";
+  /** Disabled users retain identity and content but cannot establish a new product session. */
+  status: "active" | "disabled";
+  /** Server creation time as ISO-8601 UTC. */
+  createdAt: string;
+  /** Server update time as ISO-8601 UTC. */
+  updatedAt: string;
+};
+
+/** Result of one authoritative Supabase invitation plus local admission. */
+export type DirectoryInviteResult = {
+  /** Newly admitted member, or the identical member returned on idempotent replay. */
+  user: DirectoryUser;
+  /** Durable local mutation receipt. */
+  receipt: AdminMutationReceipt;
+};
+
+/** Admin-only description of one provider lifecycle mutation awaiting completion. */
+export type PendingUserLifecycle = {
+  /** Immutable Subject of the affected directory user. */
+  userId: string;
+  /** Desired provider and directory status reserved by the original operation. */
+  status: "active" | "disabled";
+  /** Original mutation identifier required for exact recovery and replay. */
+  mutationId: string;
+  /** Original administrator; selector data only, never authority for the resuming call. */
+  actorUserId: string;
+  /** Server time at which the provider transition was reserved, as ISO-8601 UTC. */
+  startedAt: string;
+};
+
+/** Exact original lifecycle selector submitted when resuming; timestamps are not caller-controlled. */
+export type ResumeUserStatusInput = Pick<
+  PendingUserLifecycle,
+  "userId" | "status" | "mutationId" | "actorUserId"
+>;
 
 /**
  * One promoted blueprint, as the admin Formats panel sees it: the deployment's curation plus
@@ -974,8 +1021,8 @@ export type AdminFormat = {
 
 /**
  * Capability for managing deployment-wide admin settings, obtained via
- * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
+ * AuthenticatedApi.getAdminApi() (which is null for non-admins). Every method rechecks the human
+ * session guard and current active-admin status. Covers branding, agent instructions,
  * local administrative audit history, and which gatekeeper connectors/resources are offered — NOT
  * authentication config (that's env-var driven). Each setter throws on invalid input.
  */
@@ -995,6 +1042,27 @@ export interface AdminApi {
    * admin capability supplies authorization and tenant scope; callers cannot select another tenant.
    */
   listAuditEvents(limit?: number): Promise<AdminAuditEvent[]>;
+
+  /** List users in the configured single organization. */
+  listDirectoryUsers(): Promise<DirectoryUser[]>;
+
+  /** Invite or explicitly admit a central identity as a member. */
+  inviteUser(input: {email: string; displayName: string; mutationId: string})
+      : Promise<DirectoryInviteResult>;
+
+  /** Change an active user's organization role, protecting the last active administrator. */
+  setUserRole(input: {userId: string; role: "admin" | "member"; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Change a user's provider and directory lifecycle status without deleting their identity. */
+  setUserStatus(input: {userId: string; status: "active" | "disabled"; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** List provider lifecycle operations that an active administrator may explicitly resume. */
+  listPendingUserLifecycle(): Promise<PendingUserLifecycle[]>;
+
+  /** Resume the exact original lifecycle payload after rechecking current administrator authority. */
+  resumeUserStatus(input: ResumeUserStatusInput): Promise<AdminMutationReceipt>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.
