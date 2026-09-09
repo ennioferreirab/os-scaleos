@@ -97,3 +97,43 @@ or export policy must preserve retry detection separately before deleting event 
 `AdminSettings` mutations use its durable outbox because their authority is a different DO.
 Directory-owned lifecycle mutations commit their state, receipt, and audit event directly in one
 directory transaction. Neither path adds a central collector; retention/export remains future work.
+
+## Central group audit storage (#28)
+
+Issue #28 transitions group administrative authority, receipts, and audit storage to the central
+Postgres database (`scaleos_directory`).
+
+### Group audit events
+
+New group administrative events are committed directly to `scaleos_directory.group_audit_events`
+in the same SQL transaction as the group mutation, monotonic version increment, and mutation receipt.
+Events adhere to the canonical `AdminAuditEvent` envelope:
+
+- `resourceType`: `"directoryGroup"`
+- `action` and `reasonCode`:
+  - `createGroup` → `DIRECTORY_GROUP_CREATED`
+  - `renameGroup` → `DIRECTORY_GROUP_RENAMED`
+  - `replaceGroupMembers` → `DIRECTORY_GROUP_MEMBERS_CHANGED`
+  - `deleteGroup` → `DIRECTORY_GROUP_DELETED`
+- `change`:
+  - `createGroup`: `{field: "name", before: null, after: "<name>"}`
+  - `renameGroup`: `{field: "name", before: "<oldName>", after: "<newName>"}`
+  - `replaceGroupMembers`: `{field: "members", before: "<beforeCount>", after: "<afterCount>"}`
+    (member IDs, emails, or personal details are never stored in the audit trail)
+  - `deleteGroup`: `{field: "name", before: "<oldName>", after: null}`
+- `result`: `"succeeded"`
+- `correlationId` and `idempotencyKey`: Bound to the caller's `mutationId`.
+
+### Storage and domain merging
+
+Administrative audit queries merge events from the respective domain authorities by timestamp and
+event ID, preserving the standard limit of 50 events (up to 200). Group audit events reside in
+`scaleos_directory.group_audit_events` indexed by `(org_id, timestamp DESC, event_id DESC)`.
+The central group version clock (`group_versions.version`) is incremented atomically under lock on each
+committed mutation and stored in `beforeVersion`/`afterVersion`.
+
+Retries with the same actor, operation, mutation ID, and normalized payload return the stored receipt
+without generating duplicate audit events. Stored audit records and receipts remain durable for the
+lifetime of the organization.
+
+The central directory schema, functions, and reader bindings remain unprovisioned in the live acceptance database.
