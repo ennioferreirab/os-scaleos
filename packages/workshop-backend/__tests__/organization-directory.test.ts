@@ -241,6 +241,7 @@ describe("OrganizationDirectoryDurableObject", () => {
         status: "disabled",
         mutationId,
         actorUserId: ADMIN_ID,
+        startedAt: expect.any(String),
       });
       await expect(directory.resumeUserStatus(RESUMER_ID, {...pending, status: "active"}))
           .rejects.toMatchObject({code: AUTH_ERROR_CODES.conflict});
