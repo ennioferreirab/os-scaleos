@@ -7,12 +7,17 @@ import {
   PendingUserLifecycle,
   ResumeUserStatusInput,
   createAuthError,
+  type Audience,
+  type DirectoryAudienceTargets,
+  type Group,
+  type GroupMember,
 } from "@gadgets/workshop-shared/api";
 import { collection, createTypedStorage } from "@gadgets/typed-storage";
 import { DurableObject } from "cloudflare:workers";
 import { requireSubject, type SupabaseAuthEnv } from "./auth/supabase.js";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const GROUP_NAME_MAX_LENGTH = 80;
 
 /** Stable actor shape retained for the T02 AdminSettings audit outbox. */
 export type DirectoryActor = {
@@ -48,10 +53,12 @@ type DirectoryMutation = {
   key: string;
   mutationId: string;
   actorId: string;
-  operation: "inviteUser" | "setUserRole" | "setUserStatus";
+  operation: "inviteUser" | "setUserRole" | "setUserStatus" |
+    "createGroup" | "renameGroup" | "replaceGroupMembers" | "deleteGroup";
   requestHash: string;
   receipt: AdminMutationReceipt;
   user?: DirectoryUser;
+  group?: Group;
 };
 type StoredAuditEvent = AdminAuditEvent & {storageKey: string};
 
@@ -68,6 +75,19 @@ function makeDirectoryStorage(storage: DurableObjectStorage) {
       pendingInvites: collection<PendingInvite>()({
         primaryKey: "mutationId",
         uniqueIndexes: {byEmail: (pending: PendingInvite) => pending.email},
+      }),
+      groups: collection<Group>()({
+        primaryKey: "groupId",
+        uniqueIndexes: {
+          byName: (group: Group) => group.name.trim().toLocaleLowerCase("pt-BR"),
+        },
+      }),
+      groupMembers: collection<GroupMember>()({
+        primaryKey: "key",
+        nonUniqueIndexes: {
+          byGroup: (member: GroupMember) => member.groupId,
+          byUser: (member: GroupMember) => member.userId,
+        },
       }),
       mutations: collection<DirectoryMutation>()({primaryKey: "key"}),
       auditEvents: collection<StoredAuditEvent>()({
@@ -119,6 +139,46 @@ function normalizeDisplayName(displayName: string): string {
   return normalized;
 }
 
+function normalizeGroupName(name: string): {display: string; index: string} {
+  if (typeof name !== "string") {
+    throw Object.assign(new TypeError("Group name must be a string."), {
+      code: AUTH_ERROR_CODES.invalidInput,
+    });
+  }
+  const display = name.trim();
+  if (!display || display.length > GROUP_NAME_MAX_LENGTH) {
+    throw Object.assign(
+        new TypeError(`Group name must be between 1 and ${GROUP_NAME_MAX_LENGTH} characters.`),
+        {code: AUTH_ERROR_CODES.invalidInput});
+  }
+  return {display, index: display.toLocaleLowerCase("pt-BR")};
+}
+
+function requireGroupId(value: string): string {
+  try {
+    return requireSubject(value, "groupId");
+  } catch {
+    throw Object.assign(new TypeError("groupId must be a UUID."), {
+      code: AUTH_ERROR_CODES.invalidInput,
+    });
+  }
+}
+
+function normalizeMemberIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw Object.assign(new TypeError("userIds must be an array."), {
+      code: AUTH_ERROR_CODES.invalidInput,
+    });
+  }
+  try {
+    return [...new Set(value.map(userId => requireSubject(userId, "userId")))].toSorted();
+  } catch {
+    throw Object.assign(new TypeError("userIds must contain only UUIDs."), {
+      code: AUTH_ERROR_CODES.invalidInput,
+    });
+  }
+}
+
 async function requestHash(value: unknown): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
   return new Uint8Array(digest).toHex();
@@ -134,7 +194,7 @@ function selfDisableError(): Error & {code: typeof AUTH_ERROR_CODES.forbidden} {
 }
 
 function notFoundError(message: string): Error & {code: "NOT_FOUND"} {
-  return Object.assign(new Error(message), {code: "NOT_FOUND" as const});
+  return Object.assign(new Error(message), {code: AUTH_ERROR_CODES.notFound});
 }
 
 function publicProviderUser(value: unknown): ProviderUser {
@@ -295,6 +355,25 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     return user;
   }
 
+  #requireGroup(groupId: string): Group {
+    const group = this.storage.groups.get(requireGroupId(groupId));
+    if (!group) throw notFoundError("Directory group was not found.");
+    return group;
+  }
+
+  #groupMemberIds(groupId: string): string[] {
+    return [...this.storage.groupMembers.byGroup.get(groupId)]
+        .map(member => member.userId).toSorted();
+  }
+
+  #sortedGroups(): Group[] {
+    return [...this.storage.groups.list()].toSorted((left, right) => {
+      const byName = left.name.trim().toLocaleLowerCase("pt-BR")
+          .localeCompare(right.name.trim().toLocaleLowerCase("pt-BR"), "pt-BR");
+      return byName || left.groupId.localeCompare(right.groupId, "pt-BR");
+    });
+  }
+
   #hasAnotherActiveAdmin(userId: string): boolean {
     return [...this.storage.directoryUsers.list()].some(candidate =>
       candidate.userId !== userId && candidate.role === "admin" &&
@@ -305,7 +384,8 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       action: AdminAuditEvent["action"], reasonCode: AdminAuditEvent["reasonCode"],
       mutationId: string, change: AdminAuditEvent["change"], beforeVersion: number,
       afterVersion: number, idempotencyKey = mutationId,
-      resumedByUserId?: string): AdminAuditEvent {
+      resumedByUserId?: string,
+      resourceType?: AdminAuditEvent["resourceType"]): AdminAuditEvent {
     const orgId = this.#identity().orgId;
     return {
       eventId: crypto.randomUUID(),
@@ -313,7 +393,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       tenantId: orgId,
       actorUserId: actorId,
       ...(resumedByUserId ? {resumedByUserId} : {}),
-      resourceType: resourceId === orgId ? "adminConfig" : "directoryUser",
+      resourceType: resourceType ?? (resourceId === orgId ? "adminConfig" : "directoryUser"),
       resourceId,
       action,
       beforeVersion,
@@ -748,6 +828,228 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
       this.storage.pendingLifecycle.delete(userId);
       return receipt;
     });
+  }
+
+  /** List groups after rechecking the requesting administrator in this directory invocation. */
+  listGroups(actorId: string): Group[] {
+    this.#identity();
+    this.#requireAdmin(actorId);
+    return this.#sortedGroups();
+  }
+
+  /** Return group member Subjects after rechecking the administrator in this invocation. */
+  getGroupMembers(actorId: string, groupId: string): string[] {
+    this.#identity();
+    this.#requireAdmin(actorId);
+    const normalizedGroupId = requireGroupId(groupId);
+    this.#requireGroup(normalizedGroupId);
+    return this.#groupMemberIds(normalizedGroupId);
+  }
+
+  /** Return only active-user names and live-group names to an authenticated audience picker. */
+  listAudienceTargets(actorId: string): DirectoryAudienceTargets {
+    this.#identity();
+    this.#requireActive(actorId);
+    const users = [...this.storage.directoryUsers.list()]
+        .filter(user => this.#effectiveStatus(user) === "active")
+        .map(user => ({userId: user.userId, displayName: user.displayName}))
+        .toSorted((left, right) => {
+          const byName = left.displayName.localeCompare(right.displayName, "pt-BR");
+          return byName || left.userId.localeCompare(right.userId, "pt-BR");
+        });
+    const groups = this.#sortedGroups()
+        .map(group => ({groupId: group.groupId, name: group.name}));
+    return {users, groups};
+  }
+
+  /** Create a group, its receipt, and its local audit event in one directory transaction. */
+  async createGroup(actorId: string, input: {name: string; mutationId: string})
+      : Promise<{group: Group; receipt: AdminMutationReceipt}> {
+    actorId = requireSubject(actorId, "actorId");
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const name = normalizeGroupName(input.name);
+    const hash = await requestHash({name: name.display});
+    const key = mutationKey(actorId, "createGroup", mutationId);
+    return this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash || !completed.group) {
+          throw createAuthError(AUTH_ERROR_CODES.conflict);
+        }
+        return {group: completed.group, receipt: completed.receipt};
+      }
+      if (this.storage.groups.byName.get(name.index)) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const now = new Date().toISOString();
+      const group: Group = {
+        groupId: crypto.randomUUID(),
+        name: name.display,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      const event = this.#event(actorId, group.groupId, "createGroup", "DIRECTORY_GROUP_CREATED",
+          mutationId, {field: "name", before: null, after: group.name}, version.before,
+          version.after, key, undefined, "directoryGroup");
+      this.storage.groups.put(group);
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "createGroup", requestHash: hash, receipt, group,
+      });
+      this.#storeEvent(event);
+      return {group, receipt};
+    });
+  }
+
+  /** Rename a group while preserving its id and membership atomically. */
+  async renameGroup(actorId: string,
+      input: {groupId: string; name: string; mutationId: string}): Promise<AdminMutationReceipt> {
+    actorId = requireSubject(actorId, "actorId");
+    const groupId = requireGroupId(input.groupId);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const name = normalizeGroupName(input.name);
+    const hash = await requestHash({groupId, name: name.display});
+    const key = mutationKey(actorId, "renameGroup", mutationId);
+    return this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      const group = this.#requireGroup(groupId);
+      const existing = this.storage.groups.byName.get(name.index);
+      if (existing && existing.groupId !== groupId) {
+        throw createAuthError(AUTH_ERROR_CODES.conflict);
+      }
+      const now = new Date().toISOString();
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      const event = this.#event(actorId, groupId, "renameGroup", "DIRECTORY_GROUP_RENAMED",
+          mutationId, {field: "name", before: group.name, after: name.display}, version.before,
+          version.after, key, undefined, "directoryGroup");
+      this.storage.groups.put({...group, name: name.display, updatedAt: now});
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "renameGroup", requestHash: hash, receipt,
+      });
+      this.#storeEvent(event);
+      return receipt;
+    });
+  }
+
+  /** Replace the complete group member set in one transaction, validating every new member first. */
+  async replaceGroupMembers(actorId: string,
+      input: {groupId: string; userIds: string[]; mutationId: string})
+      : Promise<AdminMutationReceipt> {
+    actorId = requireSubject(actorId, "actorId");
+    const groupId = requireGroupId(input.groupId);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const userIds = normalizeMemberIds(input.userIds);
+    const hash = await requestHash({groupId, userIds});
+    const key = mutationKey(actorId, "replaceGroupMembers", mutationId);
+    return this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      this.#requireGroup(groupId);
+      const before = this.#groupMemberIds(groupId);
+      const beforeSet = new Set(before);
+      for (const userId of userIds) {
+        const user = this.storage.directoryUsers.get(userId);
+        if (!user || (!beforeSet.has(userId) && this.#effectiveStatus(user) !== "active")) {
+          throw Object.assign(new TypeError("Group members must be existing active users."), {
+            code: AUTH_ERROR_CODES.invalidInput,
+          });
+        }
+      }
+      const nextSet = new Set(userIds);
+      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
+      for (const member of members) {
+        if (!nextSet.has(member.userId)) this.storage.groupMembers.delete(member.key);
+      }
+      const now = new Date().toISOString();
+      for (const userId of userIds) {
+        if (!beforeSet.has(userId)) {
+          this.storage.groupMembers.put({
+            key: `${groupId}:${userId}`,
+            groupId,
+            userId,
+          });
+        }
+      }
+      const group = this.#requireGroup(groupId);
+      this.storage.groups.put({...group, updatedAt: now});
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      const event = this.#event(actorId, groupId, "replaceGroupMembers",
+          "DIRECTORY_GROUP_MEMBERS_CHANGED", mutationId,
+          {field: "members", before: String(before.length), after: String(userIds.length)},
+          version.before, version.after, key, undefined, "directoryGroup");
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "replaceGroupMembers", requestHash: hash, receipt,
+      });
+      this.#storeEvent(event);
+      return receipt;
+    });
+  }
+
+  /** Delete a group and its membership rows atomically; audience references then grant nothing. */
+  async deleteGroup(actorId: string,
+      input: {groupId: string; mutationId: string}): Promise<AdminMutationReceipt> {
+    actorId = requireSubject(actorId, "actorId");
+    const groupId = requireGroupId(input.groupId);
+    const mutationId = requireSubject(input.mutationId, "mutationId");
+    const hash = await requestHash({groupId});
+    const key = mutationKey(actorId, "deleteGroup", mutationId);
+    return this.storage.transaction(() => {
+      this.#requireAdmin(actorId);
+      const completed = this.storage.mutations.get(key);
+      if (completed) {
+        if (completed.requestHash !== hash) throw createAuthError(AUTH_ERROR_CODES.conflict);
+        return completed.receipt;
+      }
+      const group = this.#requireGroup(groupId);
+      const members = [...this.storage.groupMembers.byGroup.get(groupId)];
+      for (const member of members) {
+        this.storage.groupMembers.delete(member.key);
+      }
+      this.storage.groups.delete(groupId);
+      const now = new Date().toISOString();
+      const version = this.#nextVersion();
+      const receipt = this.#receipt(mutationId, now, version.after);
+      const event = this.#event(actorId, groupId, "deleteGroup", "DIRECTORY_GROUP_DELETED",
+          mutationId, {field: "name", before: group.name, after: null}, version.before,
+          version.after, key, undefined, "directoryGroup");
+      this.storage.mutations.put({
+        key, mutationId, actorId, operation: "deleteGroup", requestHash: hash, receipt,
+      });
+      this.#storeEvent(event);
+      return receipt;
+    });
+  }
+
+  /** Resolve an audience from current directory state without caching or external I/O. */
+  resolveAudience(subject: string, audience: Audience): {allowed: boolean; sources: string[]} {
+    this.#identity();
+    subject = requireSubject(subject);
+    const user = this.storage.directoryUsers.get(subject);
+    if (!user || this.#effectiveStatus(user) !== "active") return {allowed: false, sources: []};
+
+    const sources: string[] = [];
+    if (audience.everyone) sources.push("everyone");
+    if (audience.userIds.includes(subject)) sources.push(`user:${subject}`);
+    const groupIds = [...new Set(audience.groupIds.filter(groupId => typeof groupId === "string"))]
+        .toSorted();
+    for (const groupId of groupIds) {
+      if (!this.storage.groups.get(groupId)) continue;
+      if (this.storage.groupMembers.get(`${groupId}:${subject}`)) sources.push(`group:${groupId}`);
+    }
+    return {allowed: sources.length > 0, sources};
   }
 
   /** Resolve an admitted user for the private backend-to-backend directory endpoint. */
