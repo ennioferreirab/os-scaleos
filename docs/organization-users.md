@@ -94,9 +94,11 @@ vendor. `enabled` automatically provisions only selected users and cannot create
 for anyone. Legacy-auth deployments keep their prior optional behavior and do not consult directory
 policy.
 
-Human management and resource-configurator frames retain a narrow `AppUiAuthority` bound to the
-exact connected account; every retained UI duplicates it and calls `requireAppAccess()` before
-processing an RPC, including validation-only paths.
+Human management and resource-configurator frames retain a Subject-bound `ContextAuthority` minted
+by the kernel for the exact app and target. Every retained UI duplicates it and calls
+`assertAppAccess()` before processing an RPC, including validation-only paths. Context additionally
+uses the same capability to obtain the trusted actor and resolve current directory audiences; other
+vendors never receive or construct identity payloads.
 Persistent observer verifiers retain a separate attenuated authority bound to the exact Workshop
 user object, connected-account ID, and vendor. Every verifier use re-enters that user object and
 rejects a removed or mismatched account before resolving current directory policy. Workspace

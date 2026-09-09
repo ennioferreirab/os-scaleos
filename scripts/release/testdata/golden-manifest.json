@@ -151,13 +151,7 @@
       }
     },
     "gatekeeper-context": {
-      "bindings": [
-        {
-          "name": "CONTEXT_COLLECTIONS",
-          "namespace_id": "$KV_CONTEXT_COLLECTIONS_ID",
-          "type": "kv_namespace"
-        }
-      ],
+      "bindings": [],
       "compatibilityDate": "2026-02-02",
       "compatibilityFlags": [
         "nodejs_compat",

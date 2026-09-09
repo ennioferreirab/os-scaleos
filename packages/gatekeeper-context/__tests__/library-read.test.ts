@@ -1,19 +1,21 @@
 import type { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ContextAuthorityCapability, ObservationAuthorizer,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { LibraryReadSession } from "../src/library-read.js";
 import type { ContextCollectionDurableObject } from "../src/context-collection.js";
-import type { UserLibraryDurableObject } from "../src/user-library.js";
+import type { LibraryRegistryDurableObject } from "../src/registry-do.js";
 
 function deniedSession() {
   const appAccessError = new Error("app access denied");
-  const assertAppAccess = vi.fn(async () => {
+  const authorizeObservation = vi.fn(async () => {});
+  const authorityAssertAppAccess = vi.fn(async () => {
     throw appAccessError;
   });
-  const authorizeObservation = vi.fn(async () => {});
   const collection = {
     search: vi.fn(async () => []),
-    getMetadata: vi.fn(async () => undefined),
+    getAuthorizedSummary: vi.fn(async () => null),
     listContextDocuments: vi.fn(async () => []),
     getContextDocument: vi.fn(async () => undefined),
   };
@@ -21,27 +23,35 @@ function deniedSession() {
     idFromName: vi.fn((id: string) => id),
     get: vi.fn(() => collection),
   } as unknown as DurableObjectNamespace<ContextCollectionDurableObject>;
-  const getEnabledCollections = vi.fn(async () => new Map([["docs", "public" as const]]));
-  const userLibraries = {
-    idFromName: vi.fn((id: string) => id),
-    get: vi.fn(() => ({ getEnabledCollections })),
-  } as unknown as DurableObjectNamespace<UserLibraryDurableObject>;
-  const authorizer = {assertAppAccess, authorizeObservation} as unknown as
-      NativeRpcStub<ApprovalQueue>;
+  const registries = {
+    getByName: vi.fn(() => ({listCollections: vi.fn(async () => [])})),
+  } as unknown as DurableObjectNamespace<LibraryRegistryDurableObject>;
+  const duplicate = <T extends object>(value: T): T => ({
+    ...value,
+    dup: vi.fn(() => value),
+  });
+  const authority = duplicate({
+    assertAppAccess: authorityAssertAppAccess,
+    getActor: vi.fn(async () => ({subject: "subject-a", isOrgAdmin: false})),
+    resolveAudience: vi.fn(async () => ({allowed: false, sources: []})),
+    listAudienceTargets: vi.fn(async () => ({users: [], groups: []})),
+  }) as unknown as ContextAuthorityCapability;
+  const authorizer = duplicate({
+    authorizeObservation,
+  }) as unknown as NativeRpcStub<ObservationAuthorizer>;
   const session = new LibraryReadSession(
     collections,
-    userLibraries,
+    registries,
     "example.test",
-    "account-a",
+    authority,
     authorizer,
     vi.fn(async () => ({pendingCollections: [], commit() {}})),
   );
   return {
     appAccessError,
-    assertAppAccess,
+    authorityAssertAppAccess,
     authorizeObservation,
     collection,
-    getEnabledCollections,
     session,
   };
 }
@@ -54,10 +64,9 @@ describe("LibraryReadSession", () => {
     await expect(fixture.session.list()).rejects.toBe(fixture.appAccessError);
     await expect(fixture.session.read("docs/file.md")).rejects.toBe(fixture.appAccessError);
 
-    expect(fixture.assertAppAccess).toHaveBeenCalledTimes(3);
-    expect(fixture.getEnabledCollections).not.toHaveBeenCalled();
+    expect(fixture.authorityAssertAppAccess).toHaveBeenCalledTimes(3);
     expect(fixture.collection.search).not.toHaveBeenCalled();
-    expect(fixture.collection.getMetadata).not.toHaveBeenCalled();
+    expect(fixture.collection.getAuthorizedSummary).not.toHaveBeenCalled();
     expect(fixture.collection.listContextDocuments).not.toHaveBeenCalled();
     expect(fixture.collection.getContextDocument).not.toHaveBeenCalled();
     expect(fixture.authorizeObservation).not.toHaveBeenCalled();

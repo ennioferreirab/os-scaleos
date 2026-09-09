@@ -765,26 +765,28 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("Linear app authority is unavailable.");
+    await authority.assertAppAccess();
     const account = this.#account();
     const getToken = () => account.getAccessToken();
 
     if (resourceUrlPattern === WORKSPACE_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_WORKSPACE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearWorkspaceConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new LinearWorkspaceConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === TEAM_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_TEAM_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearTeamConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new LinearTeamConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: LINEAR_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new LinearIssueConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new LinearIssueConfiguratorUI(getToken, authority)),
       };
     }
     throw new Error(`Unsupported Linear resource configurator type: ${resourceUrlPattern}`);

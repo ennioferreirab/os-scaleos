@@ -446,17 +446,19 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Cloudflare app authority is unavailable.");
     const getToken = () => this.#account().getAccessToken();
     if (resourceUrlPattern === ACCOUNT_OBSERVABILITY_RESOURCE.urlPattern) {
       return {
         iframeHtml: ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CloudflareAccountConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new CloudflareAccountConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === WORKER_OBSERVABILITY_RESOURCE.urlPattern) {
       return {
         iframeHtml: WORKER_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken, authority)),
       };
     }
     throw new Error(`Unsupported Cloudflare resource configurator type: ${resourceUrlPattern}`);

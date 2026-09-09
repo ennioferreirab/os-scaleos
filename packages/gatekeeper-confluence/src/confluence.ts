@@ -481,12 +481,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("Confluence app authority is unavailable.");
+    await authority.assertAppAccess();
     const account = this.#userAccount();
     const ui = new ConfluenceConfiguratorUI(
       async () => await account.getSites(),
       async () => await account.getAccessToken(),
-      context.authority,
+      authority,
     );
     const html =
       resourceUrlPattern === SITE_RESOURCE.urlPattern ? SITE_CONFIGURATOR_HTML

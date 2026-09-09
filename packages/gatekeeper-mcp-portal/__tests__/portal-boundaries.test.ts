@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
+
 import type { McpServerConfiguratorRpc } from
   "../src/configurator/server-configurator-types.js";
 
-type TestAuthority = {
+type TestAuthority = Pick<ContextAuthority, "assertAppAccess"> & {
   requireAppAccess(): Promise<void>;
-  requireActive(): Promise<void>;
-  isAdmin(): Promise<boolean>;
   dup(): TestAuthority;
   [Symbol.dispose](): void;
 };
@@ -109,25 +109,23 @@ function makeSubject(
   };
 }
 
-function makeAuthority(): {
-  authority: TestAuthority;
-  deny(): void;
-  requireAppAccess: ReturnType<typeof vi.fn>;
-} {
+function makeAuthority() {
   let allowed = true;
-  const requireAppAccess = vi.fn(async () => {
+  const checkAccess = async () => {
     if (!allowed) throw new Error("App access denied.");
-  });
+  };
+  const assertAppAccess = vi.fn(checkAccess);
+  const requireAppAccess = vi.fn(checkAccess);
   const authority: TestAuthority = {
+    assertAppAccess,
     requireAppAccess,
-    requireActive: async () => {},
-    isAdmin: async () => false,
     dup() { return authority; },
     [Symbol.dispose]: vi.fn(),
   };
   return {
     authority,
     deny: () => { allowed = false; },
+    assertAppAccess,
     requireAppAccess,
   };
 }
@@ -192,7 +190,7 @@ describe("hidden portal server boundaries", () => {
 
     expect(account.getServer).toHaveBeenCalledTimes(serverReads);
     expect(mocks.withClient).toHaveBeenCalledTimes(remoteReads);
-    expect(live.requireAppAccess).toHaveBeenCalledTimes(5);
+    expect(live.assertAppAccess).toHaveBeenCalledTimes(5);
   });
 
   it("retains verifier authority and denies verification before local reads", async () => {

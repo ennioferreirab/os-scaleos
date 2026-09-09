@@ -5,7 +5,7 @@ import {
   stripTrailingSlashes,
   type AccountDescription,
   type AvatarImage,
-  type AppUiAuthority,
+  type ContextAuthority,
   type AppUiContext,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -576,34 +576,35 @@ export class HomeAssistantUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Home Assistant app authority is unavailable.");
     const userAccount = this.#userAccount();
     const credsGetter = async () => await userAccount.getCredentials();
-
     switch (resourceUrlPattern) {
       case INSTANCE_RESOURCE.urlPattern:
         return {
           iframeHtml: INSTANCE_CONFIGURATOR_HTML,
-          ui: new RpcStub(new InstanceConfiguratorUI(credsGetter, context.authority)),
+          ui: new RpcStub(new InstanceConfiguratorUI(credsGetter, authority)),
         };
       case AREA_RESOURCE.urlPattern:
         return {
           iframeHtml: AREA_CONFIGURATOR_HTML,
-          ui: new RpcStub(new AreaConfiguratorUI(credsGetter, context.authority)),
+          ui: new RpcStub(new AreaConfiguratorUI(credsGetter, authority)),
         };
       case LABEL_RESOURCE.urlPattern:
         return {
           iframeHtml: LABEL_CONFIGURATOR_HTML,
-          ui: new RpcStub(new LabelConfiguratorUI(credsGetter, context.authority)),
+          ui: new RpcStub(new LabelConfiguratorUI(credsGetter, authority)),
         };
       case DEVICE_RESOURCE.urlPattern:
         return {
           iframeHtml: DEVICE_CONFIGURATOR_HTML,
-          ui: new RpcStub(new DeviceConfiguratorUI(credsGetter, context.authority)),
+          ui: new RpcStub(new DeviceConfiguratorUI(credsGetter, authority)),
         };
       case ENTITY_RESOURCE.urlPattern:
         return {
           iframeHtml: ENTITY_CONFIGURATOR_HTML,
-          ui: new RpcStub(new EntityConfiguratorUI(credsGetter, context.authority)),
+          ui: new RpcStub(new EntityConfiguratorUI(credsGetter, authority)),
         };
       default:
         throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
@@ -731,7 +732,8 @@ const instanceConfiguratorGetters = new WeakMap<
   object,
   () => Promise<HomeAssistantCredentials>
 >();
-function disposeAppUiAuthority(authority: RpcStub<AppUiAuthority>): void {
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+function disposeAuthority(authority: RpcStub<ConfiguratorAuthority>): void {
   try {
     const dispose = Reflect.get(authority, Symbol.dispose);
     if (typeof dispose === "function") dispose.call(authority);
@@ -742,11 +744,11 @@ function disposeAppUiAuthority(authority: RpcStub<AppUiAuthority>): void {
 
 @validateRpc()
 class InstanceConfiguratorUI extends RpcTarget implements HomeAssistantInstanceConfiguratorRpc {
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
 
   constructor(
     getCredentials: () => Promise<HomeAssistantCredentials>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     instanceConfiguratorGetters.set(this, getCredentials);
@@ -754,11 +756,11 @@ class InstanceConfiguratorUI extends RpcTarget implements HomeAssistantInstanceC
   }
 
   [Symbol.dispose](): void {
-    disposeAppUiAuthority(this.#authority);
+    disposeAuthority(this.#authority);
   }
 
   async resourceUrl(): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const getter = instanceConfiguratorGetters.get(this);
     if (!getter) throw new Error("Configurator is not initialized.");
     const creds = await getter();
@@ -766,11 +768,11 @@ class InstanceConfiguratorUI extends RpcTarget implements HomeAssistantInstanceC
   }
 
   async describeInstance(): Promise<{ name: string; baseUrl: string }> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const getter = instanceConfiguratorGetters.get(this);
     if (!getter) throw new Error("Configurator is not initialized.");
     const creds = await getter();
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     let name = "Home Assistant";
     try {
       const config = await new HomeAssistantRest(creds).getConfig();
@@ -823,23 +825,23 @@ function buildEntityUrl(entityId: string): string {
 
 @validateRpc()
 class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfiguratorRpc {
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   constructor(
     getCredentials: () => Promise<HomeAssistantCredentials>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
     this.#authority = authority.dup();
   }
   [Symbol.dispose](): void {
-    disposeAppUiAuthority(this.#authority);
+    disposeAuthority(this.#authority);
   }
 
   async listAreas(query: string): Promise<HomeAssistantConfiguratorOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       const list = await ws.send<any[]>({ type: "config/area_registry/list" });
       const options: HomeAssistantConfiguratorOption[] = list
@@ -855,7 +857,7 @@ class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfigura
   }
 
   async resourceUrl(areaId: string | null | undefined): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     if (!areaId) throw new Error("No area selected.");
     return buildAreaUrl(areaId);
   }
@@ -863,23 +865,23 @@ class AreaConfiguratorUI extends RpcTarget implements HomeAssistantAreaConfigura
 
 @validateRpc()
 class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfiguratorRpc {
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   constructor(
     getCredentials: () => Promise<HomeAssistantCredentials>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
     this.#authority = authority.dup();
   }
   [Symbol.dispose](): void {
-    disposeAppUiAuthority(this.#authority);
+    disposeAuthority(this.#authority);
   }
 
   async listLabels(query: string): Promise<HomeAssistantConfiguratorOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       let list: any[];
       try {
@@ -899,7 +901,7 @@ class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfigu
   }
 
   async resourceUrl(labelId: string | null | undefined): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     if (!labelId) throw new Error("No label selected.");
     return buildLabelUrl(labelId);
   }
@@ -907,23 +909,23 @@ class LabelConfiguratorUI extends RpcTarget implements HomeAssistantLabelConfigu
 
 @validateRpc()
 class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfiguratorRpc {
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   constructor(
     getCredentials: () => Promise<HomeAssistantCredentials>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
     this.#authority = authority.dup();
   }
   [Symbol.dispose](): void {
-    disposeAppUiAuthority(this.#authority);
+    disposeAuthority(this.#authority);
   }
 
   async listDevices(query: string): Promise<HomeAssistantConfiguratorOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return await withWebSocket(creds, async (ws) => {
       const [devices, areas] = await Promise.all([
         ws.send<any[]>({ type: "config/device_registry/list" }),
@@ -946,7 +948,7 @@ class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfi
   }
 
   async resourceUrl(deviceId: string | null | undefined): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     if (!deviceId) throw new Error("No device selected.");
     return buildDeviceUrl(deviceId);
   }
@@ -954,23 +956,23 @@ class DeviceConfiguratorUI extends RpcTarget implements HomeAssistantDeviceConfi
 
 @validateRpc()
 class EntityConfiguratorUI extends RpcTarget implements HomeAssistantEntityConfiguratorRpc {
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   constructor(
     getCredentials: () => Promise<HomeAssistantCredentials>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     resourceConfiguratorGetters.set(this, getCredentials);
     this.#authority = authority.dup();
   }
   [Symbol.dispose](): void {
-    disposeAppUiAuthority(this.#authority);
+    disposeAuthority(this.#authority);
   }
 
   async listEntities(query: string): Promise<HomeAssistantConfiguratorOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const creds = await getResourceConfiguratorCreds(this);
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const snapshot = await fetchRegistrySnapshot(creds);
     const areaNames = new Map<string, string>(
       snapshot.areas.map((a: any) => [a.area_id, a.name]),
@@ -1013,7 +1015,7 @@ class EntityConfiguratorUI extends RpcTarget implements HomeAssistantEntityConfi
   }
 
   async resourceUrl(entityId: string | null | undefined): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     if (!entityId) throw new Error("No entity selected.");
     return buildEntityUrl(entityId);
   }

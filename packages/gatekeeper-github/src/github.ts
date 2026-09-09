@@ -1339,6 +1339,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("GitHub app authority is unavailable.");
     const getToken = async () => {
       const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
       const account = this.ctx.exports.UserAccount.get(id);
@@ -1348,21 +1350,21 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     if (resourceUrlPattern === REPO_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_REPO_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new GitHubRepoConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === ISSUE_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_ISSUE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new GitHubIssueConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === PULL_REQUEST_RESOURCE.urlPattern) {
       return {
         iframeHtml: GITHUB_PULL_REQUEST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new GitHubPullRequestConfiguratorUI(getToken, authority)),
       };
     }
 

@@ -11,7 +11,7 @@ import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import { createLogger } from "@gadgets/backend-utils/logger";
 import {
   stripTrailingSlashes,
-  type AppUiAuthority,
+  type ContextAuthority,
   type AppUiContext,
   type AvatarImage,
   type Gatekeeper,
@@ -321,10 +321,12 @@ export class GatekeeperUserImpl
     _resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("MCP app authority is unavailable.");
     return {
       iframeHtml: MCP_SERVER_CONFIGURATOR_HTML,
       ui: new RpcStub(new McpServerConfiguratorUI(
-        this.env, this.#account(), context.authority)),
+        this.env, this.#account(), authority)),
     };
   }
 
@@ -356,17 +358,19 @@ export class McpVerifier
 // ---------------------------------------------------------------------------
 // Resource configurator
 
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+
 @validateRpc()
 class McpServerConfiguratorUI extends RpcTarget implements McpServerConfiguratorRpc {
   #env: Env;
   #account: DurableObjectStub<McpAccount>;
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   #toolsPromise: Promise<ToolCatalog> | undefined;
 
   constructor(
     env: Env,
     account: DurableObjectStub<McpAccount>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     this.#env = env;
@@ -375,7 +379,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   }
 
   async getEndpoint(): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return (await this.#account.getServer()).endpoint;
   }
 
@@ -390,7 +394,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
 
   // Every tool the grant may cover, annotated with whether calls need approval.
   async listToolOptions(): Promise<ConfiguratorUIOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     const { tools, truncated } = await this.#tools();
     requireCompleteCatalogForToolSelection(truncated);
     // `fetchTools` lists with the ordinary catalog cap, so that is the cap reaching it would be

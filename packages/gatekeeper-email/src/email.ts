@@ -15,7 +15,7 @@ import {
   AccountDescription,
   SupportedResource,
   ResourceConfiguratorFrame,
-  AppUiAuthority,
+  type ContextAuthority,
   AppUiContext,
   GatekeeperVerifierContext,
   VerifierAppAuthority,
@@ -113,13 +113,14 @@ function validateEmailName(value: string | undefined): { ok: true, emailName: st
 }
 
 const emailConfiguratorEnvs = new WeakMap<object, Env>();
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
 
 // RPC interface exposed to the resource selection/configuration iframe.
 @validateRpc()
 class EmailMailboxConfiguratorUI extends RpcTarget implements EmailMailboxConfiguratorRpc {
-  readonly #authority: RpcStub<AppUiAuthority>;
+  readonly #authority: RpcStub<ConfiguratorAuthority>;
 
-  constructor(env: Env, authority: RpcStub<AppUiAuthority>) {
+  constructor(env: Env, authority: RpcStub<ConfiguratorAuthority>) {
     super();
     this.#authority = authority.dup();
     emailConfiguratorEnvs.set(this, env);
@@ -128,7 +129,7 @@ class EmailMailboxConfiguratorUI extends RpcTarget implements EmailMailboxConfig
   // Email mailbox resource URLs depend on Gatekeeper's configured BASE_URL,
   // so the iframe asks Gatekeeper to construct the URL.
   async resourceUrl(emailName: string | null | undefined): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     let validated = validateEmailName(emailName ?? undefined);
     if (!validated.ok) throw new Error(validated.message);
     let env = emailConfiguratorEnvs.get(this);
@@ -388,13 +389,15 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       resourceUrlPattern: string,
       context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Email app authority is unavailable.");
     let resource = getEmailMailboxResource(this.env);
     if (resourceUrlPattern !== resource.urlPattern) {
       throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
     }
     return {
       iframeHtml: EMAIL_CONFIGURATOR_HTML,
-      ui: new RpcStub(new EmailMailboxConfiguratorUI(this.env, context.authority)),
+      ui: new RpcStub(new EmailMailboxConfiguratorUI(this.env, authority)),
     };
   }
 

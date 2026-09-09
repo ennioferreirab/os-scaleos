@@ -4,7 +4,7 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
-  type AppUiAuthority,
+  type ContextAuthority,
   type AppUiContext,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -571,13 +571,15 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("ZoomInfo app authority is unavailable.");
+    await authority.assertAppAccess();
     if (resourceUrlPattern !== ACCOUNT_RESOURCE.urlPattern) {
       throw new Error(`Unsupported ZoomInfo resource configurator type: ${resourceUrlPattern}`);
     }
     return {
       iframeHtml: ZOOMINFO_ACCOUNT_CONFIGURATOR_HTML,
-      ui: new RpcStub(new ZoomInfoAccountConfiguratorUI(context.authority.dup())),
+      ui: new RpcStub(new ZoomInfoAccountConfiguratorUI(authority.dup())),
     };
   }
 
@@ -615,9 +617,9 @@ export class ZoomInfoVerifier extends WorkerEntrypoint<Env, ZoomInfoVerifierProp
 }
 
 class ZoomInfoAccountConfiguratorUI extends RpcTarget implements ZoomInfoAccountConfiguratorRpc {
-  readonly #authority: RpcStub<AppUiAuthority>;
+  readonly #authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">>;
 
-  constructor(authority: RpcStub<AppUiAuthority>) {
+  constructor(authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">>) {
     super();
     this.#authority = authority;
   }
@@ -627,7 +629,7 @@ class ZoomInfoAccountConfiguratorUI extends RpcTarget implements ZoomInfoAccount
   }
 
   async resourceUrl(): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return ACCOUNT_URL;
   }
 }

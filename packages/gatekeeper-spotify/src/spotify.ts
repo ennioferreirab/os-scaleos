@@ -3,7 +3,7 @@ import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
-  type AppUiAuthority,
+  type ContextAuthority,
   type AppUiContext,
   type AccountDescription,
   type ActionDescription,
@@ -707,18 +707,20 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Spotify app authority is unavailable.");
     const getToken = async () => await this.#userAccount().getAccessToken();
 
     if (resourceUrlPattern === ACCOUNT_RESOURCE.urlPattern) {
       return {
         iframeHtml: SPOTIFY_ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SpotifyAccountConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new SpotifyAccountConfiguratorUI(getToken, authority)),
       };
     }
     if (resourceUrlPattern === PLAYLIST_RESOURCE.urlPattern) {
       return {
         iframeHtml: SPOTIFY_PLAYLIST_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SpotifyPlaylistConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new SpotifyPlaylistConfiguratorUI(getToken, authority)),
       };
     }
     throw new Error(`Unsupported Spotify resource configurator type: ${resourceUrlPattern}`);
@@ -2584,7 +2586,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
 
 type SpotifyConfiguratorState = {
   getToken: () => Promise<string>;
-  authority: RpcStub<AppUiAuthority>;
+  authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">>;
 };
 
 const configuratorStates = new WeakMap<object, SpotifyConfiguratorState>();
@@ -2592,13 +2594,13 @@ const configuratorStates = new WeakMap<object, SpotifyConfiguratorState>();
 function configuratorApi(target: object): SpotifyApi {
   const state = configuratorStates.get(target);
   if (!state) throw new Error("Spotify configurator is not initialized.");
-  return new SpotifyApi(state.getToken).withBeforeRequest(() => state.authority.requireAppAccess());
+  return new SpotifyApi(state.getToken).withBeforeRequest(() => state.authority.assertAppAccess());
 }
 
-async function requireConfiguratorAccess(target: object): Promise<void> {
+async function assertConfiguratorAccess(target: object): Promise<void> {
   const state = configuratorStates.get(target);
   if (!state) throw new Error("Spotify configurator is not initialized.");
-  await state.authority.requireAppAccess();
+  await state.authority.assertAppAccess();
 }
 
 function disposeConfigurator(target: object): void {
@@ -2612,7 +2614,10 @@ const CONFIGURATOR_OPTION_LIMIT = 50;
 
 @validateRpc()
 class SpotifyAccountConfiguratorUI extends RpcTarget implements SpotifyAccountConfiguratorRpc {
-  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
+  constructor(
+    getToken: () => Promise<string>,
+    authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">>,
+  ) {
     super();
     configuratorStates.set(this, { getToken, authority: authority.dup() });
   }
@@ -2622,7 +2627,7 @@ class SpotifyAccountConfiguratorUI extends RpcTarget implements SpotifyAccountCo
   }
 
   async resourceUrl(): Promise<string> {
-    await requireConfiguratorAccess(this);
+    await assertConfiguratorAccess(this);
     const user = await configuratorApi(this).getCurrentUser();
     return externalUrl(user, profileUrl(user.id));
   }
@@ -2630,7 +2635,10 @@ class SpotifyAccountConfiguratorUI extends RpcTarget implements SpotifyAccountCo
 
 @validateRpc()
 class SpotifyPlaylistConfiguratorUI extends RpcTarget implements SpotifyPlaylistConfiguratorRpc {
-  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
+  constructor(
+    getToken: () => Promise<string>,
+    authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">>,
+  ) {
     super();
     configuratorStates.set(this, { getToken, authority: authority.dup() });
   }
@@ -2640,7 +2648,7 @@ class SpotifyPlaylistConfiguratorUI extends RpcTarget implements SpotifyPlaylist
   }
 
   async listPlaylists(query: string): Promise<SpotifyConfiguratorOption[]> {
-    await requireConfiguratorAccess(this);
+    await assertConfiguratorAccess(this);
     const api = configuratorApi(this);
     const trimmed = query.trim();
 

@@ -610,31 +610,33 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("Slack app authority is unavailable.");
+    await authority.assertAppAccess();
 
     if (resourceUrlPattern === WORKSPACE_RESOURCE.urlPattern) {
-      let authority = context.authority.dup();
+      let configuratorAuthority = authority.dup();
       return {
         iframeHtml: WORKSPACE_CONFIGURATOR_HTML,
         ui: new RpcStub(new WorkspaceConfiguratorUI(
-            this.#api().withAppAccessGuard(() => authority.requireAppAccess()),
-            authority)),
+            this.#api().withAppAccessGuard(() => configuratorAuthority.assertAppAccess()),
+            configuratorAuthority)),
       };
     }
     if (resourceUrlPattern === CONVERSATION_RESOURCE.urlPattern) {
       let teamId = await this.#account().getTeamId();
-      let authority = context.authority.dup();
+      let configuratorAuthority = authority.dup();
       return {
         iframeHtml: CONVERSATION_CONFIGURATOR_HTML,
         ui: new RpcStub(new ConversationConfiguratorUI(
-          this.#api().withAppAccessGuard(() => authority.requireAppAccess()),
-          teamId, authority)),
+          this.#api().withAppAccessGuard(() => configuratorAuthority.assertAppAccess()),
+          teamId, configuratorAuthority)),
       };
     }
     if (resourceUrlPattern === THREAD_RESOURCE.urlPattern) {
       return {
         iframeHtml: THREAD_CONFIGURATOR_HTML,
-        ui: new RpcStub(new ThreadConfiguratorUI(context.authority.dup())),
+        ui: new RpcStub(new ThreadConfiguratorUI(authority.dup())),
       };
     }
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);

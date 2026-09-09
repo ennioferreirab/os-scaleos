@@ -27,7 +27,7 @@ auto-provisions an account only for selected users. An absent policy is disabled
 deployments keep the prior opt-in behavior.
 
 The Workshop, not Scheduler, owns this decision. The account management frame rechecks its retained
-`AppUiAuthority` before each list operation. Workspace sessions, registration queues, and each hook
+`ContextAuthority` before each list operation. Workspace sessions, registration queues, and each hook
 attempt are gated again by the kernel using the persisted owner Subject, workspace, and hook ID.
 Neither iframe data nor a gatekeeper-supplied Subject conveys authority.
 

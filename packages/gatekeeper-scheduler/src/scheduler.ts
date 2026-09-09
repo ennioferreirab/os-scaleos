@@ -9,7 +9,7 @@ import type {
   AccountDescription,
   ActionKind,
   AgentCatalog,
-  AppUiAuthority,
+  ContextAuthority,
   AppUiContext,
   ApprovalQueue,
   Gatekeeper,
@@ -303,13 +303,18 @@ export class SchedulerGatekeeper
   }
 }
 
+interface ConfiguratorAuthorityHandle extends Pick<ContextAuthority, "assertAppAccess"> {
+  dup(): ConfiguratorAuthorityHandle;
+  [Symbol.dispose](): void;
+}
+
 @validateRpc()
 export class ScheduleManagementApi extends RpcTarget {
-  private readonly authority: NativeRpcStub<AppUiAuthority>;
+  private readonly authority: ConfiguratorAuthorityHandle;
 
   constructor(
     private readonly driver: Pick<ScheduleDriver, "listAccount">,
-    authority: NativeRpcStub<AppUiAuthority>,
+    authority: ConfiguratorAuthorityHandle,
   ) {
     super();
     this.authority = authority.dup();
@@ -317,7 +322,7 @@ export class ScheduleManagementApi extends RpcTarget {
 
   /** Lists schedules across this account after revalidating the host app policy. */
   async list(options?: ManagementListOptions): Promise<ManagementSchedulePage> {
-    await this.authority.requireAppAccess();
+    await this.authority.assertAppAccess();
     return this.driver.listAccount(options);
   }
 
@@ -355,8 +360,10 @@ export class ScheduleAccount
 
   /** Opens the account's read-only management frame. */
   async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Scheduled Tasks app authority is unavailable.");
     const ui = new NativeRpcStub(
-      new ScheduleManagementApi(this.#driver(), context.authority),
+      new ScheduleManagementApi(this.#driver(), authority),
     );
     return { iframeHtml: APP_HTML, ui };
   }

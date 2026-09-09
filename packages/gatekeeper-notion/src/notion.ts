@@ -545,17 +545,19 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("Notion app authority is unavailable.");
+    await authority.assertAppAccess();
     if (resourceUrlPattern === ITEM_RESOURCE.urlPattern) {
       return {
         iframeHtml: NOTION_ITEM_CONFIGURATOR_HTML,
-        ui: new RpcStub(new NotionItemConfiguratorUI(this.#getToken, context.authority)),
+        ui: new RpcStub(new NotionItemConfiguratorUI(this.#getToken, authority)),
       };
     }
     if (resourceUrlPattern === WORKSPACE_RESOURCE.urlPattern) {
       return {
         iframeHtml: NOTION_WORKSPACE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new NotionWorkspaceConfiguratorUI(this.#getToken, context.authority)),
+        ui: new RpcStub(new NotionWorkspaceConfiguratorUI(this.#getToken, authority)),
       };
     }
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);

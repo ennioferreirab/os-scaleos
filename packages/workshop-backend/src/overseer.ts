@@ -5,6 +5,10 @@ import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeC
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  GatekeeperRequestContext,
+  SlashCommandResult,
+} from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -37,6 +41,7 @@ import { UserDurableObject, UserAiModelRecord, type UserChatContext, type Worksp
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
 import type { OrganizationDirectoryDurableObject } from "./organization-directory";
 import { hasSupabaseAuthSettings } from "./auth/supabase";
+import { ContextAuthorityImpl } from "./context-authority.js";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
@@ -256,6 +261,8 @@ type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
 // getAgentCatalog is optional on Gatekeeper; ambient capsules always implement it. After confirming
 // the gatekeeper is an ambient capsule, we view its facet through this derived (Pick + Required)
 // shape to call it — same optional-method-on-a-stub pattern as user.ts's SingletonAccountStub.
+type GatekeeperRequestContextFactory =
+    (gatekeeperId: number) => GatekeeperRequestContext | undefined;
 type CatalogGatekeeperFacet =
     Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "getAgentCatalog">>>;
 
@@ -2750,6 +2757,54 @@ class OverseerImpl implements AgentHooks {
     };
     return this.ctx.exports.GatekeeperLoopback({props});
   }
+  /**
+   * Mint the request-scoped or durable authority attached to a Gatekeeper method call. Interactive
+   * callers retain a session-bound native stub; gadget/agent callers receive a durable authority
+   * carrying only the kernel-trusted Subject and target checks.
+   */
+  makeGatekeeperRequestContext(
+      gatekeeperId: number, caller: GatekeeperCaller,
+      sessionGuard?: HumanSessionGuard): GatekeeperRequestContext | undefined {
+    let record = this.storage.gatekeepers.get(gatekeeperId);
+    if (!record) return undefined;
+
+    let subject = sessionGuard?.subject;
+    if (subject === undefined && "subject" in caller) subject = caller.subject;
+    if (subject === undefined && caller.from === "hook") subject = caller.ownerSubject;
+    if (subject === undefined) return undefined;
+
+    let vendorId = gatekeeperVendorId(record);
+    let assertAdditionalAccess = () => this.assertGatekeeperCallerAccess(gatekeeperId, caller)
+        .then(() => undefined);
+    if (sessionGuard) {
+      let authority = new NativeRpcStub(new ContextAuthorityImpl({
+        subject,
+        vendorId,
+        directory: this.organizationDirectory.getByName(""),
+        centralAuthMode: this.centralAuthMode,
+        sessionGuard,
+        assertAdditionalAccess,
+      }));
+      return {authority};
+    }
+
+    let authority: GatekeeperRequestContext["authority"] =
+      this.ctx.exports.DurableContextAuthority({props: {
+        subject,
+        ...(vendorId === undefined ? {} : {vendorId}),
+        overseerId: this.ctx.id.toString(),
+        gatekeeperId,
+        caller,
+      }});
+    return {authority};
+  }
+
+  disposeGatekeeperRequestContext(requestContext?: GatekeeperRequestContext): void {
+    if (!requestContext) return;
+    const dispose = Reflect.get(requestContext.authority, Symbol.dispose);
+    if (typeof dispose === "function") dispose.call(requestContext.authority);
+  }
+
 
   // Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
   // bindings plus `GADGET` (the gadget's self-stub, kept for back-compat with existing gadget
@@ -2771,8 +2826,13 @@ class OverseerImpl implements AgentHooks {
   // gadget's RPC stub, a gatekeeper session stub, or an agent callback's stored arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere.
-  getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>): object {
-    let caller: GatekeeperCaller = {from: "agent", chatId};
+  getEnvForAgent(
+      chatId: number, bindings: Record<string, ChatBindingEntry>, subject?: string): object {
+    let caller: GatekeeperCaller = {
+      from: "agent",
+      chatId,
+      ...(subject === undefined ? {} : {subject}),
+    };
     // This must be a *plain* object: it becomes the loaded worker's `env`, and the loader's
     // serializer rejects anything else (including a null-prototype object) with DataCloneError.
     // So prototype-pollution safety comes from validation instead: names from before name
@@ -4005,6 +4065,7 @@ class OverseerImpl implements AgentHooks {
       // The snapshot meta above serves the as-of-`sequence` doc build; this re-read only keeps
       // the old fail-on-deleted-chat behavior (don't cache a load for a chat deleted mid-load).
       if (chatId !== undefined) this.getChatMetaOrThrow(chatId);
+      let ownerSubject = await this.getOwnerProfileId();
       let files: ReadonlyMap<string, string>;
       // An unpinned committed gadget tracks mainline head live, in chat context and out (see
       // chatDocOwnsGadget). Head movement invalidates the cached load either way: every merge
@@ -4044,7 +4105,8 @@ class OverseerImpl implements AgentHooks {
         ],
         mainModule: "server.js",
         modules,
-        env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
+        env: this.getEnvForLoader(
+            gadgetId, {from: "gadget", chatId, gadgetId, subject: ownerSubject}, chatId),
         globalOutbound: null,
 
         // TODO: Switch to streaming tails when the workerd log spam issue is fixed.
@@ -5336,7 +5398,8 @@ class OverseerImpl implements AgentHooks {
   // message. A result without a message suppresses only the generated message, not the invocation.
   async #prepareChatMessage(
       message: string | SlashCommandRequest,
-      hasAttachments: boolean): Promise<PreparedChatMessage> {
+      hasAttachments: boolean,
+      requestContextFactory?: GatekeeperRequestContextFactory): Promise<PreparedChatMessage> {
     if (typeof message !== "string") {
       // A built-in command is handled by the Workshop, not a Gatekeeper: there is nothing to invoke
       // here. Committing the event is what makes the turn a compaction turn (see isCompactionTurn).
@@ -5353,12 +5416,18 @@ class OverseerImpl implements AgentHooks {
       await this.assertGatekeeperAppAccess(gatekeeperId);
       // Display-only, and from the browser, so a bad value is dropped rather than refused.
       message = {...message, commandPosition: sanitizeCommandPosition(message)};
-      using authorizer = new NativeRpcStub<ObservationAuthorizer>(
-          new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
-      let result = await invokeSlashCommand(
-          this.getGatekeeperFacet(gatekeeperId), message, authorizer,
-          async () => { await this.assertGatekeeperAppAccess(gatekeeperId); });
-      await this.assertGatekeeperAppAccess(gatekeeperId);
+      let requestContext = requestContextFactory?.(gatekeeperId);
+      let result: SlashCommandResult;
+      try {
+        using authorizer = new NativeRpcStub<ObservationAuthorizer>(
+            new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
+        result = await invokeSlashCommand(
+            this.getGatekeeperFacet(gatekeeperId), message, authorizer,
+            async () => { await this.assertGatekeeperAppAccess(gatekeeperId); },
+            requestContext);
+      } finally {
+        this.disposeGatekeeperRequestContext(requestContext);
+      }
       if (result.message === undefined) {
         return {slashCommand: message, skillName: result.skillName};
       }
@@ -5460,6 +5529,7 @@ class OverseerImpl implements AgentHooks {
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     externalChatKey?: string,
     formats?: MessageFormatRef[],
+    requestContextFactory?: GatekeeperRequestContextFactory,
   ): Promise<number> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -5471,7 +5541,7 @@ class OverseerImpl implements AgentHooks {
     let canonicalAttachments = this.canonicalizeChatAttachmentRefs(
         attachments, userMeta.aiModel?.config.provider);
     let prepared = await this.#prepareChatMessage(
-        initialMessage, (canonicalAttachments?.length ?? 0) > 0);
+        initialMessage, (canonicalAttachments?.length ?? 0) > 0, requestContextFactory);
 
     // No code base is established at creation: gadgets pin lazily, when their code is first
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
@@ -5541,6 +5611,7 @@ class OverseerImpl implements AgentHooks {
     attachments?: ChatAttachmentHandle[],
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     formats?: MessageFormatRef[],
+    requestContextFactory?: GatekeeperRequestContextFactory,
   ): Promise<void> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -5554,7 +5625,7 @@ class OverseerImpl implements AgentHooks {
     this.assertChatNotActive(chatId);
     using _chatMessageReservation = this.reserveChatMessagePreparation(chatId);
     let prepared = await this.#prepareChatMessage(
-        message, (canonicalAttachments?.length ?? 0) > 0);
+        message, (canonicalAttachments?.length ?? 0) > 0, requestContextFactory);
 
     let meta = this.assertChatNotActive(chatId, true);
     let result = this.materializeChatChanges(chatId, meta);
@@ -6623,6 +6694,8 @@ class OverseerImpl implements AgentHooks {
   async prepareChatBindings(chatId: number, chatMessages: AiChatMessage[])
       : Promise<SeedBindingInfo[]> {
     let context = this.getChatAgentContext(chatId);
+    let agentSubject = chatMessages.toReversed()
+        .find(message => message.author.type !== "agent")?.author.id ?? this.ownerProfileId;
     let dirty = false;
     let allowedGatekeeperIds = new Set<number>();
     for (let record of this.storage.gatekeepers.list()) {
@@ -6841,16 +6914,23 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    // Complete/refresh the cached discovery catalogs for the frozen ambient set.
+    // Complete/refresh the cached discovery catalogs for the frozen ambient set. These catalogs are
+    // authority-sensitive, so reload every ambient target on every agent turn.
     let {snapshots, changed} = await completeAgentCatalogSnapshot(
         context.alwaysAvailableCatalogs,
         ambientIds,
         async gatekeeperId => {
           let record = this.storage.gatekeepers.get(gatekeeperId);
           if (!record) return null;  // disconnected since the chat froze its set — no catalog.
+          let caller: GatekeeperCaller = {
+            from: "agent",
+            chatId,
+            ...(agentSubject === undefined ? {} : {subject: agentSubject}),
+          };
+          let requestContext = this.makeGatekeeperRequestContext(gatekeeperId, caller);
           try {
             using approvalQueue = new RpcStub<ApprovalQueue>(new ApprovalQueueImpl(
-                this, gatekeeperId, {from: "agent", chatId}));
+                this, gatekeeperId, caller));
             // The catalog comes from the installed gatekeeper facet (gadget-side), authorized as an
             // observation via the approval queue. getAgentCatalog is optional on Gatekeeper; ambient
             // resources always implement it (the agent relies on it for discovery), so we view the
@@ -6860,7 +6940,7 @@ class OverseerImpl implements AgentHooks {
             let facet = this.getGatekeeperFacet(gatekeeperId) as unknown as CatalogGatekeeperFacet;
             await approvalQueue.assertAppAccess();
             let catalog = await facet.getAgentCatalog(
-                approvalQueue as unknown as ObservationAuthorizer);
+                approvalQueue as unknown as ObservationAuthorizer, requestContext);
             return catalog ? normalizeAgentCatalog(catalog) : null;
           } catch (error) {
             reportIssue("overseer.catalog-fallback", error, {
@@ -6874,8 +6954,11 @@ class OverseerImpl implements AgentHooks {
               gatekeeperId, resourceTitle: record.resourceTitle, error,
             });
             return null;
+          } finally {
+            this.disposeGatekeeperRequestContext(requestContext);
           }
-        });
+        },
+        true);
     if (changed) {
       context.alwaysAvailableCatalogs = snapshots;
       dirty = true;
@@ -6911,28 +6994,39 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  async listSlashCommands(): Promise<SlashCommandChoice[]> {
+  async listSlashCommands(
+      requestContextFactory?: GatekeeperRequestContextFactory): Promise<SlashCommandChoice[]> {
     let sources: Parameters<typeof collectSlashCommands>[0] = [];
-    for (let record of this.storage.gatekeepers.list()) {
-      if (!record.hasSlashCommands) continue;
-      try {
-        await this.assertGatekeeperAppAccess(record.id);
-      } catch {
-        continue;
+    let requestContexts: GatekeeperRequestContext[] = [];
+    try {
+      for (let record of this.storage.gatekeepers.list()) {
+        if (!record.hasSlashCommands) continue;
+        try {
+          await this.assertGatekeeperAppAccess(record.id);
+        } catch {
+          continue;
+        }
+        let requestContext = requestContextFactory?.(record.id);
+        if (requestContext) requestContexts.push(requestContext);
+        sources.push({
+          gatekeeperId: record.id,
+          providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
+          gatekeeper: this.getGatekeeperFacet(record.id),
+          requestContext,
+          assertAccess: async () => { await this.assertGatekeeperAppAccess(record.id); },
+        });
       }
-      sources.push({
-        gatekeeperId: record.id,
-        providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
-        gatekeeper: this.getGatekeeperFacet(record.id),
-        assertAccess: async () => { await this.assertGatekeeperAppAccess(record.id); },
-      });
+      return [{
+        selection: {builtin: true, commandId: "compact"},
+        name: "compact",
+        description: "Summarize older context while preserving recent messages.",
+        providerLabel: resolveSiteName((await readAdminConfig(this.env)).siteName),
+      }, ...await collectSlashCommands(sources)];
+    } finally {
+      for (let requestContext of requestContexts) {
+        this.disposeGatekeeperRequestContext(requestContext);
+      }
     }
-    return [{
-      selection: {builtin: true, commandId: "compact"},
-      name: "compact",
-      description: "Summarize older context while preserving recent messages.",
-      providerLabel: resolveSiteName((await readAdminConfig(this.env)).siteName),
-    }, ...await collectSlashCommands(sources)];
   }
 
   // =======================================================================================
@@ -7534,7 +7628,7 @@ class OverseerImpl implements AgentHooks {
           "agent.js": code,
         },
         // The agent's env holds the chat's named bindings (see getEnvForAgent).
-        env: this.getEnvForAgent(chatId, bindings),
+        env: this.getEnvForAgent(chatId, bindings, initiator.id),
         tails: [this.ctx.exports.CodeModeTailLoopback({props: tailProps})],
         globalOutbound: null,
       };
@@ -8505,6 +8599,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.outputsSnapshot();
   }
 
+  /** Recheck a durable Context caller against the current workspace, hook, and app policy. */
+  async assertGatekeeperCallerAccess(id: number, caller: GatekeeperCaller): Promise<void> {
+    await this.impl.assertGatekeeperCallerAccess(id, caller);
+  }
+
   /**
    * `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
    * by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
@@ -9004,23 +9103,33 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 }
 
-type GatekeeperCaller = {
+export type GatekeeperCaller = {
   from: "agent";
   chatId: number;
+  /** Kernel-trusted Subject for this durable agent turn. */
+  subject?: string;
 } | {
   from: "gadget";
   chatId?: number;
 
-  // Which gadget made the call. Optional for backward compatibility: callers embedded in
-  // ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
-  // should be assumed when `gadgetId` is absent.
+  /** Kernel-trusted Subject of the workspace owner running this gadget. */
+  subject?: string;
+
+  /**
+   * Which gadget made the call. Optional for backward compatibility: callers embedded in
+   * ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
+   * should be assumed when `gadgetId` is absent.
+   */
   gadgetId?: WorkpieceId;
 } | {
   from: "user";
   chatId?: number;
+  /** Present only for internal non-interactive callers. */
+  subject?: string;
 } | {
   from: "hook";
   hookId: number;
+  /** Kernel-trusted Subject of the hook owner. */
   ownerSubject?: string;
 };
 
@@ -9389,6 +9498,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // Per-session caller identity for the SharingManager.
   #sharingCaller(): SharingCaller {
     return { profileId: this.clientProfileId, isOwner: this.isOwner };
+  }
+  #gatekeeperRequestContextFactory(): GatekeeperRequestContextFactory {
+    return gatekeeperId => this.impl.makeGatekeeperRequestContext(
+        gatekeeperId, {from: "user"}, this.sessionGuard);
   }
 
   async #getClientProfile(): Promise<AiChatAuthorInfo> {
@@ -10203,7 +10316,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
     await this.slashCommandsReady;
-    return this.impl.listSlashCommands();
+    return this.impl.listSlashCommands(this.#gatekeeperRequestContextFactory());
   }
 
   async uploadChatAttachment(
@@ -10402,7 +10515,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
-                             undefined, undefined, formats);
+                             undefined, undefined, formats, this.#gatekeeperRequestContextFactory());
   }
 
   async sendChatMessage(
@@ -10412,7 +10525,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.sendChatMessage(
-        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats,
+        this.#gatekeeperRequestContextFactory());
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {
@@ -11537,16 +11651,21 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   async openSession(): Promise<RpcStub<Session>> {
     this.sessionGuard?.assertValid();
     await this.impl.assertGatekeeperAppAccess(this.id);
-    let session = (await this.facet.startSession(
-        new ApprovalQueueImpl(this.impl, this.id, this.caller, this.sessionGuard))) as unknown as
-        RpcStub<Session>;
+    let requestContext = this.impl.makeGatekeeperRequestContext(
+        this.id, this.caller, this.sessionGuard);
+    let session: RpcStub<Session> | undefined;
     try {
+      session = (await this.facet.startSession(
+          new ApprovalQueueImpl(this.impl, this.id, this.caller, this.sessionGuard),
+          requestContext)) as unknown as RpcStub<Session>;
       await this.impl.assertGatekeeperAppAccess(this.id);
       this.sessionGuard?.assertValid();
       return session;
     } catch (error) {
-      session[Symbol.dispose]();
+      session?.[Symbol.dispose]();
       throw error;
+    } finally {
+      this.impl.disposeGatekeeperRequestContext(requestContext);
     }
   }
 

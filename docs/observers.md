@@ -526,7 +526,7 @@ its resource types.
 | **confluence** | Space | **C** | Verify space access; track observed pages and blog posts because content restrictions may be narrower. |
 | **confluence** | Page / Blog Post | **C** | Verify bound-content access; track observed child pages because they may have stricter restrictions than their parent. |
 | **zoominfo** | Account | **A** | Always throw. The whole-account binding exposes licensed, entitlement-dependent and account-specific intelligence, and ZoomInfo provides no ACL oracle proving another account can read every historical result. |
-| **context** | Context Library singleton | **C** | Track observed collections; verify each is public in the sharing domain or privately owned by the observer's Context account. |
+| **context** | Context Library singleton | **C** | Track observed collections; ask the subject-bound `ContextAuthority` to resolve each observer's live collection role (reader or better). This check is additive to app-policy and other gatekeeper checks; registry/KV discovery is never authorization. |
 
 ### 9.3 The "broad binding" lens
 
@@ -543,7 +543,7 @@ This is why the broad bindings split the way they do:
 
 - **Satisfy both → C:** Supabase Org (projects + `listProjects()` oracle), Linear Workspace
   (teams + membership), Notion Workspace (pages + page access), BigQuery (datasets + IAM), Context
-  Library (public/private collections + account/domain ownership checks).
+  Library (live owner/editor/reader collection ACL resolved by `ContextAuthority`).
 - **Fail criterion 1 → B:** GitHub Repository — issues/PRs/discussions/code all inherit the single
   repo permission, and there is no binding broader than one repo, so the repo is the atomic ACL
   unit.

@@ -2,17 +2,19 @@ import { RpcTarget } from "cloudflare:workers";
 import type { RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { SupabaseApi, type OrganizationResponse, type ProjectResponse } from "./supabase-api";
-import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
-import type { SupabaseProjectConfiguratorRpc } from "./configurator/supabase-project-configurator-types";
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ConfiguratorOption, SupabaseProjectConfiguratorRpc,
+} from "./configurator/supabase-project-configurator-types";
 import type { SupabaseOrganizationConfiguratorRpc } from "./configurator/supabase-organization-configurator-types";
 
-type ConfiguratorOption = { value: string; title: string; subtitle?: string; meta?: string };
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
 
 const OPTION_LIMIT = 100;
 
 // Token getters and the app authority are held off the RpcTarget surface.
 const tokenGetters = new WeakMap<object, () => Promise<string>>();
-const authorities = new WeakMap<object, RpcStub<AppUiAuthority>>();
+const authorities = new WeakMap<object, RpcStub<ConfiguratorAuthority>>();
 
 // Supabase has no server-side project/org search, so we fetch the full list and filter locally.
 // Cache the fetch per configurator instance so typing in the picker doesn't refetch on every
@@ -23,10 +25,10 @@ const orgListCache = new WeakMap<object, Promise<OrganizationResponse[]>>();
 function api(target: object): SupabaseApi {
   const getToken = tokenGetters.get(target);
   if (!getToken) throw new Error("Supabase configurator is not initialized.");
-  return new SupabaseApi(getToken, () => authorityFor(target).requireAppAccess());
+  return new SupabaseApi(getToken, () => authorityFor(target).assertAppAccess());
 }
 
-function authorityFor(target: object): RpcStub<AppUiAuthority> {
+function authorityFor(target: object): RpcStub<ConfiguratorAuthority> {
   const authority = authorities.get(target);
   if (!authority) throw new Error("Supabase configurator is not initialized.");
   return authority;
@@ -55,7 +57,7 @@ function matches(parts: (string | undefined)[], query: string): boolean {
 
 @validateRpc()
 export class SupabaseProjectConfiguratorUI extends RpcTarget implements SupabaseProjectConfiguratorRpc {
-  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
+  constructor(getToken: () => Promise<string>, authority: RpcStub<ConfiguratorAuthority>) {
     super();
     tokenGetters.set(this, getToken);
     authorities.set(this, authority);
@@ -66,7 +68,7 @@ export class SupabaseProjectConfiguratorUI extends RpcTarget implements Supabase
   }
 
   async listProjects(query: string): Promise<ConfiguratorOption[]> {
-    await authorityFor(this).requireAppAccess();
+    await authorityFor(this).assertAppAccess();
     const projects = await cachedList(this, projectListCache, () => api(this).listProjects());
     return projects
       .filter(project => matches([project.name, project.ref, project.region], query))
@@ -82,7 +84,7 @@ export class SupabaseProjectConfiguratorUI extends RpcTarget implements Supabase
 
 @validateRpc()
 export class SupabaseOrganizationConfiguratorUI extends RpcTarget implements SupabaseOrganizationConfiguratorRpc {
-  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
+  constructor(getToken: () => Promise<string>, authority: RpcStub<ConfiguratorAuthority>) {
     super();
     tokenGetters.set(this, getToken);
     authorities.set(this, authority);
@@ -93,7 +95,7 @@ export class SupabaseOrganizationConfiguratorUI extends RpcTarget implements Sup
   }
 
   async listOrganizations(query: string): Promise<ConfiguratorOption[]> {
-    await authorityFor(this).requireAppAccess();
+    await authorityFor(this).assertAppAccess();
     const organizations = await cachedList(this, orgListCache, () => api(this).listOrganizations());
     return organizations
       .filter(org => matches([org.name, org.slug], query))

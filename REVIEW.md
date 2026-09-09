@@ -32,9 +32,11 @@ through logs and errors, then everything else.
 - Trace every new app path through discovery/connection, account provisioning, UI and singleton
   issuance, resource-class issuance, workspace bindings, sessions, observations/actions, and hooks.
   Policy must be checked before external/vendor RPC and again at every retained capability use.
-- App UI receives only the kernel-minted `AppUiAuthority`. Long-lived hook state stores the trusted
-  owner Subject plus workspace/hook identity, never a human JWT or `HumanSessionGuard`; callback and
-  approval-queue use must revalidate live owner, app, workspace, hook, and target state.
+- App UI receives only the kernel-minted, Subject-bound `ContextAuthority`; non-Context vendors use
+  its `assertAppAccess()` method, while Context also resolves actors and audiences through it.
+  Long-lived hook state stores the trusted owner Subject plus workspace/hook identity, never a
+  human JWT or `HumanSessionGuard`; callback and approval-queue use must revalidate live owner,
+  app, workspace, hook, and target state.
 - App denial preserves account/content, gatekeeper records, bindings, schedules, and hooks. Local
   cleanup can remain reachable; re-enabling must not recreate a deleted audience grant.
 - Resource-specific `AdminConfig.disabledResources` remains a separate check after app access.

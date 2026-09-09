@@ -24,9 +24,13 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription, Audience, DirectoryAudienceTargets } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
+
+// Audience selectors are defined at the lower gatekeeper contract layer and re-exported here for
+// existing directory/admin API consumers.
+export type { Audience, DirectoryAudienceTargets } from "./gatekeeper.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -974,16 +978,6 @@ export type GroupMember = {
   userId: string;
 };
 
-/** Additive audience selector shared by resources that need directory authorization. */
-export type Audience = {
-  /** Whether every currently active organization user is included. */
-  everyone: boolean;
-  /** Directly included verified Supabase Subjects. */
-  userIds: string[];
-  /** Included server-generated directory group UUIDs. */
-  groupIds: string[];
-};
-
 /** Availability modes for a registered gatekeeper app. */
 export const APP_POLICY_MODES = ['disabled', 'optional', 'enabled'] as const;
 
@@ -1015,24 +1009,6 @@ export type AppAccessResult = {
   mode: AppPolicyMode;
   /** Stable additive audience sources that granted access, empty when access is denied. */
   sources: string[];
-};
-
-/** Minimal directory projection exposed to authenticated audience pickers. */
-export type DirectoryAudienceTargets = {
-  /** Currently effective-active users, without contact, role, status, or audit fields. */
-  users: Array<{
-    /** Verified Supabase Subject. */
-    userId: string;
-    /** Current directory display name. */
-    displayName: string;
-  }>;
-  /** Existing directory groups, without membership or audit fields. */
-  groups: Array<{
-    /** Server-generated immutable group UUID. */
-    groupId: string;
-    /** Current group display name. */
-    name: string;
-  }>;
 };
 
 /** Server-computed recipients and additive audience sources for a proposed app policy. */

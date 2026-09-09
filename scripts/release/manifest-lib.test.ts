@@ -149,14 +149,10 @@ test("worker entries carry the deploy contract", () => {
   assert.equal(workers["gatekeeper-email"].installable, false);
   assert.deepEqual(workers["gatekeeper-email"].inputs, []);
 
-  // gatekeeper-context: closed-beta artifacts binding is cut; its KV is a normal template and
-  // no OAuth-app inputs are demanded.
+  // gatekeeper-context is storage-backed by its Durable Objects and has no public authorization KV.
   const context = workers["gatekeeper-context"];
   assert.ok(!context.bindings.some((b) => b.name === "ARTIFACTS"));
-  assert.deepEqual(
-      context.bindings.find((b) => b.name === "CONTEXT_COLLECTIONS"),
-      { type: "kv_namespace", name: "CONTEXT_COLLECTIONS",
-        namespace_id: "$KV_CONTEXT_COLLECTIONS_ID" });
+  assert.deepEqual(context.bindings, []);
   assert.deepEqual(context.inputs, []);
 
   // Ambient gatekeepers are preinstalled on every core deploy; preinstalls must take no

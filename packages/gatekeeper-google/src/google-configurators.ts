@@ -14,7 +14,7 @@ import type { ConfiguratorOption } from "./configurator/configurator-option";
 import type { DriveAccountConfiguratorRpc } from "./configurator/drive-account-configurator-types";
 import type { DriveFileConfiguratorRpc } from "./configurator/drive-file-configurator-types";
 import type { SharedDriveConfiguratorRpc } from "./configurator/shared-drive-configurator-types";
-import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
 
 /**
  * Mints an access token for a configurator, forwarding `AccessTokenRequest` to the `UserAccount`
@@ -22,20 +22,22 @@ import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
  */
 type ConfiguratorTokenGetter = (opts?: AccessTokenRequest) => Promise<GoogleAccessToken>;
 
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+
 const googleTokenGetters = new WeakMap<object, ConfiguratorTokenGetter>();
-const appAuthorities = new WeakMap<object, RpcStub<AppUiAuthority>>();
+const appAuthorities = new WeakMap<object, RpcStub<ConfiguratorAuthority>>();
 const calendarConfiguratorCaches = new WeakMap<object, Promise<ConfiguratorOption[]>>();
 const bigQueryConfiguratorCaches = new WeakMap<object, Map<string, ConfiguratorOption[]>>();
 const BIGQUERY_CONFIGURATOR_CACHE_MAX_ENTRIES = 200;
 
-function appAuthorityFor(target: object): RpcStub<AppUiAuthority> {
+function appAuthorityFor(target: object): RpcStub<ConfiguratorAuthority> {
   let authority = appAuthorities.get(target);
   if (!authority) throw new Error("Google configurator is not initialized.");
   return authority;
 }
 
-async function requireAppAccess(target: object): Promise<void> {
-  await appAuthorityFor(target).requireAppAccess();
+async function assertAppAccess(target: object): Promise<void> {
+  await appAuthorityFor(target).assertAppAccess();
 }
 
 function disposeConfigurator(target: object): void {
@@ -60,7 +62,7 @@ function googleToken(target: object, opts?: AccessTokenRequest): Promise<GoogleA
 /** A provider that re-asks on every call, so `fetchWithAuthRetry` can refresh a rejected token. */
 function googleTokenProvider(target: object): AccessTokenProvider {
   return async opts => {
-    await requireAppAccess(target);
+    await assertAppAccess(target);
     return (await googleToken(target, opts)).token;
   };
 }
@@ -142,7 +144,7 @@ async function listDriveFiles(
 // RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
 @validateRpc()
 export class GmailConfiguratorUI extends RpcTarget implements GmailConfiguratorRpc {
-  constructor(authority: RpcStub<AppUiAuthority>) {
+  constructor(authority: RpcStub<ConfiguratorAuthority>) {
     super();
     appAuthorities.set(this, authority.dup());
   }
@@ -157,7 +159,7 @@ export class GmailConfiguratorUI extends RpcTarget implements GmailConfiguratorR
 export class CalendarConfiguratorUI extends RpcTarget implements CalendarConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -165,7 +167,7 @@ export class CalendarConfiguratorUI extends RpcTarget implements CalendarConfigu
   }
 
   async listCalendars(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     let options = calendarConfiguratorCaches.get(this);
     if (!options) {
       options = (async () => {
@@ -196,7 +198,7 @@ export class CalendarConfiguratorUI extends RpcTarget implements CalendarConfigu
 export class BigQueryConfiguratorUI extends RpcTarget implements BigQueryConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -204,7 +206,7 @@ export class BigQueryConfiguratorUI extends RpcTarget implements BigQueryConfigu
   }
 
   async listProjects(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return cachedBigQueryOptions(this, `projects:${query.trim().toLowerCase()}`, async () => {
       let api = await bigQueryApi(this);
       let projects = await api.listProjects(bigQueryConfiguratorListOptions(query));
@@ -220,7 +222,7 @@ export class BigQueryConfiguratorUI extends RpcTarget implements BigQueryConfigu
   }
 
   async listDatasets(projectId: string, query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return cachedBigQueryOptions(this, `datasets:${projectId}:${query.trim().toLowerCase()}`, async () => {
       let api = await bigQueryApi(this);
       let datasets = await api.listDatasets(projectId, bigQueryConfiguratorListOptions(query));
@@ -237,7 +239,7 @@ export class BigQueryConfiguratorUI extends RpcTarget implements BigQueryConfigu
   }
 
   async listTables(projectId: string, datasetId: string, query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return cachedBigQueryOptions(this, `tables:${projectId}:${datasetId}:${query.trim().toLowerCase()}`, async () => {
       let api = await bigQueryApi(this);
       let tables = await api.listTables(projectId, datasetId, bigQueryConfiguratorListOptions(query));
@@ -263,7 +265,7 @@ export class BigQueryConfiguratorUI extends RpcTarget implements BigQueryConfigu
 export class GoogleDocConfiguratorUI extends RpcTarget implements GoogleDocConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -271,7 +273,7 @@ export class GoogleDocConfiguratorUI extends RpcTarget implements GoogleDocConfi
   }
 
   async listDocs(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return listDriveFiles(
       this, query, "application/vnd.google-apps.document", "Google Docs",
     );
@@ -287,7 +289,7 @@ export class GoogleDocConfiguratorUI extends RpcTarget implements GoogleDocConfi
 export class GoogleSheetsConfiguratorUI extends RpcTarget implements GoogleSheetsConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -295,7 +297,7 @@ export class GoogleSheetsConfiguratorUI extends RpcTarget implements GoogleSheet
   }
 
   async listSpreadsheets(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return listDriveFiles(
       this, query, "application/vnd.google-apps.spreadsheet", "Google Sheets",
     );
@@ -308,7 +310,7 @@ export class GoogleSheetsConfiguratorUI extends RpcTarget implements GoogleSheet
 
 @validateRpc()
 export class DriveAccountConfiguratorUI extends RpcTarget implements DriveAccountConfiguratorRpc {
-  constructor(authority: RpcStub<AppUiAuthority>) {
+  constructor(authority: RpcStub<ConfiguratorAuthority>) {
     super();
     appAuthorities.set(this, authority.dup());
   }
@@ -322,7 +324,7 @@ export class DriveAccountConfiguratorUI extends RpcTarget implements DriveAccoun
 export class SharedDriveConfiguratorUI extends RpcTarget implements SharedDriveConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -330,7 +332,7 @@ export class SharedDriveConfiguratorUI extends RpcTarget implements SharedDriveC
   }
 
   async listSharedDrives(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     let drive = new DriveApi(googleTokenProvider(this));
     let drives = await withDriveApiEnabled(
       "Shared-drive search requires the Google Drive API to be enabled for this OAuth project.",
@@ -348,7 +350,7 @@ export class SharedDriveConfiguratorUI extends RpcTarget implements SharedDriveC
 export class DriveFileConfiguratorUI extends RpcTarget implements DriveFileConfiguratorRpc {
   constructor(
     getToken: () => Promise<GoogleAccessToken>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     googleTokenGetters.set(this, getToken);
@@ -356,7 +358,7 @@ export class DriveFileConfiguratorUI extends RpcTarget implements DriveFileConfi
   }
 
   async listDriveFiles(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     let drive = new DriveApi(googleTokenProvider(this));
     let { files } = await withDriveApiEnabled(
       "Drive file search requires the Google Drive API to be enabled for this OAuth project.",

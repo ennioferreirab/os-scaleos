@@ -48,10 +48,11 @@ The overseer cases need a gatekeeper that refuses an observer on command. Every 
 gatekeeper can do that only at a cost that would dominate the test:
 
 - **OAuth gatekeepers** need a whole vendor auth surface mocked before an account exists at all.
-- **The Context Library** only refuses once an observation has been *recorded*, which takes a gadget
-  read session (so a Worker Loader), a slash-command invocation, or an AI-chat catalog snapshot. It is
-  also a singleton, so it can never produce the two simultaneously-failing bindings one of these cases
-  needs.
+* **The Context Library** has a subject-bound collection ACL and therefore refuses an observer when
+  `ContextAuthority.resolveAudience(audience)` cannot authorize the observer's live role. Collection
+  observations remain additive to the broader observer checks, and the registry/KV discovery path
+  is not an authorization shortcut; exercising the refusal still requires a gadget read session (so
+  a Worker Loader), a slash-command invocation, or an AI-chat catalog snapshot.
 
 Adding a test hook to those workers was considered and rejected. A "mark observed" hook would stub the
 very state the tracker maintains, making the test circular.

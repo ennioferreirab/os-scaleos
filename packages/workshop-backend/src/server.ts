@@ -27,16 +27,17 @@ import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from 
 
 // Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
 export { PendingLogin, LoginConnectCallbackImpl };
-import { AppUiAuthority, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import type { ContextAuthority, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { LanguageModelGatekeeper } from "./ai-models";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { OrganizationDirectoryDurableObject } from "./organization-directory.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, sanitizeBlueprintOutput, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintContent, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { DurableContextAuthority, ContextAuthorityImpl } from "./context-authority.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback, TransientStubLoopback } from "./overseer";
 import { ExternalMessageGateway } from "./external-message-gateway";
-import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
+import { RpcStub as NativeRpcStub, type RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -70,6 +71,7 @@ export { OrganizationDirectoryDurableObject };
 
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperVerifierAuthority };
+export { DurableContextAuthority };
 
 // Re-export entrypoint types from overseer.ts.
 export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
@@ -139,26 +141,6 @@ async function handleDirectoryUserRequest(
 
 // =======================================================================================
 
-class AppUiAuthorityImpl extends NativeRpcTarget implements AppUiAuthority {
-  constructor(
-      private requireActiveCallback: () => Promise<void>,
-      private requireAppAccessCallback: () => Promise<void>,
-      private isAdminCallback: () => Promise<boolean>) {
-    super();
-  }
-
-  requireActive(): Promise<void> {
-    return this.requireActiveCallback();
-  }
-
-  requireAppAccess(): Promise<void> {
-    return this.requireAppAccessCallback();
-  }
-
-  isAdmin(): Promise<boolean> {
-    return this.isAdminCallback();
-  }
-}
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
@@ -208,6 +190,20 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     } catch {
       return false;
     }
+  }
+
+  /** Mint the single subject-bound authority shared by bound vendor/app UI capabilities. */
+  #contextAuthority(
+      vendorId: string | undefined,
+      assertAdditionalAccess: () => Promise<void>): NativeRpcStub<NativeRpcTarget & ContextAuthority> {
+    return new NativeRpcStub(new ContextAuthorityImpl({
+      subject: this.guard.subject,
+      vendorId,
+      directory: this.organizationDirectory.getByName(""),
+      centralAuthMode: this.centralAuthMode,
+      sessionGuard: this.guard,
+      assertAdditionalAccess,
+    }));
   }
 
   async whoami(): Promise<AiChatAuthorInfo> {
@@ -472,13 +468,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       resourceUrlPattern: string) {
     await this.#requireActive();
     return this.#user.startResourceConfigurator(accountId, resourceUrlPattern, {
-      authority: new AppUiAuthorityImpl(
-          () => this.#requireActive(),
-          async () => {
-            await this.#requireActive();
-            await this.#user.requireOptionalConnectedAccountAccess(accountId);
-          },
-          () => this.#isAdmin()),
+      authority: this.#contextAuthority(
+          undefined, () => this.#user.requireOptionalConnectedAccountAccess(accountId)),
     });
   }
 
@@ -741,13 +732,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let app = accounts.find((account: (typeof accounts)[number]) => account.vendorId === id && account.description.providesUi);
     if (!app) return null;
     return user.startAccountAppUi(app.accountId, {
-      authority: new AppUiAuthorityImpl(
-          () => this.#requireActive(),
-          async () => {
-            await this.#requireActive();
-            await user.requireAccountAppUiAccess(app.accountId, id);
-          },
-          () => this.#isAdmin()),
+      authority: this.#contextAuthority(
+          id, () => user.requireAccountAppUiAccess(app.accountId, id)),
     });
   }
 

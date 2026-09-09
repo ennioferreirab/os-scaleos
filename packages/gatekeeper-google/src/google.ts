@@ -786,6 +786,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async startResourceConfigurator(
       resourceUrlPattern: string, context: AppUiContext): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Google app authority is unavailable.");
     let getToken = async (opts?: AccessTokenRequest) => {
       let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
       let obj = this.ctx.exports.UserAccount.get(id);
@@ -795,56 +797,56 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
       return {
         iframeHtml: BIGQUERY_CONFIGURATOR_HTML,
-        ui: new RpcStub(new BigQueryConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new BigQueryConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === GMAIL_RESOURCE.urlPattern) {
       return {
         iframeHtml: GMAIL_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GmailConfiguratorUI(context.authority)),
+        ui: new RpcStub(new GmailConfiguratorUI(authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_CALENDAR_RESOURCE.urlPattern) {
       return {
         iframeHtml: CALENDAR_CONFIGURATOR_HTML,
-        ui: new RpcStub(new CalendarConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new CalendarConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DOC_RESOURCE.urlPattern) {
       return {
         iframeHtml: GOOGLE_DOC_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GoogleDocConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new GoogleDocConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_SHEETS_RESOURCE.urlPattern) {
       return {
         iframeHtml: GOOGLE_SHEETS_CONFIGURATOR_HTML,
-        ui: new RpcStub(new GoogleSheetsConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new GoogleSheetsConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_ACCOUNT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveAccountConfiguratorUI(context.authority)),
+        ui: new RpcStub(new DriveAccountConfiguratorUI(authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: SHARED_DRIVE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken, authority)),
       };
     }
 
     if (resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_FILE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveFileConfiguratorUI(getToken, context.authority)),
+        ui: new RpcStub(new DriveFileConfiguratorUI(getToken, authority)),
       };
     }
 

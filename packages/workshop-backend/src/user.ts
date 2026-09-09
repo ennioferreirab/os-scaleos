@@ -1,6 +1,7 @@
 import { RpcStub } from "capnweb";
+import { validateRpc } from "capnweb-validate";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, AppAccessResult, createAuthError, type DirectoryUser } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperVerifierContext, VerifierAppAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperVerifierContext, VerifierAppAuthority, ContextAuthority, Audience, DirectoryAudienceTargets } from "@gadgets/workshop-shared/gatekeeper";
 import { canOptIntoAccount, shouldAutoProvisionAccount } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -14,6 +15,7 @@ import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./a
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { hasSupabaseAuthSettings } from "./auth/supabase.js";
 import type { OrganizationDirectoryDurableObject } from "./organization-directory.js";
+import { ContextAuthorityImpl } from "./context-authority.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -291,19 +293,54 @@ type GatekeeperVerifierAuthorityProps = {
   userObjectId: string;
   accountId: number;
   vendorId: string;
+  subject: string;
 };
 
 /**
  * Persistent, attenuated callback used by vendor verifier entrypoints. Unlike human UI authority,
  * it survives the browser session and re-enters the owning User DO for every observer access check.
+ * The capability is bound to its vendor/app and also exposes Context methods when that app supports
+ * the Context contract.
  */
+@validateRpc()
 export class GatekeeperVerifierAuthority
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperVerifierAuthorityProps>
-    implements VerifierAppAuthority {
+    implements VerifierAppAuthority, ContextAuthority {
+  #user() {
+    const users = this.ctx.exports.UserDurableObject;
+    return users.get(users.idFromString(this.ctx.props.userObjectId));
+  }
+
+  #authority(): ContextAuthorityImpl {
+    return new ContextAuthorityImpl({
+      subject: this.ctx.props.subject,
+      vendorId: this.ctx.props.vendorId,
+      directory: this.ctx.exports.OrganizationDirectoryDurableObject.getByName(""),
+      centralAuthMode: hasSupabaseAuthSettings(this.env),
+      assertAdditionalAccess: () => this.#user().requireConnectedAccountAppAccess(
+          this.ctx.props.accountId, this.ctx.props.vendorId, this.ctx.props.subject),
+    });
+  }
+
   requireAppAccess(): Promise<void> {
-    let users = this.ctx.exports.UserDurableObject;
-    return users.get(users.idFromString(this.ctx.props.userObjectId))
-        .requireConnectedAccountAppAccess(this.ctx.props.accountId, this.ctx.props.vendorId);
+    return this.#user().requireConnectedAccountAppAccess(
+        this.ctx.props.accountId, this.ctx.props.vendorId, this.ctx.props.subject);
+  }
+
+  getActor(): Promise<{subject: string; isOrgAdmin: boolean}> {
+    return this.#authority().getActor();
+  }
+
+  resolveAudience(audience: Audience): Promise<{allowed: boolean; sources: string[]}> {
+    return this.#authority().resolveAudience(audience);
+  }
+
+  listAudienceTargets(): Promise<DirectoryAudienceTargets> {
+    return this.#authority().listAudienceTargets();
+  }
+
+  assertAppAccess(): Promise<void> {
+    return this.#authority().assertAppAccess();
   }
 }
 
@@ -1880,17 +1917,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
           `!= expected "${expectedVendorId}"`);
       throw new Error("Invalid account selection for this service.");
     }
-    await this.requireConnectedAccountAppAccess(accountId, expectedVendorId);
-    let authority = this.ctx.exports.GatekeeperVerifierAuthority({
-      props: {userObjectId: this.ctx.id.toString(), accountId, vendorId: expectedVendorId},
-    }) as Fetcher<VerifierAppAuthority>;
+    let subject = this.storage.profile.get().id;
+    await this.requireConnectedAccountAppAccess(accountId, expectedVendorId, subject);
+    let authority: GatekeeperVerifierContext["authority"] =
+      this.ctx.exports.GatekeeperVerifierAuthority({
+        props: {
+          userObjectId: this.ctx.id.toString(),
+          accountId,
+          vendorId: expectedVendorId,
+          subject,
+        },
+      });
     let context: GatekeeperVerifierContext = {authority};
     let verifier = await account.account.getVerifier(context);
     try {
-      await this.requireConnectedAccountAppAccess(accountId, expectedVendorId);
+      await this.requireConnectedAccountAppAccess(accountId, expectedVendorId, subject);
       return verifier;
     } catch (error) {
-      (verifier as unknown as {[Symbol.dispose]?(): void})[Symbol.dispose]?.();
+      verifier[Symbol.dispose]?.();
       throw error;
     }
   }

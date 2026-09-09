@@ -15,7 +15,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "types": ["vite/client"]
+    "types": ["vite/client", "@cloudflare/workers-types/experimental"]
   },
   "include": ["app"]
 }

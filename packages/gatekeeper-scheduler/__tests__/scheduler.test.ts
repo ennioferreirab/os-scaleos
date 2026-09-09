@@ -1,8 +1,6 @@
 import { RpcTarget } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import type {
-  AppUiAuthority, ApprovalQueue, HookInitiator,
-} from "@gadgets/workshop-shared/gatekeeper";
+import type { ApprovalQueue, HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ScheduleManagementApi,
   ScheduleSessionImpl,
@@ -342,24 +340,28 @@ describe("ScheduleManagementApi", () => {
     const page = { schedules: [activeSummary("schedule-a")] };
     const listAccount = vi.fn(async () => page);
     let allowed = true;
-    const requireAppAccess = vi.fn(async () => {
+    const assertAppAccess = vi.fn(async () => {
       if (!allowed) throw new Error("App access denied.");
     });
     const dispose = vi.fn();
     const authority = {
-      requireAppAccess,
-      requireActive: vi.fn(async () => {}),
-      isAdmin: vi.fn(async () => false),
-      dup() { return authority; },
-      [Symbol.dispose]: dispose,
-    } as unknown as RpcStub<AppUiAuthority>;
+      async assertAppAccess(): Promise<void> {
+        await assertAppAccess();
+      },
+      dup() {
+        return this;
+      },
+      [Symbol.dispose](): void {
+        dispose();
+      },
+    };
     const api = new ScheduleManagementApi({ listAccount }, authority);
     const options = { query: "brief", statuses: ["active" as const] };
 
     await expect(api.list(options)).resolves.toBe(page);
     allowed = false;
     await expect(api.list(options)).rejects.toThrow("App access denied.");
-    expect(requireAppAccess).toHaveBeenCalledTimes(2);
+    expect(assertAppAccess).toHaveBeenCalledTimes(2);
     expect(listAccount).toHaveBeenCalledTimes(1);
 
     api[Symbol.dispose]();

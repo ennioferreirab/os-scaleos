@@ -1,35 +1,37 @@
 import { RpcTarget } from "cloudflare:workers";
 import type { RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { AppUiAuthority } from "@gadgets/workshop-shared/gatekeeper";
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
 import { LinearApi, type RawConnection, type RawTeam } from "./linear-api";
 import type { LinearWorkspaceConfiguratorRpc } from "./configurator/linear-workspace-configurator-types";
 import type { LinearTeamConfiguratorRpc } from "./configurator/linear-team-configurator-types";
 import type { LinearIssueConfiguratorRpc } from "./configurator/linear-issue-configurator-types";
 
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
 type ConfiguratorOption = { value: string; title: string; subtitle?: string; meta?: string };
+
 
 const OPTION_LIMIT = 50;
 
 // Keep the token getter and live app authority off the RpcTarget's public surface.
 const tokenGetters = new WeakMap<object, () => Promise<string>>();
-const authorities = new WeakMap<object, RpcStub<AppUiAuthority>>();
+const authorities = new WeakMap<object, RpcStub<ConfiguratorAuthority>>();
 
 function api(target: object): LinearApi {
   const getToken = tokenGetters.get(target);
   const authority = authorities.get(target);
   if (!getToken || !authority) throw new Error("Linear configurator is not initialized.");
-  return new LinearApi(getToken).withBeforeRequest(() => authority.requireAppAccess());
+  return new LinearApi(getToken).withBeforeRequest(() => authority.assertAppAccess());
 }
 
-function requireAppAccess(target: object): Promise<void> {
+function assertAppAccess(target: object): Promise<void> {
   const authority = authorities.get(target);
   if (!authority) throw new Error("Linear configurator is not initialized.");
-  return authority.requireAppAccess();
+  return authority.assertAppAccess();
 }
 
-function disposeAuthority(authority: RpcStub<AppUiAuthority>): void {
-  (authority as RpcStub<AppUiAuthority> & { [Symbol.dispose](): void })[Symbol.dispose]();
+function disposeAuthority(authority: RpcStub<ConfiguratorAuthority>): void {
+  authority[Symbol.dispose]();
 }
 
 // Per-instance cache of the workspace url key (the first path segment of linear.app URLs).
@@ -66,7 +68,7 @@ function matches(parts: (string | null | undefined)[], query: string): boolean {
 
 @validateRpc()
 export class LinearWorkspaceConfiguratorUI extends RpcTarget implements LinearWorkspaceConfiguratorRpc {
-  constructor(getToken: () => Promise<string>, authority: RpcStub<AppUiAuthority>) {
+  constructor(getToken: () => Promise<string>, authority: RpcStub<ConfiguratorAuthority>) {
     super();
     tokenGetters.set(this, getToken);
     authorities.set(this, authority.dup());
@@ -78,12 +80,12 @@ export class LinearWorkspaceConfiguratorUI extends RpcTarget implements LinearWo
   }
 
   async getWorkspaceUrlKey(): Promise<string> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     return await workspaceUrlKey(this);
   }
 
   async listWorkspaces(): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     // A Linear OAuth token is scoped to a single workspace, so there is exactly one option.
     const org = await api(this).getOrganization();
     return [{ value: org.urlKey, title: org.name, subtitle: `linear.app/${org.urlKey}` }];
@@ -93,7 +95,7 @@ export class LinearWorkspaceConfiguratorUI extends RpcTarget implements LinearWo
 @validateRpc()
 export class LinearTeamConfiguratorUI extends LinearWorkspaceConfiguratorUI implements LinearTeamConfiguratorRpc {
   async listTeams(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     const conn = await allTeams(this);
     return conn.nodes
       .filter(team => matches([team.key, team.name, team.description], query))
@@ -110,7 +112,7 @@ export class LinearTeamConfiguratorUI extends LinearWorkspaceConfiguratorUI impl
 @validateRpc()
 export class LinearIssueConfiguratorUI extends LinearWorkspaceConfiguratorUI implements LinearIssueConfiguratorRpc {
   async listIssues(query: string): Promise<ConfiguratorOption[]> {
-    await requireAppAccess(this);
+    await assertAppAccess(this);
     const trimmed = query.trim();
     const conn = trimmed
       ? await api(this).searchIssues({ term: trimmed, first: OPTION_LIMIT })

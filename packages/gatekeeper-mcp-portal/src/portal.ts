@@ -12,7 +12,7 @@ import {
   matchesResourceUrlPattern,
   stripTrailingSlashes,
   type AccountDescription,
-  type AppUiAuthority,
+  type ContextAuthority,
   type AppUiContext,
   type AvatarImage,
   type Gatekeeper,
@@ -714,10 +714,12 @@ export class GatekeeperUserImpl
     _resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("MCP portal app authority is unavailable.");
     return {
       iframeHtml: MCP_SERVER_CONFIGURATOR_HTML,
       ui: new RpcStub(new McpServerConfiguratorUI(
-        this.env, this.#account(), context.authority)),
+        this.env, this.#account(), authority)),
     };
   }
 
@@ -800,18 +802,20 @@ export class McpPortalVerifier
 // ---------------------------------------------------------------------------
 // Resource configurator
 
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+
 @validateRpc()
 class McpServerConfiguratorUI extends RpcTarget implements McpServerConfiguratorRpc {
   #env: Env;
   #account: DurableObjectStub<McpAccount>;
-  #authority: RpcStub<AppUiAuthority>;
+  #authority: RpcStub<ConfiguratorAuthority>;
   #serverPromise: Promise<ConnectedServer> | undefined;
   #portalServersPromise: Promise<PortalServer[]> | undefined;
 
   constructor(
     env: Env,
     account: DurableObjectStub<McpAccount>,
-    authority: RpcStub<AppUiAuthority>,
+    authority: RpcStub<ConfiguratorAuthority>,
   ) {
     super();
     this.#env = env;
@@ -820,7 +824,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   }
 
   async getEndpoint(): Promise<string> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return (await this.#server()).endpoint;
   }
 
@@ -839,7 +843,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   // endpoint that does not implement the portal contract or currently fronts nothing; either case
   // leaves the form unsubmittable.
   async listServerOptions(): Promise<ConfiguratorUIOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     return (await this.#portalServers())
       .filter(upstream => !isPortalServerHidden(this.#env, upstream.id))
       .map(upstream => ({
@@ -854,7 +858,7 @@ class McpServerConfiguratorUI extends RpcTarget implements McpServerConfigurator
   // Tools the grant may cover within one portal upstream server. The survey is checked before the
   // detailed catalog is fetched, and `toolGrantOptions` decides what each source says.
   async listToolOptions(serverId: string): Promise<ConfiguratorUIOption[]> {
-    await this.#authority.requireAppAccess();
+    await this.#authority.assertAppAccess();
     if (!isValidToolName(serverId) || isPortalServerHidden(this.#env, serverId)) return [];
     if (!(await this.#portalServers()).some(server => server.id === serverId)) return [];
     const server = await this.#server();

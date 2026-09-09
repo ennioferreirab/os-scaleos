@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type {
-  GatekeeperUser, GatekeeperUserVerifier, GatekeeperVerifierContext, VerifierAppAuthority,
+  ContextAuthority, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVerifierContext,
+  VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { UserDurableObject } from "../src/user.js";
 
 function makeUserWithAccount(vendorId: string) {
   const verifier = {} as Fetcher<GatekeeperUserVerifier>;
-  const authority = {} as Fetcher<VerifierAppAuthority>;
+  const authority = {} as Fetcher<VerifierAppAuthority & ContextAuthority>;
   let verifierRequests = 0;
   let verifierContext: GatekeeperVerifierContext | undefined;
   let authorityProps: unknown;
@@ -31,6 +32,9 @@ function makeUserWithAccount(vendorId: string) {
       },
     },
     storage: {
+      profile: {
+        get: () => ({id: "subject-a"}),
+      },
       connectedAccounts: {
         get: (accountId: number) => accountId === 7
           ? { id: accountId, account, vendorId }
@@ -61,6 +65,7 @@ describe("UserDurableObject.getVerifier", () => {
       userObjectId: "user-do-id",
       accountId: 7,
       vendorId: "notion",
+      subject: "subject-a",
     });
   });
 

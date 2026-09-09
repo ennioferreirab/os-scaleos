@@ -3,7 +3,7 @@
 // `assertAppAccess` or `authorizeObservation` await in `observability-session.ts` must fail this file.
 
 import { RpcStub, RpcTarget } from "cloudflare:workers";
-import type { AppUiAuthority, ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
+import type { ContextAuthority, ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CloudflareObservabilityApi } from "../../src/observability-api";
 import {
@@ -16,19 +16,13 @@ import {
 } from "../../src/observability-session";
 import type { CloudflareObservabilityFilter } from "../../src/types";
 
-class TestAppUiAuthority extends RpcTarget {
+class TestContextAuthority extends RpcTarget {
   constructor(private readonly denied: boolean) {
     super();
   }
 
-  async requireActive(): Promise<void> {}
-
-  async requireAppAccess(): Promise<void> {
+  async assertAppAccess(): Promise<void> {
     if (this.denied) throw new Error("app access denied");
-  }
-
-  async isAdmin(): Promise<boolean> {
-    return false;
   }
 }
 
@@ -183,7 +177,8 @@ describe("observation authorization", () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
     const getToken = vi.fn(async () => "token");
-    const authority = new RpcStub(new TestAppUiAuthority(true)) as unknown as RpcStub<AppUiAuthority>;
+    const authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">> =
+      new RpcStub(new TestContextAuthority(true));
     const ui = new CloudflareAccountConfiguratorUI(getToken, authority);
 
     await expect(ui.listAccounts("")).rejects.toThrow("app access denied");
@@ -198,7 +193,8 @@ describe("observation authorization", () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
     const getToken = vi.fn(async () => "token");
-    const authority = new RpcStub(new TestAppUiAuthority(true)) as unknown as RpcStub<AppUiAuthority>;
+    const authority: RpcStub<RpcTarget & Pick<ContextAuthority, "assertAppAccess">> =
+      new RpcStub(new TestContextAuthority(true));
     const ui = new CloudflareWorkerConfiguratorUI(getToken, authority);
 
     await expect(ui.listWorkers(ACCOUNT_ID, "")).rejects.toThrow("app access denied");

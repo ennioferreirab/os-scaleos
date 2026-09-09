@@ -1,6 +1,6 @@
 import type {RpcStub} from "cloudflare:workers";
 import type {
-  Gatekeeper, ObservationAuthorizer, SlashCommandResult,
+  Gatekeeper, GatekeeperRequestContext, ObservationAuthorizer, SlashCommandResult,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   SlashCommandChoice, SlashCommandRequest,
@@ -14,6 +14,7 @@ type SlashCommandSource = {
   gatekeeperId: number;
   providerLabel: string;
   gatekeeper: Fetcher<Gatekeeper<any>>;
+  requestContext?: GatekeeperRequestContext;
   assertAccess?: () => Promise<void>;
 };
 
@@ -24,7 +25,7 @@ export async function collectSlashCommands(
     try {
       await source.assertAccess?.();
       using provider = await (source.gatekeeper as SlashCommandGatekeeper)
-          .getSlashCommandProvider();
+          .getSlashCommandProvider(source.requestContext);
       await source.assertAccess?.();
       let commands = await provider.list();
       await source.assertAccess?.();
@@ -48,13 +49,14 @@ export async function collectSlashCommands(
     left.selection.commandId.localeCompare(right.selection.commandId));
 }
 
-/** Invoke one command on its selected attached Gatekeeper. */
 export async function invokeSlashCommand(
     gatekeeper: Fetcher<Gatekeeper<any>>, request: SlashCommandRequest,
     authorizer: RpcStub<ObservationAuthorizer>,
-    assertAccess?: () => Promise<void>): Promise<SlashCommandResult> {
+    assertAccess?: () => Promise<void>,
+    requestContext?: GatekeeperRequestContext): Promise<SlashCommandResult> {
   await assertAccess?.();
-  using provider = await (gatekeeper as SlashCommandGatekeeper).getSlashCommandProvider();
+  using provider = await (gatekeeper as SlashCommandGatekeeper)
+      .getSlashCommandProvider(requestContext);
   await assertAccess?.();
   let result = await provider.invoke(request.id.commandId, request.args, authorizer);
   await assertAccess?.();

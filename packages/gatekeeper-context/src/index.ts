@@ -1,5 +1,5 @@
-// Context Library worker: private per-account collections plus public per-domain collections. The
-// vendor auto-provisions accounts that expose a read-only agent singleton and a management UI.
+// Context Library worker: private Subject-owned collections plus a read-only agent singleton. The
+// vendor auto-provisions one account per connection and exposes a management UI.
 
 export { ContextCollectionDurableObject } from "./context-collection.js";
 export { UserLibraryDurableObject } from "./user-library.js";

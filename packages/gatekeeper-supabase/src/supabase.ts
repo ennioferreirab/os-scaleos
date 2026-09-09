@@ -639,18 +639,20 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     resourceUrlPattern: string,
     context: AppUiContext,
   ): Promise<ResourceConfiguratorFrame> {
-    await context.authority.requireAppAccess();
+    const authority = context.authority;
+    if (!authority) throw new Error("Supabase app authority is unavailable.");
+    await authority.assertAppAccess();
     if (resourceUrlPattern === PROJECT_RESOURCE.urlPattern) {
       return {
         iframeHtml: SUPABASE_PROJECT_CONFIGURATOR_HTML,
-        ui: new RpcStub(new SupabaseProjectConfiguratorUI(this.#getToken, context.authority.dup())),
+        ui: new RpcStub(new SupabaseProjectConfiguratorUI(this.#getToken, authority.dup())),
       };
     }
     if (resourceUrlPattern === ORGANIZATION_RESOURCE.urlPattern) {
       return {
         iframeHtml: SUPABASE_ORGANIZATION_CONFIGURATOR_HTML,
         ui: new RpcStub(new SupabaseOrganizationConfiguratorUI(
-          this.#getToken, context.authority.dup())),
+          this.#getToken, authority.dup())),
       };
     }
     throw new Error(`Unsupported Supabase resource configurator type: ${resourceUrlPattern}`);
