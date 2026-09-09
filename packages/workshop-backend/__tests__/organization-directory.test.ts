@@ -75,7 +75,7 @@ describe("OrganizationDirectoryDurableObject", () => {
       if (url.includes("/rest/v1/rpc/list_groups")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
         const list = [...centralGroupsData.values()]
-          .sort((a, b) => a.nameKey.localeCompare(b.nameKey) || a.groupId.localeCompare(b.groupId))
+          .toSorted((a, b) => a.nameKey.localeCompare(b.nameKey) || a.groupId.localeCompare(b.groupId))
           .map(g => ({groupId: g.groupId, name: g.name, createdAt: g.createdAt, updatedAt: g.updatedAt}));
         return Response.json(list);
       }
@@ -83,7 +83,7 @@ describe("OrganizationDirectoryDurableObject", () => {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
         const group = centralGroupsData.get(body.p_group_id);
         if (!group) return Response.json({message: "NOT_FOUND"}, {status: 404});
-        return Response.json([...(centralMembersData.get(body.p_group_id) ?? [])].sort());
+        return Response.json([...(centralMembersData.get(body.p_group_id) ?? [])].toSorted());
       }
       if (url.includes("/rest/v1/rpc/get_groups_members")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
@@ -93,7 +93,7 @@ describe("OrganizationDirectoryDurableObject", () => {
           if (centralGroupsData.has(gid)) {
             const members = centralMembersData.get(gid);
             if (members) {
-              for (const uid of [...members].sort()) {
+              for (const uid of [...members].toSorted()) {
                 pairs.push({groupId: gid, userId: uid});
               }
             }
@@ -104,19 +104,19 @@ describe("OrganizationDirectoryDurableObject", () => {
       if (url.includes("/rest/v1/rpc/resolve_group_memberships")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
         const groupIds: string[] = body.p_group_ids ?? [];
-        const matched = groupIds.filter(gid => centralGroupsData.has(gid) && (centralMembersData.get(gid)?.has(body.p_subject) ?? false)).sort();
+        const matched = groupIds.filter(gid => centralGroupsData.has(gid) && (centralMembersData.get(gid)?.has(body.p_subject) ?? false)).toSorted();
         return Response.json(matched);
       }
       if (url.includes("/rest/v1/rpc/existing_group_ids")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
         const groupIds: string[] = body.p_group_ids ?? [];
-        const existing = groupIds.filter(gid => centralGroupsData.has(gid)).sort();
+        const existing = groupIds.filter(gid => centralGroupsData.has(gid)).toSorted();
         return Response.json(existing);
       }
       if (url.includes("/rest/v1/rpc/list_group_audit_events")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});
         const limit = body.p_limit ?? 50;
-        return Response.json(centralAuditEventsData.slice(-limit).reverse());
+        return Response.json(centralAuditEventsData.slice(-limit).toReversed());
       }
       if (url.includes("/rest/v1/rpc/apply_group_mutation")) {
         if (failGroupsRemote) return Response.json({message: "unavailable"}, {status: 503});

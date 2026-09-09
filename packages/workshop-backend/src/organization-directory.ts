@@ -1254,7 +1254,7 @@ export class OrganizationDirectoryDurableObject extends DurableObject<Cloudflare
     const localEvents = [...this.storage.auditEvents.list({reverse: true, limit: effectiveLimit})]
       .map(({storageKey: _, ...event}) => event);
 
-    const combined = [...sqlGroupEvents, ...localEvents].sort((left, right) => {
+    const combined = [...sqlGroupEvents, ...localEvents].toSorted((left, right) => {
       const byTime = right.occurredAt.localeCompare(left.occurredAt);
       if (byTime !== 0) return byTime;
       return right.eventId.localeCompare(left.eventId);
