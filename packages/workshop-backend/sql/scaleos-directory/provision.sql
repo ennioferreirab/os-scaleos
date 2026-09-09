@@ -16,6 +16,14 @@
 \endif
 
 BEGIN;
+-- psql does not substitute variables inside dollar-quoted PL/pgSQL bodies.
+-- Store the validated target in a transaction-local setting for the binding guard below.
+SELECT pg_catalog.set_config(
+    'scaleos_directory.target_org_id',
+    :'TARGET_ORG_ID',
+    true
+) AS target_org_setting
+\gset
 
 -- -----------------------------------------------------------------------------
 -- 1. Initialize Group Version Clock (starts at 0)
@@ -33,7 +41,7 @@ ON CONFLICT (org_id) DO NOTHING;
 DO $binding$
 DECLARE
     v_existing text;
-    v_target text := :'TARGET_ORG_ID';
+    v_target text := pg_catalog.current_setting('scaleos_directory.target_org_id');
 BEGIN
     SELECT org_id INTO v_existing
     FROM scaleos_directory.reader_bindings
