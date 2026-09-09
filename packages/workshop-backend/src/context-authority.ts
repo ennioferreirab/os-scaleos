@@ -98,7 +98,7 @@ export class ContextAuthorityImpl extends NativeRpcTarget implements ContextAuth
       // manufacturing identity from a username/account property.
       return {allowed: false, sources: []};
     }
-    return this.#directory!.resolveAudience(this.#subject, audience);
+    return await this.#directory!.resolveAudience(this.#subject, audience);
   }
 
   async listAudienceTargets(): Promise<DirectoryAudienceTargets> {
@@ -106,7 +106,7 @@ export class ContextAuthorityImpl extends NativeRpcTarget implements ContextAuth
     if (!this.#centralAuthMode) {
       return {users: [], groups: []};
     }
-    return this.#directory!.listAudienceTargets(this.#subject);
+    return await this.#directory!.listAudienceTargets(this.#subject);
   }
 
   /** Recheck access to the bound vendor/app and its kernel-owned target. */

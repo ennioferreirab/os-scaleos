@@ -466,7 +466,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     let actor = await this.organizationDirectory.getByName("").getOrCreateActor(userDoId);
     return this.#withAdminConfigMutation(async () => {
       await this.#flushAdminAuditOutbox();
-      return this.organizationDirectory.getByName("")
+      return await this.organizationDirectory.getByName("")
           .listAdminAuditEvents(actor.tenantId, limit);
     });
   }
@@ -813,34 +813,45 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async listGroups(): Promise<Group[]> {
     this.guard.assertValid();
-    return this.directory.listGroups(this.guard.subject);
+    const result = await this.directory.listGroups(this.guard.subject);
+    this.guard.assertValid();
+    return result;
   }
 
   async getGroupMembers(groupId: string): Promise<string[]> {
     this.guard.assertValid();
-    return this.directory.getGroupMembers(this.guard.subject, groupId);
+    const result = await this.directory.getGroupMembers(this.guard.subject, groupId);
+    this.guard.assertValid();
+    return result;
   }
 
   async createGroup(input: {name: string; mutationId: string}) {
     await this.#requireAdmin();
-    return this.directory.createGroup(this.guard.subject, input);
+    const result = await this.directory.createGroup(this.guard.subject, input);
+    this.guard.assertValid();
+    return result;
   }
 
   async renameGroup(input: {groupId: string; name: string; mutationId: string}) {
     await this.#requireAdmin();
-    return this.directory.renameGroup(this.guard.subject, input);
+    const result = await this.directory.renameGroup(this.guard.subject, input);
+    this.guard.assertValid();
+    return result;
   }
 
   async replaceGroupMembers(input: {groupId: string; userIds: string[]; mutationId: string}) {
     await this.#requireAdmin();
-    return this.directory.replaceGroupMembers(this.guard.subject, input);
+    const result = await this.directory.replaceGroupMembers(this.guard.subject, input);
+    this.guard.assertValid();
+    return result;
   }
 
   async deleteGroup(input: {groupId: string; mutationId: string}) {
     await this.#requireAdmin();
-    return this.directory.deleteGroup(this.guard.subject, input);
+    const result = await this.directory.deleteGroup(this.guard.subject, input);
+    this.guard.assertValid();
+    return result;
   }
-
   async setSiteName(name: string): Promise<void> {
     await this.#requireAdmin();
     if (name.length > MAX_SITE_NAME_LENGTH) {

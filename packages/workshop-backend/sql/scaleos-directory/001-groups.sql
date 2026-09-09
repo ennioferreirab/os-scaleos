@@ -334,6 +334,43 @@ BEGIN
 END;
 $$;
 
+-- Returns group-to-member mappings for candidate groups in one batch.
+CREATE OR REPLACE FUNCTION scaleos_directory.get_groups_members(
+    p_org_id text,
+    p_group_ids uuid[]
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    IF p_group_ids IS NULL OR pg_catalog.array_length(p_group_ids, 1) IS NULL THEN
+        RETURN '[]'::jsonb;
+    END IF;
+
+    SELECT coalesce(
+        pg_catalog.jsonb_agg(
+            pg_catalog.jsonb_build_object(
+                'groupId', gm.group_id,
+                'userId', gm.user_id
+            )
+            ORDER BY gm.group_id ASC, gm.user_id ASC
+        ),
+        '[]'::jsonb
+    )
+    INTO v_result
+    FROM scaleos_directory.group_members gm
+    JOIN scaleos_directory.groups g ON g.org_id = gm.org_id AND g.group_id = gm.group_id
+    WHERE gm.org_id = p_org_id
+      AND gm.group_id = ANY(p_group_ids);
+
+    RETURN v_result;
+END;
+$$;
+
 -- Lists the newest group audit events up to the specified limit (1..200, default 50).
 CREATE OR REPLACE FUNCTION scaleos_directory.list_group_audit_events(
     p_org_id text,

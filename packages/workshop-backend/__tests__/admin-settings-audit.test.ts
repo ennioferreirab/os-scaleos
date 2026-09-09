@@ -19,18 +19,21 @@ describe("AdminSettings audit outbox", () => {
     let idempotencyKey = `set-signups:${suffix}`;
     let actorUserDoId = "admin-user-do";
     let originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn(async () => Response.json({
-      id: ADMIN_ID,
-      email: "admin@example.test",
-      email_confirmed_at: "2026-09-08T12:00:00.000Z",
-    })) as typeof fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/rest/v1/rpc/list_group_audit_events")) {
+        return Response.json([]);
+      }
+      return Response.json({
+        id: ADMIN_ID,
+        email: "admin@example.test",
+        email_confirmed_at: "2026-09-08T12:00:00.000Z",
+      });
+    }) as typeof fetch;
     try {
       await runInDurableObject(
           env.TEST_ORGANIZATION_DIRECTORY.getByName(""),
           directory => directory.authenticateHuman(ADMIN_ID, actorUserDoId, "admin@example.test"));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
     let admin = env.TEST_ADMIN_SETTINGS.getByName(`admin-settings-outbox:${suffix}`);
     await runInDurableObject(admin, async instance => {
       let instanceEnv = (instance as unknown as {env: Cloudflare.Env}).env;
@@ -71,5 +74,8 @@ describe("AdminSettings audit outbox", () => {
         },
       });
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
   });
 });
