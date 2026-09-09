@@ -1,4 +1,4 @@
-import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, Group, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminAuditEvent, AdminFormat, AdminFormatPatch, AdminMutationReceipt, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, AppPolicy, AppPolicyMode, Audience, BannerColor, BlueprintPublicInfo, DirectoryInviteResult, DirectoryUser, Group, PendingUserLifecycle, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -756,6 +756,21 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   async listDirectoryUsers(): Promise<DirectoryUser[]> {
     await this.#requireAdmin();
     return this.directory.listUsers(this.guard.subject);
+  }
+
+  async listAppPolicies(): Promise<AppPolicy[]> {
+    await this.#requireAdmin();
+    return this.directory.listAppPolicies(this.guard.subject);
+  }
+
+  async setAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+    mutationId: string;
+  }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}> {
+    await this.#requireAdmin();
+    return this.directory.setAppPolicy(this.guard.subject, input);
   }
 
   async listPendingUserLifecycle(): Promise<PendingUserLifecycle[]> {

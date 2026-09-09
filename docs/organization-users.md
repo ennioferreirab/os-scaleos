@@ -55,7 +55,9 @@ singleton name. Its organization ID is the backend-configured `ORG_ID`. It store
 - the deterministic Subject-to-User-DO binding;
 - invitation admission and first-acceptance timestamps;
 - narrowly scoped pending invitation and lifecycle records;
-- idempotency receipts and bounded administrative audit events.
+- idempotency receipts and bounded administrative audit events;
+- registered gatekeeper app policies keyed by canonical vendor ID; an absent record is disabled with
+  an empty audience.
 
 On empty storage, only `BOOTSTRAP_ADMIN_SUB` may bootstrap. The directory confirms that UUID exists
 in Supabase Auth and has a confirmed e-mail before atomically creating the organization, first
@@ -67,6 +69,29 @@ Object name is deterministic from `supabase:<sub>`; the first admitted login cre
 profile projection, never a password or alternate credential. Confirmed e-mail claims may refresh
 the contact address. The existing self-service display-name edit is preserved and is not
 overwritten by later logins.
+
+## Management app policy (T05-A)
+
+The directory's `appPolicies` collection is keyed by the exact vendor ID of a registered
+`GATEKEEPER_*` binding. `listAppPolicies()` includes every registered vendor and supplies an
+implicit `disabled` policy with an empty audience and the organization's `createdAt` as its
+deterministic `updatedAt` value when no row exists. `setAppPolicy()` accepts only those IDs,
+normalizes and deduplicates audience user/group IDs into sorted arrays, and validates that every
+referenced directory user and group exists. `enabled` is accepted only for vendors that declare
+`autoProvisionsAccount`; `disabled` and `optional` remain distinct policy modes.
+
+`resolveAppAccess(subject, vendorId)` rereads the current directory user, app policy, and T04
+audience membership. It returns the current mode and bounded additive sources; missing, pending,
+disabled, or unknown users and disabled or absent policies deny access, including for administrators.
+Policy changes use the directory's existing atomic mutation receipt, policy version, idempotency, and
+audit mechanisms. No audience IDs are copied into audit events.
+
+This first T05 increment applies the resolver only to `AuthenticatedApi.listGatekeeperApps()` and
+`getGatekeeperApp()`: central-auth sessions filter the app catalog and return the existing `null`
+denial for a direct URL before opening an app. Legacy-auth sessions retain their existing behavior.
+It does not alter provisioning, Connections, hooks, capability issuance, or add an administrative UI,
+preview endpoint, or test backdoor. T05 remains incomplete and this increment is not an acceptance
+claim for T05.
 
 ## Invitations, roles, and lifecycle
 

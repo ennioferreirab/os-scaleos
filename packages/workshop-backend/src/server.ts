@@ -696,17 +696,31 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
     // appear in the nav even before the user opens a gadget — in a single round trip.
     let accounts = await this.#user.listProvidedAccounts();
-    return accounts
-        .filter((account: (typeof accounts)[number]) => account.description.providesUi)
-        .map((account: (typeof accounts)[number]) => ({
-          id: account.vendorId,
-          title: account.description.providesUi!.title,
-          icon: account.description.providesUi!.icon,
-        }));
+    let apps: GatekeeperAppInfo[] = [];
+    for (let account of accounts) {
+      let providesUi = account.description.providesUi;
+      if (!providesUi) continue;
+      if (this.centralAuthMode) {
+        let access = await this.organizationDirectory.getByName("")
+            .resolveAppAccess(this.guard.subject, account.vendorId);
+        if (!access.allowed) continue;
+      }
+      apps.push({
+        id: account.vendorId,
+        title: providesUi.title,
+        icon: providesUi.icon,
+      });
+    }
+    return apps;
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
     await this.#requireActive();
+    if (this.centralAuthMode) {
+      let access = await this.organizationDirectory.getByName("")
+          .resolveAppAccess(this.guard.subject, id);
+      if (!access.allowed) return null;
+    }
     // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
     // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
     let user = this.#user;  // one stub for both calls

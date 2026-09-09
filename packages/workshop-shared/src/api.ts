@@ -872,7 +872,7 @@ export type AdminMutationReceipt = {
 /** A bounded, non-sensitive description of one field changed by an administrative mutation. */
 export type AdminAuditChange = {
   /** Stable field name from the administrative resource schema. */
-  field: "signupsEnabled" | "role" | "status" | "name" | "members";
+  field: "signupsEnabled" | "role" | "status" | "name" | "members" | "appPolicy";
   /** Bounded value before the mutation; never contains invitation secrets or user content. */
   before: boolean | string | null;
   /** Bounded value after the mutation; never contains invitation secrets or user content. */
@@ -894,13 +894,13 @@ export type AdminAuditEvent = {
   /** Optional executor principal for future product adapters; absent for local OS administration. */
   executorPrincipalId?: string;
   /** Stable kind of resource affected by the event. */
-  resourceType: "adminConfig" | "directoryUser" | "directoryGroup";
-  /** Backend-owned identifier of the affected OS installation. */
+  resourceType: "adminConfig" | "directoryUser" | "directoryGroup" | "directoryApp";
+  /** Canonical identifier of the affected configuration, user, group, or gatekeeper vendor. */
   resourceId: string;
   /** Stable administrative operation name. */
   action: "setSignupsEnabled" | "bootstrapAdmin" | "inviteUser" |
       "setUserRole" | "setUserStatus" | "createGroup" | "renameGroup" |
-      "replaceGroupMembers" | "deleteGroup";
+      "replaceGroupMembers" | "deleteGroup" | "setAppPolicy";
   /** Policy version before the mutation. */
   beforeVersion: number;
   /** Policy version after the mutation. */
@@ -912,7 +912,8 @@ export type AdminAuditEvent = {
       "DIRECTORY_USER_INVITED" | "DIRECTORY_USER_ROLE_CHANGED" |
       "DIRECTORY_USER_DISABLED" | "DIRECTORY_USER_REACTIVATED" |
       "DIRECTORY_GROUP_CREATED" | "DIRECTORY_GROUP_RENAMED" |
-      "DIRECTORY_GROUP_MEMBERS_CHANGED" | "DIRECTORY_GROUP_DELETED";
+      "DIRECTORY_GROUP_MEMBERS_CHANGED" | "DIRECTORY_GROUP_DELETED" |
+      "DIRECTORY_APP_POLICY_CHANGED";
   /** Backend-generated identifier for correlating this event with its mutation receipt. */
   correlationId: string;
   /** Caller-generated operation key used only for idempotent retry detection. */
@@ -991,6 +992,39 @@ export type Audience = {
   userIds: string[];
   /** Included server-generated directory group UUIDs. */
   groupIds: string[];
+};
+
+/** Availability modes for a registered gatekeeper management app. */
+export const APP_POLICY_MODES = ['disabled', 'optional', 'enabled'] as const;
+
+/** The deployment-wide availability mode of one registered gatekeeper management app. */
+export type AppPolicyMode = typeof APP_POLICY_MODES[number];
+
+/** Return whether an unknown value is one of the registered management-app policy modes. */
+export function isAppPolicyMode(value: unknown): value is AppPolicyMode {
+  return APP_POLICY_MODES.includes(value as AppPolicyMode);
+}
+
+/** Authoritative availability policy for one registered gatekeeper vendor. */
+export type AppPolicy = {
+  /** Canonical vendor id from the deployment's GATEKEEPER_* service binding. */
+  vendorId: string;
+  /** Whether the app is unavailable, user-selectable, or enabled for its audience. */
+  mode: AppPolicyMode;
+  /** Additive users and groups receiving access when the app is not disabled. */
+  audience: Audience;
+  /** Server time of the last administrative policy mutation; implicit defaults use organization creation time. */
+  updatedAt: string;
+};
+
+/** Result of resolving one subject's current access to a registered management app. */
+export type AppAccessResult = {
+  /** Whether the subject may use the app at this instant. */
+  allowed: boolean;
+  /** Current app mode, including "disabled" when no policy has been stored. */
+  mode: AppPolicyMode;
+  /** Stable additive audience sources that granted access, empty when access is denied. */
+  sources: string[];
 };
 
 /** Minimal directory projection exposed to authenticated audience pickers. */
@@ -1086,8 +1120,9 @@ export type AdminFormat = {
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). Every method rechecks the human
  * session guard and current active-admin status. Covers branding, agent instructions,
- * local administrative audit history, and which gatekeeper connectors/resources are offered — NOT
- * authentication config (that's env-var driven). Each setter throws on invalid input.
+ * local administrative audit history, registered app policies, and which gatekeeper
+ * connectors/resources are offered — NOT authentication config (that's env-var driven). Each setter
+ * throws on invalid input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
@@ -1108,6 +1143,23 @@ export interface AdminApi {
 
   /** List users in the configured single organization. */
   listDirectoryUsers(): Promise<DirectoryUser[]>;
+
+  /**
+   * List the registered gatekeeper app policies, including an implicit disabled policy for each
+   * vendor with no stored record.
+   */
+  listAppPolicies(): Promise<AppPolicy[]>;
+
+  /**
+   * Atomically set one registered gatekeeper app's availability mode and additive audience.
+   * Reusing `mutationId` with the same payload returns the original policy and receipt.
+   */
+  setAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+    mutationId: string;
+  }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}>;
 
   /** Invite or explicitly admit a central identity as a member. */
   inviteUser(input: {email: string; displayName: string; mutationId: string})

@@ -448,6 +448,14 @@ describe("OrganizationDirectoryDurableObject", () => {
         userIds: [MEMBER_ID],
         groupIds: [],
       })).toEqual({allowed: false, sources: []});
+
+      // The isolated workerd fixture has no GATEKEEPER_* service binding, so registered-vendor
+      // policy writes are left to the real runtime scenario rather than adding a test backdoor.
+      expect(directory.resolveAppAccess(ADMIN_ID, "unregistered-vendor")).toEqual({
+        allowed: false,
+        mode: "disabled",
+        sources: [],
+      });
     });
   });
 

@@ -53,6 +53,24 @@ the stable order `everyone`, `user:<subject>`, and sorted `group:<groupId>` entr
 are not traversed, so stale audience references do not grant access. This helper remains an internal
 capability for later resource owners; there is no public preview endpoint or test backdoor.
 
+## Registered app policies (T05-A)
+
+`AdminApi.listAppPolicies()` and `setAppPolicy()` use the active-admin guard and the same
+directory-owned receipt, monotonic policy version, idempotency, and atomic audit transaction as the
+other directory mutations. Each policy is keyed by an exact registered vendor ID. The mutation
+normalizes and validates its audience before committing; an absent row means `disabled` with no
+audience, and `enabled` is rejected for a vendor without `autoProvisionsAccount`.
+
+The audit event uses `resourceType="directoryApp"`, `action="setAppPolicy"`, and
+`reasonCode="DIRECTORY_APP_POLICY_CHANGED"`. Its `change.field` is `appPolicy`; `before` and `after`
+contain only a stable bounded summary of mode, the `everyone` bit, and user/group counts. Audience
+IDs are never written to the event, and replay with the same actor, operation, and mutation ID
+returns the original policy and receipt without a second event.
+
+The T05-A consumer is deliberately limited to the central-auth management-app catalog and direct
+app opening. It does not add policy UI, previews, hooks, provisioning changes, or another audit
+surface; T05 is not accepted by this increment.
+
 T04 is implemented but not accepted. Focused automated checks and review are supporting evidence
 only; the required real containerized positive and denial scenarios are still pending. No UI
 acceptance, session reset, or runtime restart is claimed here.
@@ -61,9 +79,9 @@ acceptance, session reset, or runtime restart is claimed here.
 
 Each event contains stable event, mutation-correlation, and idempotency identifiers; server time;
 tenant and actor ids; resource and action; before/after resource-policy versions; result and reason;
-and a bounded transition. T03 adds directory-local events for first-admin bootstrap, user
-invitation, role changes, and user deactivation/reactivation. The directory also records group
-creation, renames, complete membership replacements, and deletion as `directoryGroup` events.
+and a bounded transition. T03 adds directory-local events for first-admin bootstrap, user invitation,
+role changes, and lifecycle changes; T04 adds directory-group events, and T05-A adds app-policy
+events.
 Group membership audit changes record only before/after counts, never the member ID list. The
 `AdminSettings` version and directory authorization version are intentionally separate clocks owned
 by their respective transactional authorities; event versions are interpreted with the resource.

@@ -132,6 +132,7 @@ export default function AdminPage() {
       case 'renameGroup': return t('adminArea.audit.actions.renameGroup')
       case 'replaceGroupMembers': return t('adminArea.audit.actions.replaceGroupMembers')
       case 'deleteGroup': return t('adminArea.audit.actions.deleteGroup')
+      case 'setAppPolicy': return t('adminArea.audit.actions.setAppPolicy')
       case 'setSignupsEnabled': return t('adminArea.audit.actions.setSignupsEnabled')
     }
   }
