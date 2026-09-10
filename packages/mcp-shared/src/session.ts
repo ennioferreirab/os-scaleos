@@ -141,6 +141,11 @@ export class McpSessionBase extends RpcTarget {
     this.#queue = queue;
   }
 
+  /** Rechecks the live app and caller access before any host or retained-action read. */
+  async #assertAppAccess(): Promise<void> {
+    await this.#queue.assertAppAccess();
+  }
+
   [Symbol.dispose](): void {
     (this.#queue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
@@ -148,6 +153,8 @@ export class McpSessionBase extends RpcTarget {
   async listTools(
     options?: McpToolListOptions,
   ): Promise<McpToolInfo[] | McpToolSummary[]> {
+    await this.#assertAppAccess();
+
     if (options === undefined) {
       const tools = await this.#host.tools();
       await this.#queue.authorizeObservation({
@@ -209,6 +216,7 @@ export class McpSessionBase extends RpcTarget {
   }
 
   async callTool(name: string, args?: Record<string, unknown>): Promise<McpCallResult> {
+    await this.#assertAppAccess();
     requireToolName("callTool", name);
     const toolArgs = args ?? {};
     if (typeof toolArgs !== "object" || Array.isArray(toolArgs)) {
@@ -317,6 +325,7 @@ export class McpSessionBase extends RpcTarget {
   }
 
   async getActionResult(actionId: number): Promise<McpCallResult> {
+    await this.#assertAppAccess();
     if (!Number.isInteger(actionId)) throw new Error("getActionResult() requires an action id.");
     const host = this.#host;
     const stored = host.lookupAction(actionId);

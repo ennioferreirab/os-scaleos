@@ -18,6 +18,24 @@ management app at `/gatekeepers/scheduler`.
 The Scheduler app is intentionally read-only. Enabling and disabling remain in Connections; the app
 does not provide editing, pausing, deletion, run history, or a second hook toggle.
 
+
+## App availability
+
+In central-auth deployments, Scheduled Tasks follows the directory's registered `scheduler` app
+policy. `disabled` denies everyone, `optional` lets selected users opt in, and `enabled`
+auto-provisions an account only for selected users. An absent policy is disabled. Legacy-auth
+deployments keep the prior opt-in behavior.
+
+The Workshop, not Scheduler, owns this decision. The account management frame rechecks its retained
+`ContextAuthority` before each list operation. Workspace sessions, registration queues, and each hook
+attempt are gated again by the kernel using the persisted owner Subject, workspace, and hook ID.
+Neither iframe data nor a gatekeeper-supplied Subject conveys authority.
+
+Changing policy never calls account revocation or deletes schedules and hooks. Denied hooks remain
+visible in Connections and can be disabled or deleted locally. Re-enabling policy makes preserved
+state usable only for the current audience; it does not reinstate a removed audience grant or replay
+a missed occurrence.
+
 ## Agent API
 
 The ambient binding exposes `ScheduleSession`. The exact agent-facing contract and examples live in
@@ -90,9 +108,10 @@ code should use `runId` as an idempotency key. Authorization or callback failure
 total attempts with exponential delays beginning at one minute and capped at one hour. Exhausted
 schedules enter the **Needs attention** state.
 
-The Workshop admission check runs before every attempt. If the hook, gatekeeper, or account is no
-longer allowed, the occurrence is skipped without consuming a callback attempt. Recurring schedules
-advance to their next future occurrence; a due one-shot expires.
+The Workshop admission check runs before every attempt and the callback wrapper rechecks again on
+use. If the owner, app, workspace, hook, or target gadget is no longer allowed, the occurrence is
+skipped without consuming a callback attempt. Recurring schedules advance to their next future
+occurrence; a due one-shot expires.
 
 ## Cadence behavior
 
@@ -156,8 +175,8 @@ a user callback that never settles can delay other schedules in that account unt
 the alarm. Bounded batches limit ordinary load; they do not eliminate that tradeoff.
 
 The Scheduler is capability-authorized. It does not receive Workshop user identity, assert its own
-ambient policy, expose external network authority, or implement actions. The Workshop's existing hook
-admission and observation authorization remain the security boundaries.
+app policy, expose external network authority, or implement actions. Directory app policy,
+kernel-issued hook authority, and observation authorization remain the security boundaries.
 
 ## Limits
 

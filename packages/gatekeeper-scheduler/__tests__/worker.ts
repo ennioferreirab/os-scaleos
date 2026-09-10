@@ -7,6 +7,24 @@ export * from "../src/worker.js";
 // Vitest's ctx.exports analyzer does not follow the production barrel re-export.
 export { ScheduleAccount, ScheduleVerifier } from "../src/scheduler.js";
 
+let verifierAccessChecks = 0;
+
+export class TestVerifierAuthority extends WorkerEntrypoint<Cloudflare.Env> {
+  async requireAppAccess(): Promise<void> {
+    verifierAccessChecks++;
+  }
+}
+
+export class TestVerifierControl extends WorkerEntrypoint<Cloudflare.Env> {
+  async reset(): Promise<void> {
+    verifierAccessChecks = 0;
+  }
+
+  async getChecks(): Promise<number> {
+    return verifierAccessChecks;
+  }
+}
+
 type TestExports = {
   ScheduleDriver: DurableObjectNamespace<ScheduleDriver>;
   SchedulerScopeTestFacet: DurableObjectClass<SchedulerScopeTestFacet>;

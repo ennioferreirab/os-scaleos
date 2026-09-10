@@ -226,9 +226,15 @@ export async function revokeRefreshToken(
  */
 export class SupabaseApi {
   #getToken: () => Promise<string>;
+  #assertAppAccess?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, assertAppAccess?: () => Promise<void>) {
     this.#getToken = getToken;
+    this.#assertAppAccess = assertAppAccess;
+  }
+
+  withAppAccessGuard(assertAppAccess: () => Promise<void>): SupabaseApi {
+    return new SupabaseApi(this.#getToken, assertAppAccess);
   }
 
   async #request<T>(
@@ -251,6 +257,7 @@ export class SupabaseApi {
       }
     }
 
+    await this.#assertAppAccess?.();
     const headers = new Headers({
       Accept: options.acceptText ? "text/plain, application/json" : "application/json",
       "User-Agent": USER_AGENT,
@@ -262,6 +269,7 @@ export class SupabaseApi {
       headers.set("Content-Type", "application/json");
       body = JSON.stringify(options.body);
     }
+    await this.#assertAppAccess?.();
 
     const response = await fetch(url.toString(), {
       method,

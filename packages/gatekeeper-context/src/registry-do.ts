@@ -1,15 +1,14 @@
-// Per-domain registry of public collections. It serializes writes to the KV snapshot read by user
-// sessions when building their enabled collection set.
+// Per-domain registry of all Context collection summaries. This is a discovery/projection index,
+// never an authorization authority; every caller resolves the live role in Collection DO.
 
 import { DurableObject } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { ContextCollectionSummary } from "./context-types.js";
-import { publicCollectionsKvKey } from "./collection-kv.js";
 
 function makeRegistryStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
-      publicCollections: collection<ContextCollectionSummary>()({
+      collections: collection<ContextCollectionSummary>()({
         primaryKey: "id",
       }),
     },
@@ -25,35 +24,19 @@ export class LibraryRegistryDurableObject extends DurableObject<Cloudflare.Env> 
     this.storage = makeRegistryStorage(ctx.storage);
   }
 
-  async #writeSnapshot(domain: string): Promise<void> {
-    let collections = [...this.storage.publicCollections.list()];
-    await this.env.CONTEXT_COLLECTIONS.put(
-      publicCollectionsKvKey(domain), JSON.stringify(collections));
+  /** Return every known summary for this domain; callers must filter through Collection DO roles. */
+  listCollections(): ContextCollectionSummary[] {
+    return [...this.storage.collections.list()]
+        .toSorted((left, right) =>
+          left.title.localeCompare(right.title) || left.id.localeCompare(right.id));
   }
 
-  isPublic(collectionId: string): boolean {
-    return !!this.storage.publicCollections.get(collectionId);
+  /** Upsert a summary after the Collection DO has committed it. */
+  upsertCollection(summary: ContextCollectionSummary): void {
+    this.storage.collections.put({...summary, visibility: "private"});
   }
 
-  async addPublic(domain: string, summary: ContextCollectionSummary): Promise<void> {
-    this.storage.publicCollections.put(summary);
-    await this.#writeSnapshot(domain);
-  }
-
-  async removePublic(domain: string, collectionId: string): Promise<void> {
-    if (this.storage.publicCollections.get(collectionId)) {
-      this.storage.publicCollections.delete(collectionId);
-      await this.#writeSnapshot(domain);
-    }
-  }
-
-  /** Refresh a public collection summary; no-op if it is no longer public. */
-  async syncPublic(domain: string, summary: ContextCollectionSummary): Promise<void> {
-    let existing = this.storage.publicCollections.get(summary.id);
-    if (!existing) return;
-    if (existing.lastUpdated.valueOf() !== summary.lastUpdated.valueOf()) {
-      this.storage.publicCollections.put(summary);
-      await this.#writeSnapshot(domain);
-    }
+  removeCollection(collectionId: string): void {
+    this.storage.collections.delete(collectionId);
   }
 }

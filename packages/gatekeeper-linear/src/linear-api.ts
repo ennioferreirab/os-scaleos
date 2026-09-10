@@ -330,13 +330,24 @@ export type IssueUpdateInput = {
 
 export class LinearApi {
   #getToken: () => Promise<string>;
+  #beforeRequest?: () => Promise<void>;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, beforeRequest?: () => Promise<void>) {
     this.#getToken = getToken;
+    this.#beforeRequest = beforeRequest;
+  }
+
+  /**
+   * Rebind this client to the operation owner's capability. Children must not retain parent guards.
+   */
+  withBeforeRequest(beforeRequest: () => Promise<void>): LinearApi {
+    return new LinearApi(this.#getToken, beforeRequest);
   }
 
   async graphql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
+    await this.#beforeRequest?.();
     const token = await this.#getToken();
+    await this.#beforeRequest?.();
     const response = await fetch(GRAPHQL_ENDPOINT, {
       method: "POST",
       headers: {

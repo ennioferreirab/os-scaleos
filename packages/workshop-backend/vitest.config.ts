@@ -16,6 +16,14 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: '2026-02-02',
         compatibilityFlags: ['experimental', 'nodejs_compat'],
+        bindings: {
+          ORG_ID: '10000000-0000-4000-8000-000000000001',
+          BOOTSTRAP_ADMIN_SUB: '20000000-0000-4000-8000-000000000002',
+          AUTH_PUBLIC_URL: 'https://auth.example.test',
+          OS_PUBLIC_URL: 'https://os.example.test',
+          SUPABASE_SECRET_KEY: 'test-secret-key-not-a-real-credential',
+          DIRECTORY_SERVICE_TOKEN: 'test-directory-service-token',
+        },
         kvNamespaces: ['BLUEPRINTS'],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },

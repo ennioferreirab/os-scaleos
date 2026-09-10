@@ -165,6 +165,28 @@ describe("completeAgentCatalogSnapshot", () => {
       changed: true,
     });
   });
+  it("refreshes authority-sensitive catalogs and clears a now-empty ambient set", async () => {
+    let refreshed = await completeAgentCatalogSnapshot([
+      {gatekeeperId: 1, catalog: {entries: [{id: "old", title: "Old", description: "old"}]}},
+    ], [1], async () => ({
+      entries: [{id: "current", title: "Current", description: "current"}],
+    }), true);
+
+    expect(refreshed).toEqual({
+      snapshots: [{
+        gatekeeperId: 1,
+        catalog: {entries: [{id: "current", title: "Current", description: "current"}]},
+      }],
+      changed: true,
+    });
+
+    let denied = await completeAgentCatalogSnapshot(
+        refreshed.snapshots, [], async () => {
+          throw new Error("an empty ambient set must not load a catalog");
+        }, true);
+    expect(denied).toEqual({snapshots: [], changed: true});
+  });
+
 });
 
 

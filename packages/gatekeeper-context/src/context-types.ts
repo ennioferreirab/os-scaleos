@@ -2,6 +2,13 @@
 // getTypeScriptTypes().
 
 import type { RpcTarget } from "capnweb";
+import type {
+  Audience, ContextAuthority, DirectoryAudienceTargets,
+} from "@gadgets/workshop-shared/gatekeeper";
+
+// These are canonical gatekeeper contract values. Re-export them for Context consumers without
+// defining a second, subtly different audience shape.
+export type { Audience, ContextAuthority, DirectoryAudienceTargets };
 
 /** Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased). */
 export const VENDOR_ID = "context";
@@ -90,7 +97,7 @@ export function decodeDocId(docId: string): {collectionId: string; path: string}
 // Stored data model
 // ---------------------------------------------------------------------------
 
-/** Collection visibility within a sharing domain. */
+/** New collections are private; this field remains for storage compatibility with old rows. */
 export type ContextCollectionVisibility = "public" | "private";
 export const DEFAULT_GIT_BRANCH = "main";
 
@@ -101,7 +108,7 @@ export type ContextCollectionContent =
   | { source: "git"; remote: string; branch: string; lastRefreshedAt: Date; commit?: string };
 
 export type ContextCollectionMetadata = {
-  /** Random hex ID. */
+  /** Random hex/UUID ID. */
   id: string;
 
   /** Optional emoji icon. */
@@ -113,6 +120,7 @@ export type ContextCollectionMetadata = {
   /** Listed and used by agents to decide relevance. */
   description: string;
 
+  /** Kept as a private storage marker for old rows; it is not an authorization signal. */
   visibility: ContextCollectionVisibility;
 
   created: Date;
@@ -139,12 +147,13 @@ export type ContextGitTokenCreateResult = {
   remote: string;
 };
 
-/** Collection summary for listings. */
+/** Collection summary for the all-collection discovery registry. */
 export type ContextCollectionSummary = {
   id: string;
   title: string;
   description: string;
   icon?: string;
+  /** Always private for newly-created collections; never used to authorize access. */
   visibility: ContextCollectionVisibility;
   documentCount: number;
   lastUpdated: Date;
@@ -183,7 +192,7 @@ export type ContextDocumentSummary = {
   lastUpdated: Date;
 };
 
-/** A user's record of one of their own (private) collections. */
+/** A user's own-collection summary projection. */
 export type OwnedCollectionRecord = {
   id: string;
   title: string;
@@ -192,13 +201,62 @@ export type OwnedCollectionRecord = {
   lastUpdated: Date;
 };
 
-/** Collections an account's agents can use: own private plus all public. */
+export type ContextCollectionRole = "owner" | "editor" | "reader" | "none";
+export type ContextGrantRole = "reader" | "editor";
+export type ContextGrantTargetType = "everyone" | "user" | "group";
+
+/** A collection-local ACL grant. Groups are resolved live by ContextAuthority. */
+export type CollectionGrant = {
+  key: string;
+  targetType: ContextGrantTargetType;
+  targetId: string;
+  role: ContextGrantRole;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** Context-local idempotency receipt. It contains no document or credential data. */
+export type ContextMutationReceipt = {
+  /** Schema version for this local receipt shape. */
+  version: 1;
+  /** Monotonic collection-local ACL state version; stable on idempotent replay. */
+  accessVersion: number;
+  mutationId: string;
+  actorSubject: string;
+  action: "createCollection" | "setAccess" | "removeAccess";
+  collectionId: string;
+  targetType?: ContextGrantTargetType;
+  targetId?: string;
+  role?: ContextGrantRole;
+  confirmedAt: string;
+};
+
+/** Context-local ACL audit event. It contains metadata only, never document content. */
+export type ContextAccessEvent = {
+  /** Schema version for this local event shape. */
+  version: 1;
+  /** Collection-local ACL state version after this mutation. */
+  accessVersion: number;
+  eventId: string;
+  collectionId: string;
+  mutationId: string;
+  actorSubject: string;
+  targetType: ContextGrantTargetType;
+  targetId: string;
+  action: "setAccess" | "removeAccess";
+  role?: ContextGrantRole;
+  occurredAt: string;
+  receipt: ContextMutationReceipt;
+};
+
+/** Collections visible to this actor, with the winning role and its authoritative sources. */
 export type EnabledCollectionInfo = {
   id: string;
   title: string;
   description: string;
   icon?: string;
-  source: "private" | "public";
+  role: Exclude<ContextCollectionRole, "none">;
+  sources: string[];
   lastUpdated: Date;
 };
 
@@ -307,15 +365,19 @@ export function isMarkdownContentType(contentType: string): boolean {
 // Per-user management capability (ContextApi)
 // ---------------------------------------------------------------------------
 
-/** Per-account management API exposed to the gatekeeper app iframe. */
+/** Per-account management capability exposed to the gatekeeper app iframe. */
 export interface ContextApi extends RpcTarget {
-  /** Gates creating/editing public collections and offering Git-backed collections. */
+  /** Current actor status and whether Git-backed collections are configured. */
   getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }>;
 
-  createContextCollection(
-    title: string, description: string, visibility: ContextCollectionVisibility, icon?: string,
-    source?: ContextCollectionContent["source"],
-  ): Promise<ContextCollectionMetadata>;
+  /** Create a private collection, idempotently keyed by the actor and mutationId. */
+  createCollection(input: {
+    title: string;
+    description: string;
+    icon?: string;
+    source?: ContextCollectionContent["source"];
+    mutationId: string;
+  }): Promise<{collectionId: string; receipt: ContextMutationReceipt}>;
   updateContextCollection(collectionId: string, options: {
     title?: string; description?: string; icon?: string; branch?: string;
   }): Promise<void>;
@@ -333,8 +395,30 @@ export interface ContextApi extends RpcTarget {
   }): Promise<void>;
   deleteContextDocument(collectionId: string, path: string): Promise<void>;
   moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void>;
-  /** Own private collections plus every public one. */
+
+  /** Active users and groups from the authoritative directory; used by the Share picker. */
+  listAccessTargets(): Promise<DirectoryAudienceTargets>;
+  /** Complete ACL grants, available only to the collection owner. */
+  listAccess(collectionId: string): Promise<CollectionGrant[]>;
+  setAccess(input: {
+    collectionId: string;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    role: ContextGrantRole;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt>;
+  removeAccess(input: {
+    collectionId: string;
+    targetType: ContextGrantTargetType;
+    targetId: string;
+    mutationId: string;
+  }): Promise<ContextMutationReceipt>;
+  getMyAccess(collectionId: string): Promise<{
+    role: Exclude<ContextCollectionRole, "none">;
+    sources: string[];
+  }>;
+  listAccessEvents(collectionId: string, limit?: number): Promise<ContextAccessEvent[]>;
+
+  /** Own and explicitly-shared private collections; inaccessible rows are omitted. */
   listEnabledContextCollections(): Promise<EnabledCollectionInfo[]>;
-  /** Whether the viewer may edit this collection: own private collection, or public collection as admin. */
-  canWriteContextCollection(collectionId: string): Promise<boolean>;
 }

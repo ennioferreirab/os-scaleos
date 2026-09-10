@@ -1,6 +1,6 @@
 import type {RpcStub} from "cloudflare:workers";
 import type {
-  Gatekeeper, ObservationAuthorizer, SlashCommandResult,
+  Gatekeeper, GatekeeperRequestContext, ObservationAuthorizer, SlashCommandResult,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   SlashCommandChoice, SlashCommandRequest,
@@ -14,6 +14,8 @@ type SlashCommandSource = {
   gatekeeperId: number;
   providerLabel: string;
   gatekeeper: Fetcher<Gatekeeper<any>>;
+  requestContext?: GatekeeperRequestContext;
+  assertAccess?: () => Promise<void>;
 };
 
 /** Collect the complete slash-command catalog from the attached Gatekeepers that advertise one. */
@@ -21,9 +23,12 @@ export async function collectSlashCommands(
     sources: SlashCommandSource[]): Promise<SlashCommandChoice[]> {
   let catalogs = await Promise.all(sources.map(async source => {
     try {
+      await source.assertAccess?.();
       using provider = await (source.gatekeeper as SlashCommandGatekeeper)
-          .getSlashCommandProvider();
+          .getSlashCommandProvider(source.requestContext);
+      await source.assertAccess?.();
       let commands = await provider.list();
+      await source.assertAccess?.();
       return commands.map(command => ({
         selection: {gatekeeperId: source.gatekeeperId, commandId: command.id},
         name: command.name,
@@ -44,10 +49,16 @@ export async function collectSlashCommands(
     left.selection.commandId.localeCompare(right.selection.commandId));
 }
 
-/** Invoke one command on its selected attached Gatekeeper. */
 export async function invokeSlashCommand(
     gatekeeper: Fetcher<Gatekeeper<any>>, request: SlashCommandRequest,
-    authorizer: RpcStub<ObservationAuthorizer>): Promise<SlashCommandResult> {
-  using provider = await (gatekeeper as SlashCommandGatekeeper).getSlashCommandProvider();
-  return await provider.invoke(request.id.commandId, request.args, authorizer);
+    authorizer: RpcStub<ObservationAuthorizer>,
+    assertAccess?: () => Promise<void>,
+    requestContext?: GatekeeperRequestContext): Promise<SlashCommandResult> {
+  await assertAccess?.();
+  using provider = await (gatekeeper as SlashCommandGatekeeper)
+      .getSlashCommandProvider(requestContext);
+  await assertAccess?.();
+  let result = await provider.invoke(request.id.commandId, request.args, authorizer);
+  await assertAccess?.();
+  return result;
 }

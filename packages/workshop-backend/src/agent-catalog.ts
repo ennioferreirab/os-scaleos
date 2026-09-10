@@ -49,14 +49,17 @@ export function normalizeAgentCatalog(catalog: AgentCatalog): AgentCatalog {
 export async function completeAgentCatalogSnapshot(
     existing: AgentCatalogSnapshot[] | undefined,
     gatekeeperIds: number[],
-    loadCatalog: (gatekeeperId: number) => Promise<AgentCatalog | null>):
+    loadCatalog: (gatekeeperId: number) => Promise<AgentCatalog | null>,
+    refresh = false):
     Promise<{snapshots: AgentCatalogSnapshot[], changed: boolean}> {
   let activeIds = new Set(gatekeeperIds);
   let existingCount = existing?.length ?? 0;
-  let catalogs = new Map(
-      existing
-          ?.filter(entry => activeIds.has(entry.gatekeeperId))
-          .map(entry => [entry.gatekeeperId, entry.catalog]));
+  let catalogs = new Map<number, AgentCatalog | null>();
+  if (!refresh) {
+    for (let entry of existing ?? []) {
+      if (activeIds.has(entry.gatekeeperId)) catalogs.set(entry.gatekeeperId, entry.catalog);
+    }
+  }
   let removedStaleEntries = catalogs.size !== existingCount;
   let missing = gatekeeperIds.filter(gatekeeperId => !catalogs.has(gatekeeperId));
   await Promise.all(missing.map(async gatekeeperId => {

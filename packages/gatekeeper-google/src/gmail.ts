@@ -1399,8 +1399,11 @@ function publicLabels(ids: string[], labels: GmailLabelRaw[], resources: GmailLa
   return result;
 }
 
+type GmailAccessGate = () => Promise<void>;
+
 type GmailContext = {
   api: GmailApi;
+  getAccessToken(opts?: AccessTokenRequest, requireAppAccess?: GmailAccessGate): Promise<string>;
   approvalQueue: SharedApprovalQueue;
   store: GmailStore;
   selfEmail: string;
@@ -1419,6 +1422,10 @@ class SharedApprovalQueue {
     this.#stub = stub;
   }
 
+  dup(): SharedApprovalQueue {
+    return new SharedApprovalQueue(this.#stub.dup());
+  }
+
   retain(): () => void {
     this.#references++;
     let retained = true;
@@ -1433,9 +1440,22 @@ class SharedApprovalQueue {
     return this.#stub.authorizeObservation(description);
   }
 
+  assertAppAccess(): Promise<void> {
+    return this.#stub.assertAppAccess();
+  }
+
   submitAction(actionId: number, description: ActionDescription): Promise<void> {
     return this.#stub.submitAction(actionId, description);
   }
+}
+
+function duplicateGmailContext(ctx: GmailContext): GmailContext {
+  const approvalQueue = ctx.approvalQueue.dup();
+  const api = new GmailApi(ctx.selfEmail, async opts => {
+    await approvalQueue.assertAppAccess();
+    return ctx.getAccessToken(opts, () => approvalQueue.assertAppAccess());
+  });
+  return {...ctx, api, approvalQueue};
 }
 
 class GmailRpcTarget extends RpcTarget {
@@ -1454,20 +1474,34 @@ class GmailRpcTarget extends RpcTarget {
 @validateRpc()
 class RpcCursor<Entry> extends GmailRpcTarget implements Cursor<Entry> {
   #pager: Pager<Entry>;
+  #approvalQueue: SharedApprovalQueue;
 
   constructor(pager: Pager<Entry>, approvalQueue: SharedApprovalQueue) {
     super(approvalQueue);
     this.#pager = pager;
+    this.#approvalQueue = approvalQueue;
+  }
+
+  [Symbol.dispose](): void {
+    try {
+      (this.#pager as Pager<Entry> & {[Symbol.dispose]?: () => void})[Symbol.dispose]?.();
+    } finally {
+      super[Symbol.dispose]();
+    }
   }
 
   @skipRpcValidation()
-  next(): Promise<Entry[] | null> { return this.#pager.next(); }
+  async next(): Promise<Entry[] | null> {
+    await this.#approvalQueue.assertAppAccess();
+    return this.#pager.next();
+  }
 }
 
 async function submitAction(
     ctx: GmailContext, action: GmailAction,
     description: {title: string; description: string; awaitDecision?: boolean},
     onFailure?: () => void): Promise<number> {
+  await ctx.approvalQueue.assertAppAccess();
   if (ctx.store.listActions().length >= 100) {
     throw new Error("Too many pending Gmail actions. Resolve existing actions before adding more.");
   }
@@ -1494,7 +1528,9 @@ async function submitAction(
 type GmailLabelSnapshot = {labels: GmailLabelRaw[]; resources: GmailLabelResource[]};
 
 async function currentLabels(ctx: GmailContext): Promise<GmailLabelSnapshot> {
+  await ctx.approvalQueue.assertAppAccess();
   const provider = await ctx.providerLabels();
+  await ctx.approvalQueue.assertAppAccess();
   const resources = ctx.store.listLabels();
   return {
     labels: overlayGmailLabels(provider, resources, labelPending(ctx.store), ctx.store.decisions()),
@@ -1592,23 +1628,29 @@ async function mapMatchingApplyingDraftCreate(
 
 async function ensureProviderDraft(
     ctx: GmailContext, draft: GmailDraftRef): Promise<GmailDraftResource> {
+  await ctx.approvalQueue.assertAppAccess();
   let mapped = ctx.store.draftForProvider(draft.id);
   if (applyingDraftCreates(ctx.store).length > 0) {
     let provider: GmailDraftRaw | undefined;
     let rfcMessageId: string | undefined;
     if (draft.message?.id) {
+      await ctx.approvalQueue.assertAppAccess();
       const metadata = await ctx.api.getMessageMetadata(draft.message.id);
       rfcMessageId = metadata.payload?.headers?.find(
         header => header.name.toLowerCase() === "message-id")?.value.trim();
     } else {
+      await ctx.approvalQueue.assertAppAccess();
       provider = await ctx.api.getDraft(draft.id);
       rfcMessageId = (await parseSafeGmailDraft(provider.message)).messageId;
     }
+    await ctx.approvalQueue.assertAppAccess();
     if (applyingDraftCreateForMessageId(ctx.store, rfcMessageId)) {
+      await ctx.approvalQueue.assertAppAccess();
       provider ??= await ctx.api.getDraft(draft.id);
       const reconciled = await mapMatchingApplyingDraftCreate(ctx.api, ctx.store, provider);
       if (reconciled) return reconciled;
     }
+    await ctx.approvalQueue.assertAppAccess();
     mapped = ctx.store.draftForProvider(draft.id);
   }
   if (mapped) return mapped;
@@ -1631,15 +1673,18 @@ async function loadDraftBase(
   if (resource.status === "sent") throw new Error("This Gmail draft has already been sent.");
   if (!resource.providerId) return undefined;
   if (captureAttachments) {
+    await ctx.approvalQueue.assertAppAccess();
     const snapshot = await ctx.api.getDraftFull(resource.providerId);
     if ((snapshot.message.sizeEstimate ?? 0) > MAX_GMAIL_DRAFT_MIME_BYTES) {
       throw new Error(
         `This Gmail draft exceeds the ${MAX_GMAIL_DRAFT_MIME_BYTES}-byte safe modification limit.`);
     }
+    await ctx.approvalQueue.assertAppAccess();
     const provider = await ctx.api.getDraft(resource.providerId);
     const parsed = await parseSafeGmailDraft(provider.message);
     return parsedDraftToState(resource.logicalId, resource, provider, parsed, ctx.selfEmail);
   }
+  await ctx.approvalQueue.assertAppAccess();
   const provider = await ctx.api.getDraftFull(resource.providerId);
   return parsedDraftSnapshotToState(
     resource.logicalId, resource, provider, await ctx.api.parseDraftSnapshot(provider.message),
@@ -1651,6 +1696,7 @@ async function loadSimulatedDraft(
   state: GmailDraftState;
   resource: GmailDraftResource;
 }> {
+  await ctx.approvalQueue.assertAppAccess();
   const canonicalId = ctx.store.resolveDraftId(logicalId);
   const resource = ctx.store.getDraft(canonicalId);
   if (!resource) throw new Error("Unknown Gmail draft capability.");
@@ -1661,6 +1707,7 @@ async function loadSimulatedDraft(
     base = await loadDraftBase(ctx, resource, captureAttachments);
   } catch (error) {
     if (!(error instanceof GmailApiError && error.status === 404 && providerId)) throw error;
+    await ctx.approvalQueue.assertAppAccess();
     const current = ctx.store.getDraft(canonicalId);
     if (!current || current.logicalId !== canonicalId || current.providerId !== providerId ||
         current.version !== version || current.status !== "active") {
@@ -1676,6 +1723,7 @@ async function loadSimulatedDraft(
     ctx.store.clearDraftForwardSnapshot(canonicalId);
     throw new Error("This Gmail draft has been deleted.", {cause: error});
   }
+  await ctx.approvalQueue.assertAppAccess();
   const resolvedAfterRead = ctx.store.resolveDraftId(logicalId);
   const current = ctx.store.getDraft(resolvedAfterRead);
   if (resolvedAfterRead !== canonicalId || !current || current.logicalId !== canonicalId ||
@@ -1699,6 +1747,7 @@ async function walkRestrictedMessages(
   let pages = 0;
   let pageToken: string | undefined;
   do {
+    await ctx.approvalQueue.assertAppAccess();
     const result = await ctx.api.listMessages(
       GMAIL_RESTRICTED_THREAD_PROVIDER_PAGE_SIZE, ctx.searchQuery, pageToken, labelIds);
     if (visit(result.messages)) return;
@@ -1763,6 +1812,7 @@ async function restrictedThreadScope(
   if (!restrictedMessageIds.length && !sentMessageIds.length) {
     throw new Error("This Gmail thread is not available through this restricted binding.");
   }
+  await ctx.approvalQueue.assertAppAccess();
   const thread = await ctx.api.getThread(threadId);
   if (thread.id !== threadId) throw new Error("Gmail thread identity changed unexpectedly.");
   if (thread.messages.length > MAX_GMAIL_RESTRICTED_THREAD_MESSAGES) {
@@ -1772,6 +1822,7 @@ async function restrictedThreadScope(
   }
   const messageIds = [...new Set(thread.messages.map(message => message.id))];
   const admitted = messageIds.filter(messageId => restrictedMessageIds.includes(messageId));
+  await ctx.approvalQueue.assertAppAccess();
   for (const messageId of sentMessageIds) {
     if (messageIds.includes(messageId) && ctx.store.isSentMessage(messageId) &&
         !admitted.includes(messageId)) {
@@ -1782,6 +1833,7 @@ async function restrictedThreadScope(
     throw new Error("This Gmail thread is not available through this restricted binding.");
   }
   for (let i = 0; i < admitted.length; i += 5) {
+    await ctx.approvalQueue.assertAppAccess();
     await Promise.all(admitted.slice(i, i + 5).map(async messageId => {
       const metadata = await ctx.api.getMessageMetadata(messageId);
       if (metadata.threadId !== threadId) {
@@ -1824,6 +1876,7 @@ type OwnedGmailAttachmentEntry = Omit<GmailAttachmentEntry, "attachment"> & {
 function gmailMessageCursor(
     ctx: GmailContext, query: string | undefined, labelIds: string[] | undefined,
     capabilityScope: GmailCapabilityScope): Cursor<GmailMessageEntry> {
+  ctx = duplicateGmailContext(ctx);
   return new RpcCursor(new CursorPager<{
     id: string;
     threadId: string;
@@ -1831,6 +1884,7 @@ function gmailMessageCursor(
     }, OwnedGmailMessageEntry>({
     provider: "Gmail",
     async fetchPage(pageToken) {
+      await ctx.approvalQueue.assertAppAccess();
       const page = await ctx.api.listMessages(20, query, pageToken, labelIds);
       return {items: page.messages, nextPageToken: page.nextPageToken};
     },
@@ -1840,6 +1894,7 @@ function gmailMessageCursor(
         if (messages.length === 0) return entries;
         const labels = await currentLabels(ctx);
         for (let i = 0; i < messages.length; i += 5) {
+          await ctx.approvalQueue.assertAppAccess();
           const enriched = await Promise.all(messages.slice(i, i + 5).map(async ref => {
             const metadata = await ctx.api.getMessageMetadata(ref.id);
             const info = await messageInfo(ctx, parseGmailMessageMetadata(metadata), labels);
@@ -1873,9 +1928,11 @@ function gmailMessageCursor(
 
 function gmailFullThreadCursor(
     ctx: GmailContext, query: string | undefined, labelIds: string[] | undefined): Cursor<GmailThreadEntry> {
+  ctx = duplicateGmailContext(ctx);
   return new RpcCursor(new CursorPager<{id: string; snippet?: string}, OwnedGmailThreadEntry>({
     provider: "Gmail",
     async fetchPage(pageToken) {
+      await ctx.approvalQueue.assertAppAccess();
       const page = await ctx.api.listThreads(20, query, pageToken, labelIds);
       return {items: page.threads, nextPageToken: page.nextPageToken};
     },
@@ -1886,6 +1943,7 @@ function gmailFullThreadCursor(
         const labels = await currentLabels(ctx);
         for (let i = 0; i < threads.length; i += 5) {
           const enriched = await Promise.all(threads.slice(i, i + 5).map(async thread => {
+            await ctx.approvalQueue.assertAppAccess();
             const metadata = await threadInfo(
               ctx, await ctx.api.getThreadInfo(thread.id), labels);
             return {
@@ -1928,6 +1986,7 @@ async function collectRestrictedThreadGroups(
   let pageToken: string | undefined;
   do {
     pages++;
+    await ctx.approvalQueue.assertAppAccess();
     const page = await ctx.api.listMessages(
       GMAIL_RESTRICTED_THREAD_PROVIDER_PAGE_SIZE, query, pageToken, labelIds);
     const total = messages.length + page.messages.length;
@@ -1954,6 +2013,7 @@ async function collectRestrictedThreadGroups(
 
 function gmailRestrictedThreadCursor(
     ctx: GmailContext, query: string | undefined, labelIds: string[] | undefined): Cursor<GmailThreadEntry> {
+  ctx = duplicateGmailContext(ctx);
   let pendingGroups: Promise<Array<{threadId: string; messages: GmailMessageRef[]}>> | undefined;
   const getGroups = async () => {
     if (!pendingGroups) pendingGroups = collectRestrictedThreadGroups(ctx, query, labelIds);
@@ -1971,6 +2031,7 @@ function gmailRestrictedThreadCursor(
   }, OwnedGmailThreadEntry>({
     provider: "Gmail",
     async fetchPage(pageToken) {
+      await ctx.approvalQueue.assertAppAccess();
       const groups = await getGroups();
       const offset = pageToken === undefined ? 0 : Number(pageToken);
       if (!Number.isSafeInteger(offset) || offset < 0 || offset > groups.length) {
@@ -1991,6 +2052,7 @@ function gmailRestrictedThreadCursor(
         for (const group of groups) {
           const metadata: Array<{ref: typeof group.messages[number]; info: GmailMessageInfoRaw}> = [];
           for (let i = 0; i < group.messages.length; i += 5) {
+            await ctx.approvalQueue.assertAppAccess();
             metadata.push(...await Promise.all(group.messages.slice(i, i + 5).map(async ref => ({
               ref,
               info: parseGmailMessageMetadata(await ctx.api.getMessageMetadata(ref.id)),
@@ -2031,10 +2093,12 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async #authorizeCursor(title: string, description: string): Promise<void> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     await this.#ctx.approvalQueue.authorizeObservation({title, description});
   }
 
   async getMailboxAddress(): Promise<EmailAddress> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail mailbox address",
       description: "Read the email address of the connected Gmail mailbox.",
@@ -2086,6 +2150,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async getMessage(id: string): Promise<GmailMessage> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let providerId = id;
     let sentThroughBinding = false;
     if (GMAIL_PROVIDER_ID_RE.test(providerId)) {
@@ -2110,6 +2175,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
     if (!sentThroughBinding && !await messageStillAvailable(this.#ctx, providerId)) {
       throw new Error("This Gmail message is not available through this restricted binding.");
     }
+    await this.#ctx.approvalQueue.assertAppAccess();
     let metadata: GmailMessageFull;
     try {
       metadata = await this.#ctx.api.getMessageMetadata(providerId);
@@ -2131,6 +2197,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async getThread(id: string): Promise<GmailThread> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (!GMAIL_PROVIDER_ID_RE.test(id)) throw new Error("Invalid Gmail thread ID.");
     if (!this.#ctx.restricted) {
       const info = await threadInfo(this.#ctx, await this.#ctx.api.getThreadInfo(id));
@@ -2163,6 +2230,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
 
   async send(
       to: string[], subject: string, body: string, options: GmailComposeOptions = {}): Promise<string> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error(
         "send() is unavailable on a search- or label-scoped binding. Use a message capability.");
@@ -2188,6 +2256,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async getDraft(id: string): Promise<GmailDraft> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (!GMAIL_LOGICAL_ID_RE.test(id)) throw new Error("Invalid Gmail draft ID.");
     const resource = this.#ctx.store.getDraft(id);
     if (!resource) throw new Error("Unknown Gmail draft ID for this binding.");
@@ -2204,6 +2273,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async createDraft(input: GmailDraftInput): Promise<GmailDraft> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error("createDraft() is only available on a whole-mailbox Gmail binding.");
     }
@@ -2240,6 +2310,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async listLabels(): Promise<GmailLabel[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error("listLabels() is only available on a whole-mailbox Gmail binding.");
     }
@@ -2255,6 +2326,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async createLabel(name: string): Promise<GmailCustomLabel> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error("createLabel() is only available on a whole-mailbox Gmail binding.");
     }
@@ -2277,6 +2349,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async renameLabel(label: GmailCustomLabel, name: string): Promise<GmailCustomLabel> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error("renameLabel() is only available on a whole-mailbox Gmail binding.");
     }
@@ -2286,6 +2359,7 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
     do {
       generation = this.#ctx.store.actionGeneration();
       canonical = await resolveMutableLabel(this.#ctx, label);
+      await this.#ctx.approvalQueue.assertAppAccess();
     } while (generation !== this.#ctx.store.actionGeneration());
     if (canonical.type !== "custom") throw new Error("System Gmail labels cannot be renamed.");
     const resource = ensureLabelResource(this.#ctx, canonical);
@@ -2302,11 +2376,13 @@ class GmailSessionImpl extends GmailRpcTarget implements GmailSession {
   }
 
   async deleteLabel(label: GmailCustomLabel): Promise<void> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#ctx.restricted) {
       throw new Error("deleteLabel() is only available on a whole-mailbox Gmail binding.");
     }
     const canonical = await resolveMutableLabel(this.#ctx, label);
     if (canonical.type !== "custom") throw new Error("System Gmail labels cannot be deleted.");
+    await this.#ctx.approvalQueue.assertAppAccess();
     const resource = ensureLabelResource(this.#ctx, canonical);
     const pendingUses = this.#ctx.store.listActions().filter(item =>
       item.action.type === "messageMutation" && item.action.labelId === resource.logicalId);
@@ -2357,6 +2433,7 @@ class GmailScopedSessionImpl extends GmailRpcTarget implements GmailScopedSessio
 
 async function resolveMutableLabel(
     ctx: GmailContext, candidate: unknown): Promise<CanonicalMutableLabel> {
+  await ctx.approvalQueue.assertAppAccess();
   if (ctx.restricted) {
     const id = candidate && typeof candidate === "object"
       ? (candidate as Record<string, unknown>).id
@@ -2369,7 +2446,9 @@ async function resolveMutableLabel(
     title: "Resolve Gmail label",
     description: "Resolve the supplied label ID against this connected Gmail account.",
   });
+  await ctx.approvalQueue.assertAppAccess();
   const provider = await ctx.providerLabels();
+  await ctx.approvalQueue.assertAppAccess();
   const resources = ctx.store.listLabels();
   const canonical = canonicalizeGmailMutableLabel(candidate, provider, resources);
   if (ctx.restricted && !ctx.store.isLabelAdmitted(canonical.id)) {
@@ -2480,6 +2559,7 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
   }
 
   async #loadInfo(): Promise<GmailThreadInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#cachedInfo) {
       const info = this.#cachedInfo;
       this.#cachedInfo = undefined;
@@ -2492,6 +2572,7 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
     if (!admitted.length) throw new Error("This restricted Gmail thread admits no messages.");
     const metadata: GmailMessageFull[] = [];
     for (let i = 0; i < admitted.length; i += 5) {
+      await this.#ctx.approvalQueue.assertAppAccess();
       metadata.push(...await Promise.all(
         admitted.slice(i, i + 5).map(id => this.#ctx.api.getMessageMetadata(id))));
     }
@@ -2501,12 +2582,14 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
   }
 
   async #messageIds(): Promise<string[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     if (this.#scope.kind === "restricted") return [...this.#scope.admittedMessageIds];
     const thread = await this.#ctx.api.getThread(this.#threadId);
     return gmailMessagesAllowedByScope(this.#scope, thread.messages).map(message => message.id);
   }
 
   async getMetadata(): Promise<GmailThreadInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const info = await this.#loadInfo();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: sanitizeApprovalTitle(`Gmail thread: ${info.subject}`),
@@ -2517,6 +2600,7 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
   }
 
   async messages(): Promise<GmailMessage[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const ids = await this.#messageIds();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: `Read ${ids.length} Gmail thread messages`,
@@ -2526,6 +2610,7 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
   }
 
   async messagesVisibleTo(address: string): Promise<GmailMessage[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     validateGmailAddress(address);
     const [normalized] = normalizeEmailRecipients([address]);
     const ids = await this.#messageIds();
@@ -2538,6 +2623,7 @@ class GmailThreadStub extends GmailRpcTarget implements GmailThread {
     const visible: string[] = [];
     for (let i = 0; i < ids.length; i += 5) {
       const batch = ids.slice(i, i + 5);
+      await this.#ctx.approvalQueue.assertAppAccess();
       const participants = await Promise.all(
         batch.map(id => this.#ctx.api.getMessageParticipants(id)));
       for (let j = 0; j < batch.length; j++) {
@@ -2626,6 +2712,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async #raw(): Promise<GmailMessageRaw> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     this.#cachedRaw ??= await this.#ctx.api.getMessage(this.#messageId);
     if (this.#cachedRaw.threadId !== this.#threadId) {
       throw new Error("Gmail message thread identity changed unexpectedly.");
@@ -2634,6 +2721,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async #forwardSource(): Promise<GmailMessageRaw> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const metadata = await this.#ctx.api.getMessageMetadata(this.#messageId);
     if ((metadata.sizeEstimate ?? 0) > MAX_GMAIL_FORWARD_SOURCE_BYTES) {
       throw new Error(
@@ -2643,6 +2731,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async #info(): Promise<GmailMessageInfoRaw> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const metadata = await this.#ctx.api.getMessageMetadata(this.#messageId);
     if (metadata.threadId !== this.#threadId) {
       throw new Error("Gmail message thread identity changed unexpectedly.");
@@ -2652,6 +2741,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async getMetadata(): Promise<GmailMessageInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const info = await messageInfo(this.#ctx, await this.#info());
     await this.#ctx.approvalQueue.authorizeObservation({
       title: sanitizeApprovalTitle(`Gmail message: ${info.subject}`),
@@ -2662,6 +2752,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async getHeaders(): Promise<GmailHeader[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let headers: GmailHeader[];
     if (this.#cachedRaw) {
       headers = await this.#ctx.api.parseMessageHeaders(this.#cachedRaw);
@@ -2678,6 +2769,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async thread(): Promise<GmailThread> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const scope = this.#scope.kind === "mailbox"
       ? this.#scope
       : await restrictedThreadScope(
@@ -2693,6 +2785,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async getContent(): Promise<EmailContent> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let rawInfo: GmailMessageInfoRaw;
     let content: EmailContent;
     if (this.#cachedRaw) {
@@ -2714,6 +2807,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   }
 
   async attachments(): Promise<GmailAttachmentEntry[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const full = await this.#ctx.api.getMessageFull(this.#messageId);
     if (full.threadId !== this.#threadId) throw new Error("Gmail message identity changed.");
     const snapshots = enumerateGmailAttachments(this.#messageId, full.payload);
@@ -2731,6 +2825,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   async #reply(body: string, replyAll: boolean, options: GmailReplyOptions = {}): Promise<string> {
     validateGmailBody(body);
     if (options.html !== undefined) validateGmailBody(options.html);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const source = await this.#ctx.api.getMessageMetadata(this.#messageId);
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail source message to prepare reply",
@@ -2799,6 +2894,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
   async #createReplyDraft(
       body: string, replyAll: boolean, options: GmailReplyOptions = {}): Promise<GmailDraft> {
     validateGmailBody(body);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const source = await this.#ctx.api.getMessageMetadata(this.#messageId);
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail source message to prepare reply draft",
@@ -2820,6 +2916,7 @@ class GmailMessageStub extends GmailRpcTarget implements GmailMessage {
 
   async createForwardDraft(
       to: string[], body?: string, options: GmailComposeOptions = {}): Promise<GmailDraft> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const source = await this.#forwardSource();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail source message to prepare forward draft",
@@ -2879,6 +2976,7 @@ class GmailAttachmentStub extends GmailRpcTarget implements GmailAttachment {
   }
 
   async getMetadata(): Promise<GmailAttachmentInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     this.#validate?.();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail attachment metadata",
@@ -2889,11 +2987,13 @@ class GmailAttachmentStub extends GmailRpcTarget implements GmailAttachment {
   }
 
   async getContent(): Promise<ArrayBuffer> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     this.#validate?.();
     if (!this.#info.readable || this.#info.size > MAX_GMAIL_ATTACHMENT_BYTES) {
       throw new Error(
         `Attachment is unavailable or exceeds the ${MAX_GMAIL_ATTACHMENT_BYTES}-byte safe limit.`);
     }
+    await this.#ctx.approvalQueue.assertAppAccess();
     const content = await this.#read();
     this.#validate?.();
     if (content.byteLength !== this.#info.size || content.byteLength > MAX_GMAIL_ATTACHMENT_BYTES) {
@@ -3034,11 +3134,13 @@ async function createDraftFromMessage(
 type DraftCursorRef = {logicalId: string; providerId?: string};
 
 function gmailDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
+  ctx = duplicateGmailContext(ctx);
   if (ctx.restricted) return restrictedDraftCursor(ctx);
   const emittedLogicalIds = new Set<string>();
   return new RpcCursor(new CursorPager<DraftCursorRef, OwnedGmailDraftEntry>({
     provider: "Gmail",
     async fetchPage(pageToken) {
+      await ctx.approvalQueue.assertAppAccess();
       const page = await ctx.api.listDrafts(20, pageToken);
       const items: DraftCursorRef[] = [];
       for (const draft of page.drafts) {
@@ -3048,6 +3150,7 @@ function gmailDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
         items.push({logicalId: resource.logicalId, providerId: draft.id});
       }
       if (!pageToken) {
+        await ctx.approvalQueue.assertAppAccess();
         for (const resource of ctx.store.listDrafts()) {
           if (!resource.providerId && resource.status === "active" &&
               !emittedLogicalIds.has(resource.logicalId) &&
@@ -3092,11 +3195,13 @@ function gmailDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
 }
 
 function restrictedDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
-  const resources = ctx.store.listDrafts().filter(resource => resource.source &&
-    resource.status === "active");
+  let resources: GmailDraftResource[] | undefined;
   return new RpcCursor(new CursorPager<GmailDraftResource, OwnedGmailDraftEntry>({
     provider: "Gmail",
     async fetchPage(pageToken) {
+      await ctx.approvalQueue.assertAppAccess();
+      resources ??= ctx.store.listDrafts().filter(resource => resource.source &&
+        resource.status === "active");
       const offset = pageToken ? Number(pageToken) : 0;
       const items = resources.slice(offset, offset + 20);
       const next = offset + items.length;
@@ -3151,6 +3256,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async getMetadata(): Promise<GmailDraftInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const {state} = await loadSimulatedDraft(this.#ctx, this.#logicalId);
     const info = draftInfo(state);
     await this.#ctx.approvalQueue.authorizeObservation({
@@ -3161,7 +3267,9 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async getContent(): Promise<EmailContent> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const {state} = await loadSimulatedDraft(this.#ctx, this.#logicalId);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const sourceSnapshot = state.source?.kind === "forward" && state.source.format === "inline"
       ? pendingForwardSnapshot(this.#ctx.store, state.logicalId)
       : undefined;
@@ -3180,6 +3288,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async attachments(): Promise<GmailAttachmentEntry[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const logicalId = this.#ctx.store.resolveDraftId(this.#logicalId);
     const resource = this.#ctx.store.getDraft(logicalId);
     if (!resource || resource.status !== "active") {
@@ -3207,6 +3316,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
 
     let entries: OwnedGmailAttachmentEntry[];
     if (resource.providerId) {
+      await this.#ctx.approvalQueue.assertAppAccess();
       const full = await this.#ctx.api.getDraftFull(resource.providerId);
       const snapshots = enumerateGmailAttachments(full.message.id, full.message.payload);
       entries = snapshots.map(snapshot => ({
@@ -3225,6 +3335,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
         validateVersion();
         return entries;
       }
+      await this.#ctx.approvalQueue.assertAppAccess();
       const sourceSnapshot = pendingForwardSnapshot(this.#ctx.store, logicalId);
       if (!sourceSnapshot) {
         throw new Error(
@@ -3256,6 +3367,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
         title: `List ${entries.length} Gmail draft attachments`,
         description: "Read attachment metadata from this exact simulated draft revision.",
       });
+      await this.#ctx.approvalQueue.assertAppAccess();
       validateVersion();
       return entries;
     } catch (error) {
@@ -3265,6 +3377,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async update(patch: GmailDraftPatch): Promise<void> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     validateDraftPatch(patch);
     const loaded = await loadSimulatedDraft(this.#ctx, this.#logicalId, true);
     const {state, resource} = loaded;
@@ -3287,11 +3400,14 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
         ? {rfcMessageId: newGmailMessageId()} : {}),
     };
     validateDraftState(after);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const sourceSnapshot = state.source?.kind === "forward" && state.source.format === "inline"
       ? pendingForwardSnapshot(this.#ctx.store, logicalId)
       : undefined;
+    await this.#ctx.approvalQueue.assertAppAccess();
     const expectedBefore = await draftOutputFingerprint(
       this.#ctx.api, this.#ctx.store, state, sourceSnapshot);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const descriptionMessage = sourceSnapshot
       ? await inlineForwardMessage(this.#ctx.api, this.#ctx.store, after, sourceSnapshot)
       : undefined;
@@ -3300,6 +3416,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
       title: "Read Gmail draft before update",
       description: "Read the exact simulated draft revision used as the update base.",
     });
+    await this.#ctx.approvalQueue.assertAppAccess();
     const resolved = this.#ctx.store.resolveDraftId(logicalId);
     const current = this.#ctx.store.getDraft(logicalId);
     if (resolved !== logicalId || !current || current.logicalId !== logicalId ||
@@ -3328,18 +3445,22 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async delete(): Promise<void> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const {state, resource} = await loadSimulatedDraft(this.#ctx, this.#logicalId, true);
     const logicalId = resource.logicalId;
     const version = resource.version;
+    await this.#ctx.approvalQueue.assertAppAccess();
     const sourceSnapshot = state.source?.kind === "forward" && state.source.format === "inline"
       ? pendingForwardSnapshot(this.#ctx.store, logicalId)
       : undefined;
+    await this.#ctx.approvalQueue.assertAppAccess();
     const expectedSnapshot = await draftOutputFingerprint(
       this.#ctx.api, this.#ctx.store, state, sourceSnapshot);
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read Gmail draft before deletion",
       description: "Read the exact simulated draft revision being deleted.",
     });
+    await this.#ctx.approvalQueue.assertAppAccess();
     const resolved = this.#ctx.store.resolveDraftId(logicalId);
     const current = this.#ctx.store.getDraft(logicalId);
     if (resolved !== logicalId || !current || current.logicalId !== logicalId ||
@@ -3367,6 +3488,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
   }
 
   async send(): Promise<string> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     const {state, resource} = await loadSimulatedDraft(this.#ctx, this.#logicalId, true);
     const logicalId = resource.logicalId;
     const version = resource.version;
@@ -3379,15 +3501,18 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
       throw new Error("A Gmail draft must contain a plain-text body before it can be sent.");
     }
     validateDraftState(state);
+    await this.#ctx.approvalQueue.assertAppAccess();
     const sourceSnapshot = state.source?.kind === "forward" && state.source.format === "inline"
       ? pendingForwardSnapshot(this.#ctx.store, logicalId)
       : undefined;
+    await this.#ctx.approvalQueue.assertAppAccess();
     const expectedSnapshot = await draftOutputFingerprint(
       this.#ctx.api, this.#ctx.store, state, sourceSnapshot);
     // A send action always owns a fresh identity. Imported drafts can reuse a Message-ID from an
     // already-delivered message, which would make ambiguous-send reconciliation unsafe.
     const messageId = newGmailMessageId();
     const approved = {...state, rfcMessageId: messageId};
+    await this.#ctx.approvalQueue.assertAppAccess();
     const approvedMessage = sourceSnapshot
       ? await inlineForwardMessage(this.#ctx.api, this.#ctx.store, approved, sourceSnapshot)
       : undefined;
@@ -3395,6 +3520,7 @@ class GmailDraftStub extends GmailRpcTarget implements GmailDraft {
       title: "Read Gmail draft before send",
       description: "Read the exact simulated draft snapshot that will be sent.",
     });
+    await this.#ctx.approvalQueue.assertAppAccess();
     const resolved = this.#ctx.store.resolveDraftId(logicalId);
     const current = this.#ctx.store.getDraft(logicalId);
     if (resolved !== logicalId || !current || current.logicalId !== logicalId ||
@@ -3618,26 +3744,35 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     return this.#tokenSubject!;
   }
 
-  async #getAccessToken(opts?: AccessTokenRequest): Promise<string> {
+  async #getAccessToken(
+      opts?: AccessTokenRequest, requireAppAccess?: GmailAccessGate): Promise<string> {
+    await requireAppAccess?.();
     const token = await this.#tokens.get(opts);
+    await requireAppAccess?.();
     if (token !== this.#verifiedToken) {
       const pinned = this.ctx.storage.kv.get<string>("gmail:accountSubject");
-      if (pinned && pinned !== await this.#getTokenSubject(token)) {
-        throw new Error(
-          "This Gmail binding belongs to a different Google account. Reconnect the original account.");
+      if (pinned) {
+        await requireAppAccess?.();
+        if (pinned !== await this.#getTokenSubject(token)) {
+          throw new Error(
+            "This Gmail binding belongs to a different Google account. Reconnect the original account.");
+        }
       }
       this.#verifiedToken = token;
     }
     return token;
   }
 
-  async #getSelfEmail(): Promise<string> {
+  async #getSelfEmail(requireAppAccess?: GmailAccessGate): Promise<string> {
+    await requireAppAccess?.();
     const cached = this.ctx.storage.kv.get<string>("selfEmail");
-    const token = await this.#getAccessToken();
-    const [subject, description] = await Promise.all([
-      this.#getTokenSubject(token), getGoogleAccountDescription(token),
-    ]);
+    const token = await this.#getAccessToken(undefined, requireAppAccess);
+    await requireAppAccess?.();
+    const subject = await this.#getTokenSubject(token);
+    await requireAppAccess?.();
+    const description = await getGoogleAccountDescription(token);
     if (!description.uniqueName) throw new Error("Google account has no email address.");
+    await requireAppAccess?.();
     const pinned = this.ctx.storage.kv.get<string>("gmail:accountSubject");
     if (pinned && pinned !== subject) {
       throw new Error(
@@ -3661,7 +3796,9 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
       }> {
     if (this.ctx.props.labelName === undefined) return {};
     validateGmailLabelName(this.ctx.props.labelName);
+    await approvalQueue.assertAppAccess();
     const labels = await api.listLabelRecords();
+    await approvalQueue.assertAppAccess();
     const storedId = this.ctx.storage.kv.get<string>("gmail:bindingLabelId");
     if (storedId) {
       const label = labels.find(item => item.id === storedId);
@@ -3724,29 +3861,44 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
   async startSession(
       approvalQueue: RpcStub<ApprovalQueue>,
   ): Promise<GmailScopedSession | GmailSession> {
-    if (this.ctx.props.searchQuery !== undefined) {
-      validateGmailQueryForGrouping(this.ctx.props.searchQuery);
+    const queue = approvalQueue.dup();
+    const sharedQueue = new SharedApprovalQueue(queue);
+    try {
+      await sharedQueue.assertAppAccess();
+      if (this.ctx.props.searchQuery !== undefined) {
+        validateGmailQueryForGrouping(this.ctx.props.searchQuery);
+      }
+      const selfEmail = await this.#getSelfEmail(() => sharedQueue.assertAppAccess());
+      const getAccessToken = (
+          opts?: AccessTokenRequest, requireAppAccess?: GmailAccessGate) =>
+        this.#getAccessToken(opts, requireAppAccess);
+      const api = new GmailApi(selfEmail, async opts => {
+        await sharedQueue.assertAppAccess();
+        return getAccessToken(opts, () => sharedQueue.assertAppAccess());
+      });
+      await sharedQueue.authorizeObservation({
+        title: "Open Gmail session",
+        description: "Resolve the connected Google account used by this private Gmail binding.",
+      });
+      const bindingLabel = await this.#resolveBindingLabel(api, queue);
+      const store = new GmailStore(this.ctx.storage);
+      const ctx: GmailContext = {
+        api,
+        getAccessToken,
+        approvalQueue: sharedQueue,
+        store,
+        selfEmail,
+        searchQuery: this.ctx.props.searchQuery,
+        labelId: bindingLabel.id,
+        labelName: bindingLabel.name,
+        restricted: this.ctx.props.searchQuery !== undefined || bindingLabel.id !== undefined,
+        providerLabels: () => api.listLabelRecords(),
+      };
+      return ctx.restricted ? new GmailScopedSessionImpl(ctx) : new GmailSessionImpl(ctx);
+    } catch (error) {
+      queue[Symbol.dispose]();
+      throw error;
     }
-    const selfEmail = await this.#getSelfEmail();
-    const api = new GmailApi(selfEmail, opts => this.#getAccessToken(opts));
-    await approvalQueue.authorizeObservation({
-      title: "Open Gmail session",
-      description: "Resolve the connected Google account used by this private Gmail binding.",
-    });
-    const bindingLabel = await this.#resolveBindingLabel(api, approvalQueue);
-    const store = new GmailStore(this.ctx.storage);
-    const ctx: GmailContext = {
-      api,
-      approvalQueue: new SharedApprovalQueue(approvalQueue.dup()),
-      store,
-      selfEmail,
-      searchQuery: this.ctx.props.searchQuery,
-      labelId: bindingLabel.id,
-      labelName: bindingLabel.name,
-      restricted: this.ctx.props.searchQuery !== undefined || bindingLabel.id !== undefined,
-      providerLabels: () => api.listLabelRecords(),
-    };
-    return ctx.restricted ? new GmailScopedSessionImpl(ctx) : new GmailSessionImpl(ctx);
   }
 
   async applyAction(actionId: number): Promise<void> {

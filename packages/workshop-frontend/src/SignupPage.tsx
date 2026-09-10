@@ -60,6 +60,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
     !usernameError &&
     !passwordError &&
     !confirmError &&
+    serverConfig?.signupsEnabled !== false &&
     !loading;
 
   const handleSubmit = async (e: FormEvent) => {
@@ -70,11 +71,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
 
     try {
       const passwordHash = await hashPassword(username, password);
-      const token = await rpcStub.createAccount(
-        username,
-        username,
-        passwordHash,
-      );
+      const token = await rpcStub.createAccount(username, username, passwordHash);
       if (token) {
         localStorage.setItem("authToken", token);
         window.location.href = "/";

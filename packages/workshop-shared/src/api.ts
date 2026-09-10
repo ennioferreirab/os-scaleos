@@ -24,9 +24,13 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription, Audience, DirectoryAudienceTargets } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
+
+// Audience selectors are defined at the lower gatekeeper contract layer and re-exported here for
+// existing directory/admin API consumers.
+export type { Audience, DirectoryAudienceTargets } from "./gatekeeper.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -336,6 +340,12 @@ export const getOpenGadgetErrorCode = openGadgetErrors.getCode;
 export const AUTH_ERROR_CODES = {
   invalidSessionToken: "INVALID_SESSION_TOKEN",
   notAuthenticatedWithAccess: "NOT_AUTHENTICATED_WITH_ACCESS",
+  unauthenticated: "UNAUTHENTICATED",
+  invalidInput: "INVALID_INPUT",
+  forbidden: "FORBIDDEN",
+  notFound: "NOT_FOUND",
+  conflict: "CONFLICT",
+  dependencyUnavailable: "DEPENDENCY_UNAVAILABLE",
 } as const;
 
 /** An expected authentication failure code. */
@@ -346,6 +356,12 @@ export type AuthErrorCode = typeof AUTH_ERROR_CODES[keyof typeof AUTH_ERROR_CODE
 export const AUTH_ERROR_MESSAGES: Record<AuthErrorCode, string> = {
   [AUTH_ERROR_CODES.invalidSessionToken]: "invalid session token",
   [AUTH_ERROR_CODES.notAuthenticatedWithAccess]: "Not authenticated with Access.",
+  [AUTH_ERROR_CODES.unauthenticated]: "Authentication is required.",
+  [AUTH_ERROR_CODES.invalidInput]: "The supplied input is invalid.",
+  [AUTH_ERROR_CODES.forbidden]: "This operation is not permitted.",
+  [AUTH_ERROR_CODES.notFound]: "The requested resource was not found.",
+  [AUTH_ERROR_CODES.conflict]: "The requested operation conflicts with current state.",
+  [AUTH_ERROR_CODES.dependencyUnavailable]: "An authentication dependency is unavailable.",
 };
 
 const authErrors = codedErrorFamily(AUTH_ERROR_MESSAGES);
@@ -363,19 +379,6 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;
-
-  /**
-   * Change the user's password, if using password-based authentication.
-   *
-   * See `PublicApi.login()` for an explanation of the hashing algorithm.
-   */
-  changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void>;
-
-  /**
-   * Whether this account has a password set. False for accounts created via an OAuth provider, in
-   * which case the change-password UI should be hidden.
-   */
-  hasPasswordLogin(): Promise<boolean>;
 
   /**
    * List the user's configured AI models.
@@ -558,9 +561,9 @@ export interface AuthenticatedApi extends RpcTarget {
   listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]>;
 
   /**
-   * Opt into an ambient gatekeeper: mint its connected account for this user (no OAuth flow). Only
-   * works while the vendor's mode is 'optional' (or 'enabled') and the user has no account yet; the
-   * new account then appears via subscribeConnectedAccounts(). Throws otherwise.
+   * Opt into an ambient gatekeeper: mint its connected account for this user (no OAuth flow).
+   * This is available only while the vendor's mode is `optional` and the user has no account yet;
+   * `enabled` is reserved for automatic provisioning.
    */
   provisionAmbientAccount(vendorId: string): Promise<void>;
 
@@ -704,6 +707,12 @@ export interface AuthenticatedApi extends RpcTarget {
   amIAdmin(): Promise<boolean>;
 
   /**
+   * List the minimal active-user and live-group projection offered by audience pickers.
+   * The verified session Subject supplies authority; callers cannot select another actor.
+   */
+  listAudienceTargets(): Promise<DirectoryAudienceTargets>;
+
+  /**
    * Returns a capability for managing deployment-wide admin settings, or null when the caller is not
    * an admin. The access check happens once here, so the returned stub's methods need no per-call
    * checks. (Authentication config — sign-in providers, password login — is intentionally not
@@ -711,16 +720,17 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   getAdminApi(): Promise<RpcStub<AdminApi> | null>;
 
+
   // TODO:
   // - Edit permissions on a connected account.
 }
 
-/** Describes a gatekeeper's management app, for the Workshop nav + page. */
+/** Describes a UI-providing gatekeeper app for the Workshop nav and page. */
 export type GatekeeperAppInfo = {
   /**
-   * The vendor id (the GATEKEEPER_<ID> binding suffix, lowercased), used as the URL slug at
-   * /gatekeepers/$id. This is the vendor, not a specific account: it assumes one management-UI
-   * account per vendor per user, which holds for today's auto-provisioned singletons.
+   * Canonical registered vendor ID, used unchanged as the URL segment at `/gatekeepers/$id`.
+   * This is the vendor, not a specific account; current UI-providing accounts are one per vendor
+   * and user.
    */
   id: string;
   /** Title for the nav entry / page header. */
@@ -784,32 +794,22 @@ export type AdminResource = {
 };
 
 /**
- * Provisioning mode for an auto-provisioning ("ambient") gatekeeper — one that mints a connected
- * account with no OAuth flow (VendorDescription.autoProvisionsAccount), e.g. the Context Library:
- *   - 'disabled': not available; no account is provisioned and any existing one is dormant.
- *   - 'optional': users opt in from the Connectors page; not forced on anyone (the default).
- *   - 'enabled':  auto-provisioned for every user (forced); they can't remove it.
- */
-export const AMBIENT_GATEKEEPER_MODES = ['disabled', 'optional', 'enabled'] as const;
-export type AmbientGatekeeperMode = typeof AMBIENT_GATEKEEPER_MODES[number];
-
-export function isAmbientGatekeeperMode(value: unknown): value is AmbientGatekeeperMode {
-  return AMBIENT_GATEKEEPER_MODES.includes(value as AmbientGatekeeperMode);
-}
-
-/**
- * A bound gatekeeper in the admin gatekeeper-config UI, discriminated by `autoProvisions`:
- *   - an ordinary OAuth/resource gatekeeper has a binary `enabled` flag and `resources` to toggle;
- *   - an auto-provisioning ("ambient") gatekeeper has a three-state `ambientMode` and no resources.
+ * A bound gatekeeper vendor in the administrator's catalog.
+ *
+ * The catalog is deliberately independent of availability: every registered vendor remains
+ * editable even when its app policy is absent or disabled.
  */
 export type AdminResourceVendor = {
   vendorId: string;
   displayName: string;
   logo?: AvatarImage;
-} & (
-  | { autoProvisions: false; enabled: boolean; resources: AdminResource[] }
-  | { autoProvisions: true; ambientMode: AmbientGatekeeperMode }
-);
+  /** True when the vendor can mint an account without an OAuth flow. */
+  autoProvisions: boolean;
+  /** Resource-level soft toggles. Empty for an account-only/ambient vendor. */
+  resources: AdminResource[];
+  /** Present when the vendor could not be queried for metadata. */
+  unavailable?: boolean;
+};
 
 /**
  * A connectable third-party service: its vendor id, display metadata, and the resource types it
@@ -866,11 +866,11 @@ export type AdminMutationReceipt = {
 /** A bounded, non-sensitive description of one field changed by an administrative mutation. */
 export type AdminAuditChange = {
   /** Stable field name from the administrative resource schema. */
-  field: "signupsEnabled";
-  /** Value before the mutation. */
-  before: boolean;
-  /** Value after the mutation. */
-  after: boolean;
+  field: "signupsEnabled" | "role" | "status" | "name" | "members" | "appPolicy";
+  /** Bounded value before the mutation; never contains invitation secrets or user content. */
+  before: boolean | string | null;
+  /** Bounded value after the mutation; never contains invitation secrets or user content. */
+  after: boolean | string | null;
 };
 
 /** A durable local audit event for a deployment administrative mutation. */
@@ -883,14 +883,18 @@ export type AdminAuditEvent = {
   tenantId: string;
   /** Canonical directory user identifier resolved from the authenticated OS account. */
   actorUserId: string;
+  /** Active administrator who resumed the original actor's pending provider mutation, if any. */
+  resumedByUserId?: string;
   /** Optional executor principal for future product adapters; absent for local OS administration. */
   executorPrincipalId?: string;
   /** Stable kind of resource affected by the event. */
-  resourceType: "adminConfig";
-  /** Backend-owned identifier of the affected OS installation. */
+  resourceType: "adminConfig" | "directoryUser" | "directoryGroup" | "directoryApp";
+  /** Canonical identifier of the affected configuration, user, group, or gatekeeper vendor. */
   resourceId: string;
   /** Stable administrative operation name. */
-  action: "setSignupsEnabled";
+  action: "setSignupsEnabled" | "bootstrapAdmin" | "inviteUser" |
+      "setUserRole" | "setUserStatus" | "createGroup" | "renameGroup" |
+      "replaceGroupMembers" | "deleteGroup" | "setAppPolicy";
   /** Policy version before the mutation. */
   beforeVersion: number;
   /** Policy version after the mutation. */
@@ -898,7 +902,12 @@ export type AdminAuditEvent = {
   /** Outcome of the durably committed mutation. */
   result: "succeeded";
   /** Stable reason describing the outcome without carrying private content. */
-  reasonCode: "ADMIN_CONFIG_UPDATED";
+  reasonCode: "ADMIN_CONFIG_UPDATED" | "DIRECTORY_ADMIN_BOOTSTRAPPED" |
+      "DIRECTORY_USER_INVITED" | "DIRECTORY_USER_ROLE_CHANGED" |
+      "DIRECTORY_USER_DISABLED" | "DIRECTORY_USER_REACTIVATED" |
+      "DIRECTORY_GROUP_CREATED" | "DIRECTORY_GROUP_RENAMED" |
+      "DIRECTORY_GROUP_MEMBERS_CHANGED" | "DIRECTORY_GROUP_DELETED" |
+      "DIRECTORY_APP_POLICY_CHANGED";
   /** Backend-generated identifier for correlating this event with its mutation receipt. */
   correlationId: string;
   /** Caller-generated operation key used only for idempotent retry detection. */
@@ -928,6 +937,120 @@ export type AdminSettingsView = {
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
 };
+
+/** Canonical organization-directory record shown to an administrator. */
+export type DirectoryUser = {
+  /** Immutable verified Supabase subject. */
+  userId: string;
+  /** Confirmed contact address. It is never used as an authorization key. */
+  email: string;
+  /** Presentation name initialized by the inviter and editable by the user. */
+  displayName: string;
+  /** Organization role; invited users always start as members. */
+  role: "admin" | "member";
+  /** Disabled users retain identity and content but cannot establish a new product session. */
+  status: "active" | "disabled";
+  /** Server creation time as ISO-8601 UTC. */
+  createdAt: string;
+  /** Server update time as ISO-8601 UTC. */
+  updatedAt: string;
+};
+
+/** Shared directory group record used by the administrator UI and future audience consumers. */
+export type Group = {
+  /** Server-generated immutable UUID of the group. */
+  groupId: string;
+  /** Display name; surrounding whitespace is trimmed but capitalization is preserved. */
+  name: string;
+  /** Server time at which the group was created, as an ISO-8601 UTC string. */
+  createdAt: string;
+  /** Server time of the last group metadata or membership change, as an ISO-8601 UTC string. */
+  updatedAt: string;
+};
+
+/** One authoritative group membership row in the organization directory. */
+export type GroupMember = {
+  /** Stable primary key `${groupId}:${userId}`. */
+  key: string;
+  /** UUID of the containing group. */
+  groupId: string;
+  /** Verified Supabase Subject of the admitted user. */
+  userId: string;
+};
+
+/** Availability modes for a registered gatekeeper app. */
+export const APP_POLICY_MODES = ['disabled', 'optional', 'enabled'] as const;
+
+/** The deployment-wide availability mode of one registered gatekeeper app. */
+export type AppPolicyMode = typeof APP_POLICY_MODES[number];
+
+/** Return whether an unknown value is one of the registered app-policy modes. */
+export function isAppPolicyMode(value: unknown): value is AppPolicyMode {
+  return APP_POLICY_MODES.includes(value as AppPolicyMode);
+}
+
+/** Authoritative availability policy for one registered gatekeeper vendor. */
+export type AppPolicy = {
+  /** Canonical vendor id from the deployment's GATEKEEPER_* service binding. */
+  vendorId: string;
+  /** Whether the app is unavailable, user-selectable, or enabled for its audience. */
+  mode: AppPolicyMode;
+  /** Additive users and groups receiving access when the app is not disabled. */
+  audience: Audience;
+  /** Server time of the last administrative policy mutation; implicit defaults use organization creation time. */
+  updatedAt: string;
+};
+
+/** Result of resolving one subject's current access to a registered gatekeeper app. */
+export type AppAccessResult = {
+  /** Whether the subject may use the app at this instant. */
+  allowed: boolean;
+  /** Current app mode, including "disabled" when no policy has been stored. */
+  mode: AppPolicyMode;
+  /** Stable additive audience sources that granted access, empty when access is denied. */
+  sources: string[];
+};
+
+/** Server-computed recipients and additive audience sources for a proposed app policy. */
+export type AppPolicyAudiencePreview = {
+  /** Effective-active users selected by the proposed policy, in stable display order. */
+  users: Array<{
+    /** Verified Subject of the recipient. */
+    userId: string;
+    /** Current directory display name. */
+    displayName: string;
+    /** Additive policy sources that include this user. */
+    sources: string[];
+  }>;
+};
+
+/** Result of one authoritative Supabase invitation plus local admission. */
+export type DirectoryInviteResult = {
+  /** Newly admitted member, or the identical member returned on idempotent replay. */
+  user: DirectoryUser;
+  /** Durable local mutation receipt. */
+  receipt: AdminMutationReceipt;
+};
+
+/** Admin-only description of one provider lifecycle mutation awaiting completion. */
+export type PendingUserLifecycle = {
+  /** Immutable Subject of the affected directory user. */
+  userId: string;
+  /** Desired provider and directory status reserved by the original operation. */
+  status: "active" | "disabled";
+  /** Original mutation identifier required for exact recovery and replay. */
+  mutationId: string;
+  /** Original administrator; selector data only, never authority for the resuming call. */
+  actorUserId: string;
+  /** Server time at which the provider transition was reserved, as ISO-8601 UTC. */
+  startedAt: string;
+};
+
+/** Exact original lifecycle selector submitted when resuming; timestamps are not caller-controlled. */
+export type ResumeUserStatusInput = Pick<
+  PendingUserLifecycle,
+  "userId" | "status" | "mutationId" | "actorUserId"
+>;
 
 /**
  * One promoted blueprint, as the admin Formats panel sees it: the deployment's curation plus
@@ -974,10 +1097,11 @@ export type AdminFormat = {
 
 /**
  * Capability for managing deployment-wide admin settings, obtained via
- * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
- * local administrative audit history, and which gatekeeper connectors/resources are offered — NOT
- * authentication config (that's env-var driven). Each setter throws on invalid input.
+ * AuthenticatedApi.getAdminApi() (which is null for non-admins). Every method rechecks the human
+ * session guard and current active-admin status. Covers branding, agent instructions,
+ * local administrative audit history, registered app policies, and which gatekeeper
+ * connectors/resources are offered — NOT authentication config (that's env-var driven). Each setter
+ * throws on invalid input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
@@ -995,6 +1119,72 @@ export interface AdminApi {
    * admin capability supplies authorization and tenant scope; callers cannot select another tenant.
    */
   listAuditEvents(limit?: number): Promise<AdminAuditEvent[]>;
+
+  /** List users in the configured single organization. */
+  listDirectoryUsers(): Promise<DirectoryUser[]>;
+
+  /**
+   * List the registered gatekeeper app policies, including an implicit disabled policy for each
+   * vendor with no stored record.
+   */
+  listAppPolicies(): Promise<AppPolicy[]>;
+
+  /**
+   * Atomically set one registered gatekeeper app's availability mode and additive audience.
+   * Reusing `mutationId` with the same payload returns the original policy and receipt.
+   */
+  setAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+    mutationId: string;
+  }): Promise<{policy: AppPolicy; receipt: AdminMutationReceipt}>;
+
+  /** Preview recipients and authoritative sources for a proposed policy without mutating it. */
+  previewAppPolicy(input: {
+    vendorId: string;
+    mode: AppPolicyMode;
+    audience: Audience;
+  }): Promise<AppPolicyAudiencePreview>;
+
+  /** Invite or explicitly admit a central identity as a member. */
+  inviteUser(input: {email: string; displayName: string; mutationId: string})
+      : Promise<DirectoryInviteResult>;
+
+  /** Change an active user's organization role, protecting the last active administrator. */
+  setUserRole(input: {userId: string; role: "admin" | "member"; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Change a user's provider and directory lifecycle status without deleting their identity. */
+  setUserStatus(input: {userId: string; status: "active" | "disabled"; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** List provider lifecycle operations that an active administrator may explicitly resume. */
+  listPendingUserLifecycle(): Promise<PendingUserLifecycle[]>;
+
+  /** Resume the exact original lifecycle payload after rechecking current administrator authority. */
+  resumeUserStatus(input: ResumeUserStatusInput): Promise<AdminMutationReceipt>;
+
+  /** List existing groups by normalized display name and then immutable group id. */
+  listGroups(): Promise<Group[]>;
+
+  /** Return the deduplicated, sorted Subjects currently recorded in one group. */
+  getGroupMembers(groupId: string): Promise<string[]>;
+
+  /** Create a named group and return its durable mutation receipt. */
+  createGroup(input: {name: string; mutationId: string})
+      : Promise<{group: Group; receipt: AdminMutationReceipt}>;
+
+  /** Rename a group while preserving its immutable id and membership. */
+  renameGroup(input: {groupId: string; name: string; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Replace a group's complete member set atomically. */
+  replaceGroupMembers(input: {groupId: string; userIds: string[]; mutationId: string})
+      : Promise<AdminMutationReceipt>;
+
+  /** Delete a group and all of its membership rows atomically. */
+  deleteGroup(input: {groupId: string; mutationId: string}): Promise<AdminMutationReceipt>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.
@@ -1017,14 +1207,6 @@ export interface AdminApi {
    */
   setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void>;
 
-  /**
-   * Set a gatekeeper's availability. For an auto-provisioning ("ambient") gatekeeper, `mode` is the
-   * full three-state (disabled / optional / enabled); for an ordinary gatekeeper only 'disabled' /
-   * 'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a
-   * gadget already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting
-   * it.
-   */
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
 
   /**
    * Set the top-bar notice (centered text in the top navigation bar). Pass "" to clear. Rejects over

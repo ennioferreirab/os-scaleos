@@ -481,6 +481,8 @@ for (const gk of gatekeepers) {
   const OPTIONAL_FEATURE_VARS = [
     "DISABLE_PASSWORD_AUTH", "AUTH_GATEKEEPERS", "ENABLE_CLOUDFLARE_LIMITS", "PUBLIC_BASE_URL",
     "DAILY_LLM_CALL_LIMIT", "MINIMUM_CLOUDFLARE_BALANCE",
+    "AUTH_ISSUER", "AUTH_PUBLIC_URL", "AUTH_OS_CLIENT_ID", "OS_PUBLIC_URL", "ORG_ID",
+    "BOOTSTRAP_ADMIN_SUB", "SUPABASE_SECRET_KEY", "DIRECTORY_SERVICE_TOKEN",
     // Platform AI Gateway — makes the cross-provider model catalog available. CF_AI_GATEWAY
     // always needs CF_AI_GATEWAY_ACCOUNT_ID plus one transport: the WORKERS_AI binding
     // (start with --use-workers-ai-binding; CF_AI_GATEWAY_USE_BINDING=false opts out, e.g.

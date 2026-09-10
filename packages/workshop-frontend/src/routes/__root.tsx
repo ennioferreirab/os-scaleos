@@ -23,19 +23,29 @@ function RootComponent() {
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
-  const pathname = useRouterState({
-    select: (s) => (s.resolvedLocation ?? s.location).pathname,
+  const { pathname, resolvedPathname } = useRouterState({
+    select: (s) => ({
+      // location changes before a lazy route resolves, while Outlet may still render the previous
+      // route. Keep both names so we never move that old Outlet across the AuthProvider boundary.
+      pathname: s.location.pathname,
+      resolvedPathname: s.resolvedLocation?.pathname ?? s.location.pathname,
+    }),
   })
   const { t } = useLocale()
 
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
   const isBlueprint = pathname.startsWith('/blueprint/')
+  const isAuthSurface = pathname.startsWith('/auth/')
 
   // A standalone (no app shell) render is used only for signed-out visitors of public routes.
   // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
   // native — sidebar and all — instead of floating on a bare page.
-  const standalone = isSignup || (isBlueprint && !isAuthenticated)
+  const standalone = isAuthSurface || isSignup || (isBlueprint && !isAuthenticated)
+  const resolvedIsPublic = resolvedPathname === '/signup'
+    || resolvedPathname.startsWith('/auth/')
+    || (resolvedPathname.startsWith('/blueprint/') && !isAuthenticated)
+  const crossingAuthBoundary = pathname !== resolvedPathname && standalone !== resolvedIsPublic
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
@@ -46,6 +56,17 @@ function RootComponent() {
     if (token) {
       login(token)
     }
+  }
+
+  // TanStack keeps the previous Outlet mounted while a lazy destination resolves. Rendering that
+  // protected tree with the destination's public wrapper (or the inverse) drops AuthProvider for a
+  // frame. A neutral transition is both cheaper and avoids transient authentication errors.
+  if (crossingAuthBoundary) {
+    return (
+      <div className="flex min-h-full items-center justify-center bg-kumo-base">
+        <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
+      </div>
+    )
   }
 
   // Loading state
@@ -90,7 +111,7 @@ function RootComponent() {
 
   // Signed-out visitors of public routes render without the auth wrapper / app shell.
   if (standalone) {
-    const showHeader = !isSignup
+    const showHeader = !isSignup && !isAuthSurface
     return (
       <TooltipProvider>
         <Toasty>

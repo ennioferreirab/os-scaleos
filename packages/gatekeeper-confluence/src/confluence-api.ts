@@ -508,17 +508,33 @@ export class ConfluenceApi {
   readonly webBase: string;
   #getToken: () => Promise<string>;
   #refresh?: () => Promise<string>;
+  #beforeRequest?: () => Promise<void>;
 
   constructor(opts: {
     cloudId: string;
     webBase: string;
     getToken: () => Promise<string>;
     refresh?: () => Promise<string>;
+    beforeRequest?: () => Promise<void>;
   }) {
     this.cloudId = opts.cloudId;
     this.webBase = opts.webBase;
     this.#getToken = opts.getToken;
     this.#refresh = opts.refresh;
+    this.#beforeRequest = opts.beforeRequest;
+  }
+
+  /**
+   * Rebind this client to the operation owner's capability. Children must not retain parent guards.
+   */
+  withBeforeRequest(beforeRequest: () => Promise<void>): ConfluenceApi {
+    return new ConfluenceApi({
+      cloudId: this.cloudId,
+      webBase: this.webBase,
+      getToken: this.#getToken,
+      refresh: this.#refresh,
+      beforeRequest,
+    });
   }
 
   #base(): string {
@@ -536,11 +552,15 @@ export class ConfluenceApi {
   // token once on a 401, then surfaces a clean error.
   async #request<T>(method: string, path: string, init?: RequestInit): Promise<T> {
     const url = `${this.#base()}${path}`;
+    await this.#beforeRequest?.();
     let token = await this.#getToken();
+    await this.#beforeRequest?.();
     let response = await this.#send(method, url, token, init);
     if (response.status === 401 && this.#refresh) {
       try {
+        await this.#beforeRequest?.();
         token = await this.#refresh();
+        await this.#beforeRequest?.();
         response = await this.#send(method, url, token, init);
       } catch { /* fall through with the original 401 */ }
     }
@@ -803,10 +823,14 @@ export class ConfluenceApi {
   /** Downloads attachment bytes via its `downloadLink` (relative to the site /wiki base). */
   async downloadAttachment(downloadLink: string): Promise<{ data: Uint8Array; mediaType: string }> {
     const url = `${this.#base()}/wiki${downloadLink}`;
+    await this.#beforeRequest?.();
     let token = await this.#getToken();
+    await this.#beforeRequest?.();
     let response = await this.#send("GET", url, token, { headers: { Accept: "*/*" } });
     if (response.status === 401 && this.#refresh) {
+      await this.#beforeRequest?.();
       token = await this.#refresh();
+      await this.#beforeRequest?.();
       response = await this.#send("GET", url, token, { headers: { Accept: "*/*" } });
     }
     if (!response.ok) throw new ConfluenceApiError(response.status, `Attachment download failed: ${response.status}`);

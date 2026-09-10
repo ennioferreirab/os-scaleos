@@ -1,5 +1,7 @@
 import { RpcTarget } from "cloudflare:workers";
+import type { RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import type { ContextAuthority } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ConfluenceApi,
   buildCql,
@@ -12,14 +14,28 @@ import type { ConfluenceSiteConfiguratorRpc } from "./configurator/confluence-si
 
 const OPTION_LIMIT = 50;
 
-// Token/site getters are held off-instance so they aren't exposed as RPC-accessible properties.
-type Context = { getSites: () => Promise<AccessibleResource[]>; getToken: () => Promise<string> };
+type ConfiguratorAuthority = RpcTarget & Pick<ContextAuthority, "assertAppAccess">;
+// Token/site getters and the live app authority are held off-instance so they aren't exposed as
+// RPC-accessible properties.
+type Context = {
+  getSites: () => Promise<AccessibleResource[]>;
+  getToken: () => Promise<string>;
+  authority: RpcStub<ConfiguratorAuthority>;
+};
 const contexts = new WeakMap<object, Context>();
 
 function ctx(target: object): Context {
   const c = contexts.get(target);
   if (!c) throw new Error("Confluence configurator is not initialized.");
   return c;
+}
+
+function assertAppAccess(target: object): Promise<void> {
+  return ctx(target).authority.assertAppAccess();
+}
+
+function disposeAuthority(authority: RpcStub<ConfiguratorAuthority>): void {
+  authority[Symbol.dispose]();
 }
 
 const apiFor = (site: AccessibleResource, getToken: () => Promise<string>): ConfluenceApi =>
@@ -29,12 +45,21 @@ const apiFor = (site: AccessibleResource, getToken: () => Promise<string>): Conf
 @validateRpc()
 export class ConfluenceConfiguratorUI extends RpcTarget
     implements ConfluenceSiteConfiguratorRpc, ConfluenceSpaceConfiguratorRpc, ConfluencePageConfiguratorRpc {
-  constructor(getSites: () => Promise<AccessibleResource[]>, getToken: () => Promise<string>) {
+  constructor(
+    getSites: () => Promise<AccessibleResource[]>,
+    getToken: () => Promise<string>,
+    authority: RpcStub<ConfiguratorAuthority>,
+  ) {
     super();
-    contexts.set(this, { getSites, getToken });
+    contexts.set(this, { getSites, getToken, authority: authority.dup() });
+  }
+
+  [Symbol.dispose]() {
+    disposeAuthority(ctx(this).authority);
   }
 
   async listSites(query: string): Promise<ConfiguratorOption[]> {
+    await assertAppAccess(this);
     const { getSites } = ctx(this);
     const q = query.trim().toLowerCase();
     return (await getSites())
@@ -44,6 +69,7 @@ export class ConfluenceConfiguratorUI extends RpcTarget
   }
 
   async listSpaces(query: string): Promise<ConfiguratorOption[]> {
+    await assertAppAccess(this);
     const { getSites, getToken } = ctx(this);
     const sites = await getSites();
     const q = query.trim().toLowerCase();
@@ -61,6 +87,7 @@ export class ConfluenceConfiguratorUI extends RpcTarget
   }
 
   async listPages(query: string): Promise<ConfiguratorOption[]> {
+    await assertAppAccess(this);
     const { getSites, getToken } = ctx(this);
     const sites = await getSites();
     const cql = buildCql({ text: query.trim() || undefined });

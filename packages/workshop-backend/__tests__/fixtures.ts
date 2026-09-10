@@ -75,6 +75,7 @@ export async function openFakeOverseer(
     opts: {
       role?: "build" | "use";
       exports?: object;
+      expiresAtMs?: number;
       onClearRetainedActionPayload?: (
         record: { id: string; actionRecordId: number },
       ) => void | Promise<void>;
@@ -82,6 +83,10 @@ export async function openFakeOverseer(
   let role = opts.role ?? "build";
   let ownerId = "owner-id";
   let userId = role === "build" ? ownerId : "viewer-id";
+  // In-process test storage has a deliberately partial shape; this names the single lost type.
+  const fixtureStorage = storage as {
+    boundHooks?: {get(id: number): {enabled: boolean} | undefined};
+  };
   let overseer = {
     open: OverseerDurableObject.prototype.open,
     impl: {
@@ -92,6 +97,19 @@ export async function openFakeOverseer(
       joinOutputsFanout: () => () => {},
       ensureObserver: async () => {},
       syncOutputsTo: async () => {},
+      assertHookAccess: async (id: number, requireEnabled = true) => {
+        let record = fixtureStorage.boundHooks?.get(id);
+        if (!record) throw new Error("Hook has been deleted.");
+        if (requireEnabled && !record.enabled) {
+          throw new Error("Hook has been deleted or disabled.");
+        }
+        return record;
+      },
+      getGadgetRecord: (id: number) => {
+        const record = (storage as {gadgets: {get(id: number): unknown}}).gadgets.get(id);
+        if (!record) throw new Error(`No such gadget: ${id}`);
+        return record;
+      },
       getSharingManager: async () => ({ getEffectiveRole: () => role }),
       ctx: {
         id: { toString: () => "workspace-id" },
@@ -149,7 +167,12 @@ export async function openFakeOverseer(
   } satisfies Pick<OverseerDurableObject, "open"> & { impl: object };
   const notifyClosed = new NativeRpcStub<() => void>(() => {});
   try {
-    return await overseer.open(userId, `${userId}-profile`, notifyClosed);
+    return await overseer.open(
+      userId,
+      `${userId}-profile`,
+      notifyClosed,
+      opts.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+    );
   } finally {
     notifyClosed[Symbol.dispose]();
   }

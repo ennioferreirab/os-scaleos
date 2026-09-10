@@ -6,6 +6,10 @@ import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeC
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, ToolObservationRequest, ToolReturnCapture, ToolReturnCaptureOutcome, CapturedToolResult } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  GatekeeperRequestContext,
+  SlashCommandResult,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { normalizeVaultEvidence, type NormalizedVaultEnvelope } from "@gadgets/workshop-shared/evidence";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
@@ -33,11 +37,13 @@ import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BU
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses, foldProposedChanges, isCompactionTurn,
   type ChangeBatch } from "./agent-compaction";
-import { ambientGatekeeperMode } from "./provisioning-policy";
 import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
+import type { OrganizationDirectoryDurableObject } from "./organization-directory";
+import { hasSupabaseAuthSettings } from "./auth/supabase";
+import { ContextAuthorityImpl } from "./context-authority.js";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
@@ -51,6 +57,7 @@ import { createWorkshopLogger, obsContext, traced } from "./observability";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import { HumanSessionGuard } from "./auth/human-session.js";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
@@ -256,6 +263,8 @@ type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
 // getAgentCatalog is optional on Gatekeeper; ambient capsules always implement it. After confirming
 // the gatekeeper is an ambient capsule, we view its facet through this derived (Pick + Required)
 // shape to call it — same optional-method-on-a-stub pattern as user.ts's SingletonAccountStub.
+type GatekeeperRequestContextFactory =
+    (gatekeeperId: number) => GatekeeperRequestContext | undefined;
 type CatalogGatekeeperFacet =
     Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "getAgentCatalog">>>;
 
@@ -282,6 +291,10 @@ type GatekeeperRecord = {
   class: GatekeeperClass,
   hook?: string,  // export name to which the gatekeeper's hook is connected
 
+  // The trusted Directory Subject that owns this capability. It is persisted only on internal
+  // capability records; browser-facing APIs never supply or retain it.
+  ownerSubject?: string;
+
   // Records how this gatekeeper was originally created, enabling blueprint metadata derivation.
   creationSpec?: GatekeeperCreationSpec;
 
@@ -296,7 +309,7 @@ type GatekeeperRecord = {
 
 function gatekeeperVendorId(record: GatekeeperRecord | undefined): string | undefined {
   let spec = record?.creationSpec;
-  return spec && "vendorId" in spec ? spec.vendorId.toLowerCase() : undefined;
+  return spec && "vendorId" in spec ? spec.vendorId : undefined;
 }
 
 // A binding edge from one gadget to a target workpiece (today always a gatekeeper), stored in
@@ -600,11 +613,14 @@ type BoundHookRecord = {
 
   // The gadget whose code this hook wakes. Bookkeeping only -- used to display which gadget a
   // hook belongs to and to delete a gadget's hooks when the gadget is deleted. Operationally the
-  // `callback` already encapsulates OverseerRestoreParams pointing at the correct gadget.
-  // If omitted, use `defaultGadgetId`.
+  // callback itself encapsulates the restore target.
   gadgetId?: WorkpieceId;
 
   vendorId?: string;
+
+  // Copied from the trusted gatekeeper record when binding. This is internal provenance used to
+  // revalidate hook dispatch; old records without it are denied in central-auth deployments.
+  ownerSubject?: string;
   controller: Fetcher<HookController<RpcTarget>>;
   callback: NativeRpcStub<RpcTarget>;
   description: HookDescription;
@@ -1983,6 +1999,8 @@ class OverseerImpl implements AgentHooks {
   ownerProfileId?: string;
 
   users: DurableObjectNamespace<UserDurableObject>;
+  organizationDirectory: DurableObjectNamespace<OrganizationDirectoryDurableObject>;
+  readonly centralAuthMode: boolean;
 
   // The workspace's git object store, holding all gadgets' committed code (see git-store.ts).
   // One instance per DO so isomorphic-git's parse cache is shared.
@@ -2271,6 +2289,8 @@ class OverseerImpl implements AgentHooks {
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
     this.users = this.ctx.exports.UserDurableObject;
+    this.organizationDirectory = this.ctx.exports.OrganizationDirectoryDurableObject;
+    this.centralAuthMode = hasSupabaseAuthSettings(env);
     this.ownerId = this.storage.ownerId.get();
 
     // Run any pending storage migration before anything else can touch storage. This must happen
@@ -2759,30 +2779,42 @@ class OverseerImpl implements AgentHooks {
   // given, the edge is provisional to that chat (see BindingRecord.pending); the caller is
   // responsible for getting the addition recorded in the chat log so the pending edge gets
   // sequence-stamped (see addChatMessages()).
-  bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
-                chatId?: number): void {
+  //
+  // The policy check is deliberately the final await before the durable edge write. Callers may
+  // have awaited remote identity or gatekeeper metadata before reaching this method.
+  async bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
+                      chatId?: number): Promise<void> {
     validateBindingName(name);
     if (name === "GADGET") {
       throw new Error("The binding name `GADGET` is reserved.");
     }
-    let gadget = this.getGadgetRecord(gadgetId);
-    let existing = gadget.bindings[name];
-    if (existing) {
-      // A pending edge is invisible to other chats for reads but still occupies its name for
-      // writes: allowing a second proposal under the same name would mean accepting both
-      // silently overwrites one with the other.
-      if (existing.pending && existing.pending.chatId !== chatId) {
-        throw new Error(`The binding name "${name}" is already proposed by another chat. ` +
-            `Accept or revert that chat's changes first, or choose a different name.`);
+    let validate = (): GadgetRecord => {
+      let gadget = this.getGadgetRecord(gadgetId);
+      let existing = gadget.bindings[name];
+      if (existing) {
+        // A pending edge is invisible to other chats for reads but still occupies its name for
+        // writes: allowing a second proposal under the same name would mean accepting both
+        // silently overwrites one with the other.
+        if (existing.pending && existing.pending.chatId !== chatId) {
+          throw new Error(`The binding name "${name}" is already proposed by another chat. ` +
+              `Accept or revert that chat's changes first, or choose a different name.`);
+        }
+        throw new Error(`There is already a binding named "${name}".`);
       }
-      throw new Error(`There is already a binding named "${name}".`);
-    }
-    if (!this.storage.gatekeepers.get(target)) {
-      if (this.storage.gadgets.get(target)) {
-        throw new Error(`Gadget-to-gadget bindings are not supported yet.`);
+      if (!this.storage.gatekeepers.get(target)) {
+        if (this.storage.gadgets.get(target)) {
+          throw new Error(`Gadget-to-gadget bindings are not supported yet.`);
+        }
+        throw new Error(`No such gatekeeper: ${target}`);
       }
-      throw new Error(`No such gatekeeper: ${target}`);
-    }
+      return gadget;
+    };
+
+    // Reject obvious invalid requests before the policy RPC, then repeat all mutable checks after
+    // that await because another input may have changed the gadget while policy was resolving.
+    validate();
+    await this.assertGatekeeperAppAccess(target);
+    let gadget = validate();
     gadget.bindings[name] = {target, ...(chatId !== undefined ? {pending: {chatId}} : {})};
     this.storage.gadgets.put(gadget);
 
@@ -3291,6 +3323,54 @@ class OverseerImpl implements AgentHooks {
     };
     return this.ctx.exports.GatekeeperLoopback({props});
   }
+  /**
+   * Mint the request-scoped or durable authority attached to a Gatekeeper method call. Interactive
+   * callers retain a session-bound native stub; gadget/agent callers receive a durable authority
+   * carrying only the kernel-trusted Subject and target checks.
+   */
+  makeGatekeeperRequestContext(
+      gatekeeperId: number, caller: GatekeeperCaller,
+      sessionGuard?: HumanSessionGuard): GatekeeperRequestContext | undefined {
+    let record = this.storage.gatekeepers.get(gatekeeperId);
+    if (!record) return undefined;
+
+    let subject = sessionGuard?.subject;
+    if (subject === undefined && "subject" in caller) subject = caller.subject;
+    if (subject === undefined && caller.from === "hook") subject = caller.ownerSubject;
+    if (subject === undefined) return undefined;
+
+    let vendorId = gatekeeperVendorId(record);
+    let assertAdditionalAccess = () => this.assertGatekeeperCallerAccess(gatekeeperId, caller)
+        .then(() => undefined);
+    if (sessionGuard) {
+      let authority = new NativeRpcStub(new ContextAuthorityImpl({
+        subject,
+        vendorId,
+        directory: this.organizationDirectory.getByName(""),
+        centralAuthMode: this.centralAuthMode,
+        sessionGuard,
+        assertAdditionalAccess,
+      }));
+      return {authority};
+    }
+
+    let authority: GatekeeperRequestContext["authority"] =
+      this.ctx.exports.DurableContextAuthority({props: {
+        subject,
+        ...(vendorId === undefined ? {} : {vendorId}),
+        overseerId: this.ctx.id.toString(),
+        gatekeeperId,
+        caller,
+      }});
+    return {authority};
+  }
+
+  disposeGatekeeperRequestContext(requestContext?: GatekeeperRequestContext): void {
+    if (!requestContext) return;
+    const dispose = Reflect.get(requestContext.authority, Symbol.dispose);
+    if (typeof dispose === "function") dispose.call(requestContext.authority);
+  }
+
 
   // Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
   // bindings plus `GADGET` (the gadget's self-stub, kept for back-compat with existing gadget
@@ -3312,8 +3392,13 @@ class OverseerImpl implements AgentHooks {
   // gadget's RPC stub, a gatekeeper session stub, or an agent callback's stored arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere.
-  getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>): object {
-    let caller: GatekeeperCaller = {from: "agent", chatId};
+  getEnvForAgent(
+      chatId: number, bindings: Record<string, ChatBindingEntry>, subject?: string): object {
+    let caller: GatekeeperCaller = {
+      from: "agent",
+      chatId,
+      ...(subject === undefined ? {} : {subject}),
+    };
     // This must be a *plain* object: it becomes the loaded worker's `env`, and the loader's
     // serializer rejects anything else (including a null-prototype object) with DataCloneError.
     // So prototype-pollution safety comes from validation instead: names from before name
@@ -4546,6 +4631,7 @@ class OverseerImpl implements AgentHooks {
       // The snapshot meta above serves the as-of-`sequence` doc build; this re-read only keeps
       // the old fail-on-deleted-chat behavior (don't cache a load for a chat deleted mid-load).
       if (chatId !== undefined) this.getChatMetaOrThrow(chatId);
+      let ownerSubject = await this.getOwnerProfileId();
       let files: ReadonlyMap<string, string>;
       // An unpinned committed gadget tracks mainline head live, in chat context and out (see
       // chatDocOwnsGadget). Head movement invalidates the cached load either way: every merge
@@ -4585,7 +4671,8 @@ class OverseerImpl implements AgentHooks {
         ],
         mainModule: "server.js",
         modules,
-        env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
+        env: this.getEnvForLoader(
+            gadgetId, {from: "gadget", chatId, gadgetId, subject: ownerSubject}, chatId),
         globalOutbound: null,
 
         // TODO: Switch to streaming tails when the workerd log spam issue is fixed.
@@ -4653,7 +4740,8 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number): Promise<RpcStub<any>> {
+  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number,
+      sessionGuard?: HumanSessionGuard): Promise<RpcStub<any>> {
     let facet = this.getGadgetFacetFetcher(gadgetId, chatId);
 
     let self = this;
@@ -4678,6 +4766,7 @@ class OverseerImpl implements AgentHooks {
         //   possibly a runtime bug which needs investigation.
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
+          sessionGuard?.assertValid();
           let result: Promise<any> = Reflect.apply(method, target, args);
           return result.catch((err: any) => {
             let msg = err;
@@ -4827,12 +4916,162 @@ class OverseerImpl implements AgentHooks {
 
   getGatekeeperFacet(id: number): Fetcher<Gatekeeper<any>> {
     return this.ctx.facets.get(`gatekeeper${id}`, async () => {
-      let cls = this.storage.gatekeepers.get(id)?.class;
-      if (!cls) {
-        throw new Error("no such gatekeeper?");
-      }
-      return {class: cls};
+      let record = this.storage.gatekeepers.get(id);
+      if (!record) throw new Error("No such gatekeeper.");
+      return {class: record.class};
     });
+  }
+
+  private currentGatekeeperAppRecord(
+      id: number, expected: GatekeeperRecord, vendorId: string): GatekeeperRecord {
+    let current = this.storage.gatekeepers.get(id);
+    if (!current) throw new Error("No such gatekeeper.");
+    if (current.ownerSubject !== expected.ownerSubject ||
+        gatekeeperVendorId(current) !== vendorId ||
+        current.creationSpec?.type !== expected.creationSpec?.type) {
+      throw new Error("Gatekeeper identity changed while access was checked.");
+    }
+    if (expected.creationSpec?.type === "ambient") {
+      if (current.creationSpec?.type !== "ambient" ||
+          current.creationSpec.accountId !== expected.creationSpec.accountId) {
+        throw new Error("Gatekeeper identity changed while access was checked.");
+      }
+    } else if (expected.creationSpec?.type === "gatekeeper") {
+      if (current.creationSpec?.type !== "gatekeeper" ||
+          current.creationSpec.resourceUrl !== expected.creationSpec.resourceUrl ||
+          current.creationSpec.typeUrlPattern !== expected.creationSpec.typeUrlPattern) {
+        throw new Error("Gatekeeper identity changed while access was checked.");
+      }
+    }
+    return current;
+  }
+
+  /**
+   * Resolve current access for a persisted app gatekeeper before exposing or invoking its facet.
+   * Vendorless built-ins are outside app policy. Missing trusted provenance denies in central auth;
+   * ambient singletons additionally recheck the exact connected account that minted them.
+   */
+  async assertGatekeeperAppAccess(id: number): Promise<GatekeeperRecord> {
+    let record = this.storage.gatekeepers.get(id);
+    if (!record) throw new Error("No such gatekeeper.");
+    if (!this.centralAuthMode) return record;
+
+    let vendorId = gatekeeperVendorId(record);
+    if (!vendorId) {
+      if (record.creationSpec?.type === "gatekeeper" ||
+          record.creationSpec?.type === "ambient") {
+        throw new Error("This app capability has no trusted vendor identity.");
+      }
+      return record;
+    }
+    if (!record.ownerSubject) {
+      throw new Error("This gatekeeper has no trusted owner identity.");
+    }
+    if (record.creationSpec?.type === "ambient") {
+      // Ambient singleton records name the exact connected account that minted their class. An
+      // optional-policy opt-out removes that account without deleting the dormant capsule here;
+      // retained clients must nevertheless become inert immediately.
+      await this.#ownerUserDo().requireConnectedAccountAppAccess(
+          record.creationSpec.accountId, vendorId, record.ownerSubject);
+      return this.currentGatekeeperAppRecord(id, record, vendorId);
+    }
+    let access = await this.organizationDirectory.getByName("")
+        .resolveAppAccess(record.ownerSubject, vendorId);
+    if (!access.allowed) throw new Error(`The "${vendorId}" app is not available to its owner.`);
+    return this.currentGatekeeperAppRecord(id, record, vendorId);
+  }
+
+  async #assertOwnerAppAccess(vendorId: string, ownerSubject?: string): Promise<void> {
+    if (!this.centralAuthMode) return;
+    if (!ownerSubject) throw new Error("A trusted owner identity is required.");
+    let access = await this.organizationDirectory.getByName("")
+        .resolveAppAccess(ownerSubject, vendorId);
+    if (!access.allowed) throw new Error(`The "${vendorId}" app is not available to its owner.`);
+  }
+
+  async #assertGatekeeperCreationAccess(
+      creationSpec?: GatekeeperCreationSpec, ownerSubject?: string): Promise<void> {
+    if (!creationSpec || !("vendorId" in creationSpec)) return;
+    if (creationSpec.type === "ambient") {
+      if (!this.centralAuthMode) return;
+      if (!ownerSubject) throw new Error("A trusted owner identity is required.");
+      await this.#ownerUserDo().requireConnectedAccountAppAccess(
+          creationSpec.accountId, creationSpec.vendorId, ownerSubject);
+      return;
+    }
+    await this.#assertOwnerAppAccess(creationSpec.vendorId, ownerSubject);
+  }
+
+  async assertHookAccess(hookId: number, requireEnabled = true): Promise<BoundHookRecord> {
+    let initial = this.storage.boundHooks.get(hookId);
+    if (!initial) throw new Error("Hook has been deleted.");
+    if (requireEnabled && !initial.enabled) throw new Error("Hook has been deleted or disabled.");
+    let initialGadgetId = initial.gadgetId ?? this.defaultGadgetId;
+    if (initialGadgetId === undefined || !this.storage.gadgets.get(initialGadgetId)) {
+      throw new Error("Hook target gadget is unavailable.");
+    }
+
+    // Resolve the potentially remote workspace state before the final app-policy await. Everything
+    // after that await is synchronous, so a concurrent local disable/delete cannot return a stale
+    // hook record or callback.
+    let sharing: SharingManager | undefined;
+    let ownerProfileId: string | undefined;
+    if (this.centralAuthMode) {
+      sharing = await this.getSharingManager();
+      ownerProfileId = await this.getOwnerProfileId();
+    }
+
+    let gatekeeper = await this.assertGatekeeperAppAccess(initial.gatekeeperId);
+    let record = this.storage.boundHooks.get(hookId);
+    if (!record || (requireEnabled && !record.enabled)) {
+      throw new Error("Hook has been deleted or disabled.");
+    }
+    if (record.gatekeeperId !== initial.gatekeeperId ||
+        (record.gadgetId ?? this.defaultGadgetId) !== initialGadgetId ||
+        record.actionId !== initial.actionId ||
+        record.vendorId !== initial.vendorId ||
+        record.ownerSubject !== initial.ownerSubject) {
+      throw new Error("Hook identity changed while access was checked.");
+    }
+
+    let vendorId = gatekeeperVendorId(gatekeeper);
+    if (record.vendorId && vendorId && record.vendorId !== vendorId) {
+      throw new Error("Hook and gatekeeper identities do not match.");
+    }
+
+    let gadgetId = record.gadgetId ?? this.defaultGadgetId;
+    if (gadgetId === undefined || !this.storage.gadgets.get(gadgetId)) {
+      throw new Error("Hook target gadget is unavailable.");
+    }
+
+    if (this.centralAuthMode) {
+      if (!record.vendorId || !vendorId) {
+        throw new Error("Hook has no trusted vendor identity.");
+      }
+      if (!record.ownerSubject || record.ownerSubject !== gatekeeper.ownerSubject) {
+        throw new Error("Hook has no trusted owner identity.");
+      }
+      if (record.ownerSubject !== ownerProfileId &&
+          sharing!.getEffectiveRole(record.ownerSubject) === undefined) {
+        throw new Error("Hook owner cannot access this workspace.");
+      }
+    }
+    return record;
+  }
+
+  async assertGatekeeperCallerAccess(id: number, caller: GatekeeperCaller)
+      : Promise<GatekeeperRecord> {
+    if (caller.from !== "hook") return this.assertGatekeeperAppAccess(id);
+
+    let hook = await this.assertHookAccess(caller.hookId);
+    if (hook.gatekeeperId !== id) {
+      throw new Error("Hook approval queue does not match its gatekeeper.");
+    }
+    if (this.centralAuthMode &&
+        (!caller.ownerSubject || caller.ownerSubject !== hook.ownerSubject)) {
+      throw new Error("Hook approval queue has no trusted owner identity.");
+    }
+    return this.storage.gatekeepers.get(id)!;
   }
 
   // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
@@ -4846,6 +5085,7 @@ class OverseerImpl implements AgentHooks {
   // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
   async applyPendingAction(record: ActionRecord & {type: "action"},
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
+    await this.assertGatekeeperAppAccess(record.gatekeeperId);
     let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
     let captureStub = this.createActionCaptureStub(record);
     try {
@@ -4905,19 +5145,26 @@ class OverseerImpl implements AgentHooks {
     return this.#preparingChatMessages.get(chatId);
   }
 
-  async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec)
+  async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec,
+      sessionGuard?: HumanSessionGuard, ownerSubject?: string)
       : Promise<GatekeeperClient<any>> {
+    await this.#assertGatekeeperCreationAccess(creationSpec, ownerSubject);
+    sessionGuard?.assertValid();
+
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
       id,
       class: cls,
       creationSpec,
+      ...(ownerSubject !== undefined ? {ownerSubject} : {}),
     };
     this.storage.gatekeepers.put(gatekeeperRecord);
 
     let facet = this.getGatekeeperFacet(id);
     try {
       let description = await facet.describe();
+      await this.#assertGatekeeperCreationAccess(creationSpec, ownerSubject);
+      sessionGuard?.assertValid();
       gatekeeperRecord.resourceTitle = description.title;
       gatekeeperRecord.resourceUrl = description.url;
       gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
@@ -4927,7 +5174,7 @@ class OverseerImpl implements AgentHooks {
       throw error;
     }
 
-    return new GatekeeperClientImpl<any>(this, id, facet);
+    return new GatekeeperClientImpl<any>(this, id, facet, {from: "user"}, sessionGuard);
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -4951,8 +5198,9 @@ class OverseerImpl implements AgentHooks {
     this.storage.gatekeepers.delete(id);
   }
 
-  // Open the session behind a binding loopback.
-  startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
+  // Open the session behind a binding loopback. Gatekeeper policy is resolved before the facet is
+  // even constructed so denied apps cannot trigger vendor/session RPCs.
+  async startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
     switch (target.type) {
       case "gadget": {
         if (caller.from === "agent") {
@@ -4963,6 +5211,7 @@ class OverseerImpl implements AgentHooks {
       }
 
       case "gatekeeper": {
+        await this.assertGatekeeperAppAccess(target.id);
         let client = new GatekeeperClientImpl<any>(
             this, target.id, this.getGatekeeperFacet(target.id), caller);
         return client.openSession();
@@ -5018,15 +5267,13 @@ class OverseerImpl implements AgentHooks {
 
   async authorizeObservation(gatekeeperId: number, description: ObservationDescription,
                              caller: GatekeeperCaller): Promise<void> {
-    if (description.prohibitAllSharing) {
-      if ((await this.getSharingManager()).hasAnyShares()) {
-        throw new Error(
-            "This observation was blocked because it contains sensitive data that must only be " +
-            "shown to the account owner, but this workspace is shared with other users. Try again " +
-            "from a workspace that is not shared.");
-      }
-
-      this.storage.prohibitAllSharing.put(true);
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (description.prohibitAllSharing &&
+        (await this.getSharingManager()).hasAnyShares()) {
+      throw new Error(
+          "This observation was blocked because it contains sensitive data that must only be " +
+          "shown to the account owner, but this workspace is shared with other users. Try again " +
+          "from a workspace that is not shared.");
     }
 
     // Forward exclusion: the gatekeeper may name observers who must not see this observation. Since
@@ -5034,8 +5281,22 @@ class OverseerImpl implements AgentHooks {
     // observer has already lost access in the sharing graph. If any named observer is still
     // authorized, we cannot prevent them from seeing it, so we block the observation. See
     // observers-implementation-plan.md §5 Step 5.
-    if (description.excludeObservers && description.excludeObservers.length > 0) {
-      await this.#enforceExcludeObservers(description.excludeObservers);
+    let excludedObservers = description.excludeObservers?.length
+        ? await this.#checkExcludeObservers(description.excludeObservers)
+        : [];
+
+    // The sharing checks above cross RPC awaits. Re-resolve the live human/app authority before
+    // the first mutation, then again after asynchronous observer cleanup before recording approval.
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (description.prohibitAllSharing) this.storage.prohibitAllSharing.put(true);
+
+    if (excludedObservers.length > 0) {
+      let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
+      for (let observer of excludedObservers) {
+        this.storage.observers.delete(observer.profileId);
+        await this.#removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
+      }
+      await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -5491,39 +5752,24 @@ class OverseerImpl implements AgentHooks {
     });
   }
 
-  // Enforce an observation's `excludeObservers`. For each named opaque observerId:
-  //   - Map it back to a profileId via the byObserverId index. An unknown id is not an active
-  //     observer (e.g. already torn down), so it is ignored.
-  //   - If that profileId is still authorized in the sharing graph, we cannot guarantee they won't
-  //     see the observation (v1 has no per-thread hiding), so we throw to block it.
-  //   - If that profileId is no longer authorized, we allow the observation for them and delete
-  //     their observer record (best-effort removeObserver on all gatekeepers). They are no longer
-  //     set up to observe; if they regain access they reconfigure from scratch (Step 3).
-  // If no named observer is still authorized, the observation is allowed.
-  async #enforceExcludeObservers(observerIds: string[]): Promise<void> {
+  // Validate an observation's `excludeObservers` and return the inactive observer records that
+  // should be torn down. The caller rechecks its live authority before applying those mutations.
+  async #checkExcludeObservers(observerIds: string[]):
+      Promise<Array<{profileId: string, observerId: string}>> {
     let sharing = await this.getSharingManager();
+    let inactive: Array<{profileId: string, observerId: string}> = [];
 
-    // Observers who are still authorized block the observation outright.
     for (let observerId of observerIds) {
       let observer = this.storage.observers.byObserverId.get(observerId);
-      if (!observer) continue;  // not an active observer -> ignore
-
+      if (!observer) continue;
       if (sharing.getEffectiveRole(observer.profileId)) {
         throw new Error(
             "This observation was blocked because it contains data that a current collaborator " +
             "is not permitted to see.");
       }
+      inactive.push({profileId: observer.profileId, observerId});
     }
-
-    // No still-authorized observer was named. Tear down any named observers who have already lost
-    // access, since they are no longer set up to observe.
-    let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
-    for (let observerId of observerIds) {
-      let observer = this.storage.observers.byObserverId.get(observerId);
-      if (!observer) continue;
-      this.storage.observers.delete(observer.profileId);
-      await this.#removeObserverFromGatekeepers(observerId, gatekeeperIds);
-    }
+    return inactive;
   }
 
   // Provides web-fetch with the Workers AI binding and AI Gateway config it needs to call
@@ -5578,6 +5824,7 @@ class OverseerImpl implements AgentHooks {
   async submitAction(gatekeeperId: number, action: number,
                      description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
     if (this.storage.prohibitAllSharing.get()) {
       throw new Error(
           "This workspace has observed sensitive data. To prevent leaks, the workspace is prohibited " +
@@ -5625,6 +5872,7 @@ class OverseerImpl implements AgentHooks {
         gatekeeperId: number, controller: Fetcher<HookController<Hook>>,
         callback: NativeRpcStub<Hook>, description: HookDescription, caller: GatekeeperCaller)
         : Promise<void> {
+    let gatekeeper = await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
     let hookId = this.storage.nextHookId.get();
     this.storage.nextHookId.put(hookId + 1);
 
@@ -5650,14 +5898,16 @@ class OverseerImpl implements AgentHooks {
           ?? this.executeCodeRestoreTarget();
     }
 
-    let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
-
+    if (gadgetId === undefined || !this.storage.gadgets.get(gadgetId)) {
+      throw new Error("Hook target gadget is unavailable.");
+    }
     this.storage.boundHooks.put({
       id: hookId,
       actionId,
       gatekeeperId,
       ...(gadgetId !== undefined ? {gadgetId} : {}),
       vendorId: gatekeeperVendorId(gatekeeper),
+      ...(gatekeeper.ownerSubject !== undefined ? {ownerSubject: gatekeeper.ownerSubject} : {}),
       controller: controller as unknown as Fetcher<HookController<RpcTarget>>,
       callback: callback as unknown as NativeRpcStub<RpcTarget>,
       description,
@@ -6060,7 +6310,8 @@ class OverseerImpl implements AgentHooks {
   // message. A result without a message suppresses only the generated message, not the invocation.
   async #prepareChatMessage(
       message: string | SlashCommandRequest,
-      hasAttachments: boolean): Promise<PreparedChatMessage> {
+      hasAttachments: boolean,
+      requestContextFactory?: GatekeeperRequestContextFactory): Promise<PreparedChatMessage> {
     if (typeof message !== "string") {
       // A built-in command is handled by the Workshop, not a Gatekeeper: there is nothing to invoke
       // here. Committing the event is what makes the turn a compaction turn (see isCompactionTurn).
@@ -6074,12 +6325,21 @@ class OverseerImpl implements AgentHooks {
       let {gatekeeperId} = message.id;
       let record = this.storage.gatekeepers.get(gatekeeperId);
       if (!record?.hasSlashCommands) throw new Error("Slash command provider is not available.");
+      await this.assertGatekeeperAppAccess(gatekeeperId);
       // Display-only, and from the browser, so a bad value is dropped rather than refused.
       message = {...message, commandPosition: sanitizeCommandPosition(message)};
-      using authorizer = new NativeRpcStub<ObservationAuthorizer>(
-          new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
-      let result = await invokeSlashCommand(
-          this.getGatekeeperFacet(gatekeeperId), message, authorizer);
+      let requestContext = requestContextFactory?.(gatekeeperId);
+      let result: SlashCommandResult;
+      try {
+        using authorizer = new NativeRpcStub<ObservationAuthorizer>(
+            new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
+        result = await invokeSlashCommand(
+            this.getGatekeeperFacet(gatekeeperId), message, authorizer,
+            async () => { await this.assertGatekeeperAppAccess(gatekeeperId); },
+            requestContext);
+      } finally {
+        this.disposeGatekeeperRequestContext(requestContext);
+      }
       if (result.message === undefined) {
         return {slashCommand: message, skillName: result.skillName};
       }
@@ -6181,6 +6441,7 @@ class OverseerImpl implements AgentHooks {
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     externalChatKey?: string,
     formats?: MessageFormatRef[],
+    requestContextFactory?: GatekeeperRequestContextFactory,
   ): Promise<number> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -6192,7 +6453,7 @@ class OverseerImpl implements AgentHooks {
     let canonicalAttachments = this.canonicalizeChatAttachmentRefs(
         attachments, userMeta.aiModel?.config.provider);
     let prepared = await this.#prepareChatMessage(
-        initialMessage, (canonicalAttachments?.length ?? 0) > 0);
+        initialMessage, (canonicalAttachments?.length ?? 0) > 0, requestContextFactory);
 
     // No code base is established at creation: gadgets pin lazily, when their code is first
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
@@ -6262,6 +6523,7 @@ class OverseerImpl implements AgentHooks {
     attachments?: ChatAttachmentHandle[],
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     formats?: MessageFormatRef[],
+    requestContextFactory?: GatekeeperRequestContextFactory,
   ): Promise<void> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -6275,7 +6537,7 @@ class OverseerImpl implements AgentHooks {
     this.assertChatNotActive(chatId);
     using _chatMessageReservation = this.reserveChatMessagePreparation(chatId);
     let prepared = await this.#prepareChatMessage(
-        message, (canonicalAttachments?.length ?? 0) > 0);
+        message, (canonicalAttachments?.length ?? 0) > 0, requestContextFactory);
 
     let meta = this.assertChatNotActive(chatId, true);
     let result = this.materializeChatChanges(chatId, meta);
@@ -6469,10 +6731,13 @@ class OverseerImpl implements AgentHooks {
   }
 
   async describeGatekeeper(name: string, gatekeeper: GatekeeperRecord): Promise<string> {
+    gatekeeper = await this.assertGatekeeperAppAccess(gatekeeper.id);
     let facet = this.getGatekeeperFacet(gatekeeper.id);
 
     let desc = await facet.describe();
+    gatekeeper = await this.assertGatekeeperAppAccess(gatekeeper.id);
     let types = await facet.getTypeScriptTypes();
+    gatekeeper = await this.assertGatekeeperAppAccess(gatekeeper.id);
 
     return `Binding: ${name}\n` +
         `Title: ${desc.title}\n` +
@@ -6492,15 +6757,15 @@ class OverseerImpl implements AgentHooks {
   // Add a binding edge to a gadget on behalf of the agent's setGadgetBinding tool. The edge is
   // provisional to the chat (see BindingRecord.pending); the agent loop records the addition in
   // the chat log via `addedBindings`, which sequence-stamps it (see addChatMessages()).
-  addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
-                   chatId: number): void {
+  async addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
+                         chatId: number): Promise<void> {
     if (!this.storage.gatekeepers.get(target)) {
       throw new Error("This resource is no longer available.");
     }
     // Validate the gadget exists and is visible to this chat.
     let gadget = this.getGadgetRecord(
         this.resolveWorkpieceRoot(gadgetId, true, chatId).workpieceId);
-    this.bindWorkpiece(gadget.id, name, target, chatId);
+    await this.bindWorkpiece(gadget.id, name, target, chatId);
   }
 
   // Returns the checkpoint named by `chatMeta.compactedTo`.
@@ -7096,29 +7361,58 @@ class OverseerImpl implements AgentHooks {
   async ensureAmbientCapsules(): Promise<void> {
     if (!this.ownerId) return;
     let ownerDo = this.#ownerUserDo();
-    // listProvidedAccounts ensures the owner's auto-provisioned singleton accounts exist first, so this
-    // single round trip both provisions them and reads them back before we wire up capsules.
-    let accounts = (await ownerDo.listProvidedAccounts())
+    // The available list drives new capability minting. The persisted list is used only to
+    // distinguish an explicitly disconnected/replaced account from one temporarily hidden by
+    // policy; disabling an app must not delete its capsule, hooks, or content.
+    let [availableResult, persistedResult] = await Promise.all([
+      ownerDo.listProvidedAccounts(),
+      ownerDo.listProvidedAccounts(true),
+    ]);
+    let accounts = [...availableResult]
         .filter(account => account.description.singleton?.tsType);
+    let persistedAccounts = [...persistedResult]
+        .filter(account => account.description.singleton?.tsType);
+    availableResult[Symbol.dispose]?.();
+    persistedResult[Symbol.dispose]?.();
 
-    // Reconcile existing ambient capsule records against the owner's current singleton accounts. Each
-    // record is keyed to a specific accountId; if that account is gone (disconnected) or was replaced
-    // (an optional account removed and re-added with a new accountId), the record is stale and would
-    // point the capsule at a deleted account — so remove it. Snapshot the list since we mutate it.
-    let currentAccountId = new Map(accounts.map(account => [account.vendorId, account.accountId]));
+    // Reconcile existing ambient capsule records against all of the owner's persisted singleton
+    // accounts. Each record is keyed to a specific accountId; only explicit account removal or
+    // replacement makes it stale. Policy denial leaves the record inert until access returns.
     let bound = new Set<string>();
     // Snapshot before iterating, since removeGatekeeper() mutates the collection.
     let existingGatekeepers = Array.from(this.storage.gatekeepers.list());
     for (let gk of existingGatekeepers) {
-      if (gk.creationSpec?.type !== "ambient") continue;
-      if (currentAccountId.get(gk.creationSpec.vendorId) === gk.creationSpec.accountId) {
-        bound.add(gk.creationSpec.vendorId);
+      let spec = gk.creationSpec;
+      if (spec?.type !== "ambient") continue;
+      let account = persistedAccounts.find(candidate =>
+        candidate.vendorId === spec.vendorId && candidate.accountId === spec.accountId);
+      if (account) {
+        bound.add(spec.vendorId);
+        // This is a trusted owner identity supplied by the owner's User DO. Only fill missing
+        // provenance; an existing value may represent a deliberately retained capability and is
+        // never overwritten here.
+        if (!gk.ownerSubject && account.ownerSubject) {
+          gk.ownerSubject = account.ownerSubject;
+          this.storage.gatekeepers.put(gk);
+        }
+        // Hook provenance is repaired only for this exact gatekeeper and vendor pair. In
+        // particular, never copy an owner subject onto a hook whose vendor identity is absent or
+        // belongs to another vendor, and never overwrite a nonempty subject.
+        if (account.ownerSubject) {
+          for (let hook of this.storage.boundHooks.list()) {
+            if (hook.gatekeeperId !== gk.id || hook.vendorId !== account.vendorId ||
+                hook.ownerSubject) {
+              continue;
+            }
+            hook.ownerSubject = account.ownerSubject;
+            this.storage.boundHooks.put(hook);
+          }
+        }
       } else {
         this.removeGatekeeper(gk.id);
       }
     }
     let toAdd = accounts.filter(account => !bound.has(account.vendorId));
-    if (toAdd.length === 0) return;
 
     // Each singleton account provides a normal Gatekeeper class (imbued via ctx.props with whatever
     // it needs — e.g. account id and sharing domain). We install it as a Facet exactly like any other
@@ -7132,13 +7426,15 @@ class OverseerImpl implements AgentHooks {
       // Best-effort and isolated per account: a single failing account (e.g. its
       // getSingletonGatekeeperClass throws) must not block the others or the rest of open().
       try {
-        let cls = await ownerDo.getSingletonGatekeeperClass(account.accountId);
-        if (!cls) return;
+        let result = await ownerDo.getSingletonGatekeeperClass(account.accountId);
+        if (!result) return;
         // Provision as an unnamed record: it reaches the agent through each chat's env (named at
         // seed time from the gatekeeper's suggested binding name), not as any gadget's binding.
         await this.addGatekeeper(
-            cls,
-            {type: "ambient", vendorId: account.vendorId, accountId: account.accountId});
+            result.class,
+            {type: "ambient", vendorId: account.vendorId, accountId: account.accountId},
+            undefined,
+            result.ownerSubject);
       } catch (err) {
         this.logger.error("failed to provision ambient capsule", {
           event: "ambient.capsule.provision.failed",
@@ -7310,7 +7606,19 @@ class OverseerImpl implements AgentHooks {
   async prepareChatBindings(chatId: number, chatMessages: AiChatMessage[])
       : Promise<SeedBindingInfo[]> {
     let context = this.getChatAgentContext(chatId);
+    let agentSubject = chatMessages.toReversed()
+        .find(message => message.author.type !== "agent")?.author.id ?? this.ownerProfileId;
     let dirty = false;
+    let allowedGatekeeperIds = new Set<number>();
+    for (let record of this.storage.gatekeepers.list()) {
+      try {
+        await this.assertGatekeeperAppAccess(record.id);
+        allowedGatekeeperIds.add(record.id);
+      } catch {
+        // Keep the internal record intact so a later policy grant can restore the binding, but do
+        // not seed or query the denied facet for this turn.
+      }
+    }
 
     if (context.alwaysAvailableCapsuleIds === undefined) {
       // Freeze the ambient set + order on first use. Ordered by gatekeeper id (immutable) for
@@ -7322,7 +7630,8 @@ class OverseerImpl implements AgentHooks {
           .toSorted((a, b) => a - b);
       dirty = true;
     }
-    let ambientIds = context.alwaysAvailableCapsuleIds;
+    let ambientIds = context.alwaysAvailableCapsuleIds.filter(
+        id => allowedGatekeeperIds.has(id));
 
     if (context.bindings === undefined) {
       let seed: Record<string, WorkpieceId> = Object.create(null);
@@ -7359,7 +7668,9 @@ class OverseerImpl implements AgentHooks {
         if (!gk) continue;  // disconnected since the freeze -- inert, no name needed
         let suggested: string | undefined;
         try {
+          await this.assertGatekeeperAppAccess(id);
           suggested = (await this.getGatekeeperFacet(id).describe()).suggestedBindingName;
+          await this.assertGatekeeperAppAccess(id);
         } catch (err) {
           this.logger.warn("failed to fetch suggested binding name for ambient resource", {
             event: "chat.binding.ambient.describe.failed", gatekeeperId: id, error: err,
@@ -7371,6 +7682,8 @@ class OverseerImpl implements AgentHooks {
       context.bindings = seed;
       dirty = true;
     }
+    // Keep persisted seeds stable across policy changes, but never expose a denied gatekeeper in
+    // the current turn. This permits a later policy grant to restore an existing edge.
     let seedMap = context.bindings;
 
     // --- The naming chokepoint: stamp binding names onto persisted messages that lack them. ---
@@ -7468,10 +7781,13 @@ class OverseerImpl implements AgentHooks {
         let name = quick ? await this.generateBindingName(subject, taken, quick) : undefined;
         if (name === undefined) {
           let suggested: string | undefined;
-          if (target !== undefined && this.storage.gatekeepers.get(target)) {
+          if (target !== undefined && this.storage.gatekeepers.get(target) &&
+              allowedGatekeeperIds.has(target)) {
             try {
+              await this.assertGatekeeperAppAccess(target);
               suggested =
                   (await this.getGatekeeperFacet(target).describe()).suggestedBindingName;
+              await this.assertGatekeeperAppAccess(target);
             } catch {
               // Fall through to the generic fallback.
             }
@@ -7510,16 +7826,23 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    // Complete/refresh the cached discovery catalogs for the frozen ambient set.
+    // Complete/refresh the cached discovery catalogs for the frozen ambient set. These catalogs are
+    // authority-sensitive, so reload every ambient target on every agent turn.
     let {snapshots, changed} = await completeAgentCatalogSnapshot(
         context.alwaysAvailableCatalogs,
         ambientIds,
         async gatekeeperId => {
           let record = this.storage.gatekeepers.get(gatekeeperId);
           if (!record) return null;  // disconnected since the chat froze its set — no catalog.
+          let caller: GatekeeperCaller = {
+            from: "agent",
+            chatId,
+            ...(agentSubject === undefined ? {} : {subject: agentSubject}),
+          };
+          let requestContext = this.makeGatekeeperRequestContext(gatekeeperId, caller);
           try {
-            using authorizer = new RpcStub<ObservationAuthorizer>(new ApprovalQueueImpl(
-                this, gatekeeperId, {from: "agent", chatId}));
+            using approvalQueue = new RpcStub<ApprovalQueue>(new ApprovalQueueImpl(
+                this, gatekeeperId, caller));
             // The catalog comes from the installed gatekeeper facet (gadget-side), authorized as an
             // observation via the approval queue. getAgentCatalog is optional on Gatekeeper; ambient
             // resources always implement it (the agent relies on it for discovery), so we view the
@@ -7527,8 +7850,9 @@ class OverseerImpl implements AgentHooks {
             // The DurableObjectStub proxy unstubifies the RpcStub param to its target type; the
             // native stub forwards transparently at runtime.
             let facet = this.getGatekeeperFacet(gatekeeperId) as unknown as CatalogGatekeeperFacet;
+            await approvalQueue.assertAppAccess();
             let catalog = await facet.getAgentCatalog(
-                authorizer as unknown as ObservationAuthorizer);
+                approvalQueue as unknown as ObservationAuthorizer, requestContext);
             return catalog ? normalizeAgentCatalog(catalog) : null;
           } catch (error) {
             reportIssue("overseer.catalog-fallback", error, {
@@ -7542,8 +7866,11 @@ class OverseerImpl implements AgentHooks {
               gatekeeperId, resourceTitle: record.resourceTitle, error,
             });
             return null;
+          } finally {
+            this.disposeGatekeeperRequestContext(requestContext);
           }
-        });
+        },
+        true);
     if (changed) {
       context.alwaysAvailableCatalogs = snapshots;
       dirty = true;
@@ -7568,6 +7895,7 @@ class OverseerImpl implements AgentHooks {
         result.push({name, target, title: gadget.title, isGadget: true});
         continue;
       }
+      if (!allowedGatekeeperIds.has(target)) continue;
       let gk = this.storage.gatekeepers.get(target);
       if (!gk) continue;
       let info: SeedBindingInfo =
@@ -7578,20 +7906,39 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  async listSlashCommands(): Promise<SlashCommandChoice[]> {
-    let sources = [...this.storage.gatekeepers.list()]
-      .filter(record => record.hasSlashCommands)
-      .map(record => ({
-        gatekeeperId: record.id,
-        providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
-        gatekeeper: this.getGatekeeperFacet(record.id),
-      }));
-    return [{
-      selection: {builtin: true, commandId: "compact"},
-      name: "compact",
-      description: "Summarize older context while preserving recent messages.",
-      providerLabel: resolveSiteName((await readAdminConfig(this.env)).siteName),
-    }, ...await collectSlashCommands(sources)];
+  async listSlashCommands(
+      requestContextFactory?: GatekeeperRequestContextFactory): Promise<SlashCommandChoice[]> {
+    let sources: Parameters<typeof collectSlashCommands>[0] = [];
+    let requestContexts: GatekeeperRequestContext[] = [];
+    try {
+      for (let record of this.storage.gatekeepers.list()) {
+        if (!record.hasSlashCommands) continue;
+        try {
+          await this.assertGatekeeperAppAccess(record.id);
+        } catch {
+          continue;
+        }
+        let requestContext = requestContextFactory?.(record.id);
+        if (requestContext) requestContexts.push(requestContext);
+        sources.push({
+          gatekeeperId: record.id,
+          providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
+          gatekeeper: this.getGatekeeperFacet(record.id),
+          requestContext,
+          assertAccess: async () => { await this.assertGatekeeperAppAccess(record.id); },
+        });
+      }
+      return [{
+        selection: {builtin: true, commandId: "compact"},
+        name: "compact",
+        description: "Summarize older context while preserving recent messages.",
+        providerLabel: resolveSiteName((await readAdminConfig(this.env)).siteName),
+      }, ...await collectSlashCommands(sources)];
+    } finally {
+      for (let requestContext of requestContexts) {
+        this.disposeGatekeeperRequestContext(requestContext);
+      }
+    }
   }
 
   // =======================================================================================
@@ -8193,7 +8540,7 @@ class OverseerImpl implements AgentHooks {
           "agent.js": code,
         },
         // The agent's env holds the chat's named bindings (see getEnvForAgent).
-        env: this.getEnvForAgent(chatId, bindings),
+        env: this.getEnvForAgent(chatId, bindings, initiator.id),
         tails: [this.ctx.exports.CodeModeTailLoopback({props: tailProps})],
         globalOutbound: null,
       };
@@ -8291,27 +8638,23 @@ class OverseerImpl implements AgentHooks {
         this.users.get(this.users.idFromString(this.ownerId)), this.logger);
   }
 
-  // Short-TTL cache for the gatekeeper vendor list. The list is derived from static
-  // GATEKEEPER_* bindings, so it barely changes, but the connection hooks below (and the agent's
-  // system prompt) call it on every turn — caching avoids hammering the user DO each time.
-  #vendorsCache: {
-    expires: number;
-    promise: Promise<{id: string, description: VendorDescription, supportedResources: SupportedResource[]}[]>;
-  } | null = null;
-  static readonly #VENDORS_CACHE_TTL_MS = 60_000;
+  // Deduplicate concurrent vendor-list requests only. Each completed request must re-resolve the
+  // owner's live Directory policy on the next call.
+  #vendorsInFlight: Promise<{
+    id: string;
+    description: VendorDescription;
+    supportedResources: SupportedResource[];
+  }[]> | null = null;
 
   #listGatekeeperVendorsCached() {
-    let now = Date.now();
-    if (this.#vendorsCache && this.#vendorsCache.expires > now) {
-      return this.#vendorsCache.promise;
-    }
+    if (this.#vendorsInFlight) return this.#vendorsInFlight;
     let promise = retryOnDoReset(
         () => this.#ownerUserStub().listGatekeeperVendors(), this.logger);
-    // Don't cache failures: drop the entry so the next call retries.
-    promise.catch(() => {
-      if (this.#vendorsCache?.promise === promise) this.#vendorsCache = null;
-    });
-    this.#vendorsCache = { expires: now + OverseerImpl.#VENDORS_CACHE_TTL_MS, promise };
+    this.#vendorsInFlight = promise;
+    promise.then(
+        () => { if (this.#vendorsInFlight === promise) this.#vendorsInFlight = null; },
+        () => { if (this.#vendorsInFlight === promise) this.#vendorsInFlight = null; },
+    );
     return promise;
   }
 
@@ -8892,7 +9235,12 @@ class OverseerImpl implements AgentHooks {
               gatekeeperId: gk.id, vendorId, accountId, observerId, error: err,
             });
           };
-
+          try {
+            await this.assertGatekeeperAppAccess(gk.id);
+          } catch (error) {
+            fail("This app is no longer available.", error);
+            return;
+          }
           let verifier = await clientUser.getVerifier(accountId, vendorId);
           if (!verifier) {
             // Account gone -> the overseer authors the reason. (Wrong vendor throws above.)
@@ -9163,14 +9511,22 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.outputsSnapshot();
   }
 
+  /** Recheck a durable Context caller against the current workspace, hook, and app policy. */
+  async assertGatekeeperCallerAccess(id: number, caller: GatekeeperCaller): Promise<void> {
+    await this.impl.assertGatekeeperCallerAccess(id, caller);
+  }
+
   /**
    * `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
    * by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
    */
   async open(userId: string, profileId: string,
              notifyClosed: NativeRpcStub<() => void>,
+             expiresAtMs: number,
              shareKey?: string,
              configureObservers?: RpcStub<ObserverConfigCallback>): Promise<Overseer> {
+    const sessionGuard = new HumanSessionGuard(profileId, expiresAtMs);
+    sessionGuard.assertValid();
     let firstOpen = !this.impl.ownerId;
     if (firstOpen) {
       // This Overseer hasn't been initialized yet.
@@ -9299,12 +9655,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
-          this.impl, profileId, userId, notifyClosed.dup());
+          this.impl, profileId, userId, notifyClosed.dup(), sessionGuard);
     }
 
     return new OverseerClientInterface(
         this.impl, profileId, userId, isOwner, notifyClosed.dup(),
-        ensureCapsules);
+        ensureCapsules, sessionGuard);
   }
 
   #getExternalChat(externalChatKey: string): ExternalChatRecord | undefined {
@@ -9505,25 +9861,45 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return new NativeRpcStub(this.impl.getGadgetHookEntrypoint(id));
   }
 
+  authorizedHookCallback(
+      hookId: number, callback: NativeRpcStub<RpcTarget>): RpcTarget {
+    // Hook callback methods are gatekeeper-defined. Proxy the dynamic surface, but keep the
+    // persisted callback stub owned by storage: releasing this per-fire wrapper must not dispose it.
+    let target = new (class extends RpcTarget {
+      [Symbol.dispose]() {}
+    })();
+    return new Proxy<RpcTarget>(target, {
+      get: (proxyTarget, prop) => {
+        if (prop === "then") return undefined;
+        if (Reflect.has(proxyTarget, prop)) {
+          return Reflect.get(proxyTarget, prop, proxyTarget);
+        }
+        let method = Reflect.get(callback, prop, callback);
+        if (typeof method !== "function") return method;
+        return async (...args: unknown[]) => {
+          await this.impl.assertHookAccess(hookId);
+          let currentMethod = Reflect.get(callback, prop, callback);
+          if (typeof currentMethod !== "function") {
+            throw new TypeError("Hook callback method is unavailable.");
+          }
+          return Reflect.apply(currentMethod, callback, args);
+        };
+      },
+      getPrototypeOf: () => RpcTarget.prototype,
+    });
+  }
+
   async startHook(hookId: number): Promise<{
     callback: NativeRpcStub<RpcTarget>, approvalQueue: ApprovalQueue
   }> {
-    let record = this.impl.storage.boundHooks.get(hookId);
-    if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
-
-    let vendorId = record.vendorId ??
-        gatekeeperVendorId(this.impl.storage.gatekeepers.get(record.gatekeeperId));
-    if (!vendorId) throw new Error("Hook vendor is unavailable.");
-
-    let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(vendorId) ||
-        ambientGatekeeperMode(config, vendorId) === "disabled") {
-      throw new Error("Gatekeeper is disabled.");
-    }
-
+    let record = await this.impl.assertHookAccess(hookId);
     return {
-      callback: record.callback,
-      approvalQueue: new ApprovalQueueImpl(this.impl, record.gatekeeperId, {from: "hook"}),
+      callback: new NativeRpcStub(this.authorizedHookCallback(hookId, record.callback)),
+      approvalQueue: new ApprovalQueueImpl(this.impl, record.gatekeeperId, {
+        from: "hook",
+        hookId,
+        ...(record.ownerSubject !== undefined ? {ownerSubject: record.ownerSubject} : {}),
+      }),
     };
   }
 
@@ -9640,22 +10016,34 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 }
 
-type GatekeeperCaller = {
+export type GatekeeperCaller = {
   from: "agent";
   chatId: number;
+  /** Kernel-trusted Subject for this durable agent turn. */
+  subject?: string;
 } | {
   from: "gadget";
   chatId?: number;
 
-  // Which gadget made the call. Optional for backward compatibility: callers embedded in
-  // ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
-  // should be assumed when `gadgetId` is absent.
+  /** Kernel-trusted Subject of the workspace owner running this gadget. */
+  subject?: string;
+
+  /**
+   * Which gadget made the call. Optional for backward compatibility: callers embedded in
+   * ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
+   * should be assumed when `gadgetId` is absent.
+   */
   gadgetId?: WorkpieceId;
 } | {
   from: "user";
   chatId?: number;
+  /** Present only for internal non-interactive callers. */
+  subject?: string;
 } | {
   from: "hook";
+  hookId: number;
+  /** Kernel-trusted Subject of the hook owner. */
+  ownerSubject?: string;
 };
 
 function gatekeeperCallerChatId(caller: GatekeeperCaller): number | undefined {
@@ -9983,19 +10371,29 @@ function joinSessionPresence(
 @validateRpc()
 class OverseerClientInterface extends RpcTarget implements Overseer {
   #clientProfilePromise: Promise<AiChatAuthorInfo> | undefined;
+  private implementation: OverseerImpl;
 
-  constructor(private impl: OverseerImpl,
+  constructor(impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
               private isOwner: boolean,
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
               // this so ambient providers are attached when possible.
-               private slashCommandsReady: Promise<void>) {
+              private slashCommandsReady: Promise<void>,
+              private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "build", () => this.#getClientProfile());
     this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  // Every public method reaches the implementation through this accessor, making expiry a
+  // per-entry capability check instead of relying only on deadline WebSocket cleanup.
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // We create a new stub for every call so that we don't have to worry about detecting when a
@@ -10026,6 +10424,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // Per-session caller identity for the SharingManager.
   #sharingCaller(): SharingCaller {
     return { profileId: this.clientProfileId, isOwner: this.isOwner };
+  }
+  #gatekeeperRequestContextFactory(): GatekeeperRequestContextFactory {
+    return gatekeeperId => this.impl.makeGatekeeperRequestContext(
+        gatekeeperId, {from: "user"}, this.sessionGuard);
   }
 
   async #getClientProfile(): Promise<AiChatAuthorInfo> {
@@ -10200,14 +10602,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, record.id, this.clientUserId, this.sessionGuard);
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.sessionGuard);
   }
 
   async deleteSelf(): Promise<void> {
@@ -10275,11 +10677,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async getGatekeeperById(id: number): Promise<GatekeeperClient<any>> {
-    let gatekeeper = this.impl.storage.gatekeepers.get(id)?.id;
-    if (gatekeeper === undefined) {
-      throw new Error(`No such gatekeeper id: ${id}`);
-    }
-    return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id));
+    await this.impl.assertGatekeeperAppAccess(id);
+    return new GatekeeperClientImpl(
+        this.impl, id, this.impl.getGatekeeperFacet(id), {from: "user"}, this.sessionGuard);
   }
 
   private async recordConnectionCreated(
@@ -10297,7 +10697,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async newGatekeeper(accountId: number, resourceUrl: string)
       : Promise<GatekeeperClient<any> | null> {
-    let {class: cls, vendorId, typeUrlPattern} =
+    let {class: cls, vendorId, typeUrlPattern, ownerSubject} =
         await this.#clientUser.getGatekeeperClassFor(accountId, resourceUrl);
     let creationSpec: GatekeeperCreationSpec = {
       type: "gatekeeper",
@@ -10305,11 +10705,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       resourceUrl,
       typeUrlPattern,
     };
-    let result = await this.impl.addGatekeeper(cls, creationSpec);
+    let result = await this.impl.addGatekeeper(
+        cls, creationSpec, this.sessionGuard, ownerSubject);
     await this.recordConnectionCreated(result, "gatekeeper", vendorId);
     return result;
   }
-
   async newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>> {
     let chatMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(modelId), this.impl.logger);
@@ -10332,7 +10732,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec, this.sessionGuard);
     await this.recordConnectionCreated(result, "ai_model");
     return result;
   }
@@ -10377,7 +10777,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec, this.sessionGuard);
     await this.recordConnectionCreated(result, "agent_spawner");
     return result;
   }
@@ -10458,9 +10858,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async enableHook(id: number): Promise<void> {
-    let record = this.impl.storage.boundHooks.get(id);
-    if (!record) throw new Error("Invalid hook ID.");
-
+    let record = await this.impl.assertHookAccess(id, false);
     if (!record.enabled) {
       let props: GatekeeperHookLoopbackProps = {
         overseerId: this.impl.ctx.id.toString(),
@@ -10558,8 +10956,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`Can't reject an observation: ${id}`);
     }
 
+    // Rejection is pending-state cleanup and remains reachable after app policy is disabled.
+    // Approval and every execution path still resolve live app access.
     let gatekeeper = this.impl.getGatekeeperFacet(action.gatekeeperId);
-
     // Resolve the rejecter's identity before notifying the gatekeeper, so a failed profile fetch
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
     let profile = await this.#getClientProfile();
@@ -10581,6 +10980,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // actions that this newly unblocks. Auto-approval rules are workspace-wide per gatekeeper.
   async setAutoApprovedActionKind(gatekeeperId: WorkpieceId, actionKind: ActionKind)
       : Promise<void> {
+    await this.impl.assertGatekeeperAppAccess(gatekeeperId);
     let gatekeeper = this.impl.storage.gatekeepers.get(gatekeeperId);
     if (!gatekeeper) {
       throw new Error(`No such gatekeeper: ${gatekeeperId}`);
@@ -10628,8 +11028,18 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         .map(id => this.impl.storage.gatekeepers.get(id))
         .filter(gk => gk !== undefined)
         .map(async (gk): Promise<PreApprovableAction[]> => {
+      try {
+        await this.impl.assertGatekeeperAppAccess(gk.id);
+      } catch {
+        return [];
+      }
       let facet = this.impl.getGatekeeperFacet(gk.id);
       let kinds = await facet.getAutoApprovableActions();
+      try {
+        await this.impl.assertGatekeeperAppAccess(gk.id);
+      } catch {
+        return [];
+      }
       return kinds.map(actionKind => ({
         gatekeeperId: gk.id,
         // resourceTitle is a denormalized cache of the gatekeeper's describe().title, populated in a
@@ -10832,7 +11242,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
     await this.slashCommandsReady;
-    return this.impl.listSlashCommands();
+    return this.impl.listSlashCommands(this.#gatekeeperRequestContextFactory());
   }
 
   async uploadChatAttachment(
@@ -11031,7 +11441,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
-                             undefined, undefined, formats);
+                             undefined, undefined, formats, this.#gatekeeperRequestContextFactory());
   }
 
   async sendChatMessage(
@@ -11041,7 +11451,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let userMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
     return this.impl.sendChatMessage(
-        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats,
+        this.#gatekeeperRequestContextFactory());
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {
@@ -11519,15 +11930,24 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 // whether "use" callers may invoke it.
 @validateRpc()
 class UseOverseerInterface extends RpcTarget implements Overseer {
-  constructor(private impl: OverseerImpl,
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
-              private notifyClosed: NativeRpcStub<() => void>) {
+              private notifyClosed: NativeRpcStub<() => void>,
+              private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
     this.#leavePresence = joinSessionPresence(
         this.impl, this.clientProfileId, "use",
         () => retryOnDoReset(() => this.#clientUser.whoami(), this.impl.logger));
     this.#leaveOutputsFanout = this.impl.joinOutputsFanout(this.clientUserId);
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -11556,6 +11976,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   // Throws "Unauthorized" for any method not available to "use" collaborators.
   #deny(): never {
+    this.sessionGuard.assertValid();
     throw new Error("Unauthorized: this collaborator only has permission to use the gadget's UI.");
   }
 
@@ -11627,7 +12048,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
+    return new UseGadgetClientInterface(this.impl, id, this.clientUserId, this.sessionGuard);
   }
 
   // --- Denied methods (build-only) ---
@@ -11778,9 +12199,17 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 // Overseer.createGadget()/getGadget().
 @validateRpc()
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
-  constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: WorkpieceId,
+      private clientUserId: string, private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -11791,6 +12220,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async getId(): Promise<WorkpieceId> {
+    this.sessionGuard?.assertValid();
     return this.id;
   }
 
@@ -11819,7 +12249,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       chat_id: chatId,
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, chatId);
+    return this.impl.getGadgetFacet(this.id, chatId, this.sessionGuard);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -11851,31 +12281,39 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     let record = this.impl.getGadgetRecord(this.id);
     let edge = record.bindings[name];
     if (!edge || edge.pending || !this.impl.storage.gatekeepers.get(edge.target)) return null;
+    await this.impl.assertGatekeeperAppAccess(edge.target);
     return new GatekeeperClientImpl(
-        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target));
+        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target),
+        {from: "user"}, this.sessionGuard);
   }
 
-  async bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
+  async #bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
     if (chatId === undefined) {
-      this.impl.bindWorkpiece(this.id, name, target);
+      await this.impl.bindWorkpiece(this.id, name, target);
       return;
     }
 
     // Binding with a chat open is provisional to that chat, like code edits: write the pending
     // edge and the "changes" message that records (and sequence-stamps) it in one synchronous
-    // step, so this path has no crash window (mirroring user-initiated gadget creation).
+    // step, so this path has no crash window (mirroring user-initiated gadget creation). The
+    // binding helper performs the final policy check after whoami() returns.
     if (!this.impl.storage.chatMeta.get(chatId)) {
       throw new Error(`No such chat: ${chatId}`);
     }
     let author = await retryOnDoReset(() => this.#clientUser.whoami(), this.impl.logger);
-    this.impl.bindWorkpiece(this.id, name, target, chatId);
+    await this.impl.bindWorkpiece(this.id, name, target, chatId);
     this.impl.addChatMessages(chatId, author, [{
       type: "changes",
       addedBindings: [{gadgetId: this.id, name, target}],
     }]);
   }
 
+  async bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
+    return this.#bind(name, target, chatId);
+  }
+
   async bindWithSuggestedName(target: WorkpieceId, chatId?: number): Promise<string> {
+    await this.impl.assertGatekeeperAppAccess(target);
     let record = this.impl.getGadgetRecord(this.id);
     let existing = this.impl.visibleBindings(record, chatId)
         .find(([, edge]) => edge.target === target);
@@ -11892,7 +12330,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     while (record.bindings[suggestedName] !== undefined) {
       suggestedName = `${description.suggestedBindingName}_${++i}`;
     }
-    await this.bind(suggestedName, target, chatId);
+    await this.#bind(suggestedName, target, chatId);
     return suggestedName;
   }
 
@@ -12030,9 +12468,17 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 // fails to compile here until a developer decides whether "use" callers may invoke it.
 @validateRpc()
 class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
-  constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: WorkpieceId,
+      private clientUserId: string, private sessionGuard: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard.assertValid();
+    return this.implementation;
   }
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
@@ -12043,12 +12489,14 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   }
 
   #deny(): never {
+    this.sessionGuard.assertValid();
     throw new Error("Unauthorized: this collaborator only has permission to use the gadget's UI.");
   }
 
   // --- Allowed methods ---
 
   async getId(): Promise<WorkpieceId> {
+    this.sessionGuard.assertValid();
     return this.id;
   }
 
@@ -12073,7 +12521,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       user_id: this.#clientUser.id.toString(),
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, undefined);
+    return this.impl.getGadgetFacet(this.id, undefined, this.sessionGuard);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -12110,10 +12558,19 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 @validateRpc()
 class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     extends RpcTarget implements GatekeeperClient<Session> {
-  constructor(private impl: OverseerImpl, private id: number,
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private id: number,
       private facet: Fetcher<Gatekeeper<Session>>,
-      private caller: GatekeeperCaller = {from: "user"}) {
+      private caller: GatekeeperCaller = {from: "user"},
+      private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
+  }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
   }
 
   async remove(): Promise<void> {
@@ -12128,6 +12585,7 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 
   async getId(): Promise<number> {
+    this.sessionGuard?.assertValid();
     return this.id;
   }
 
@@ -12138,28 +12596,50 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 
   async getTitle(): Promise<string> {
+    await this.impl.assertGatekeeperAppAccess(this.id);
     return this.#getRecord().resourceTitle || "(title unavailable)";
   }
 
   async setTitle(title: string): Promise<void> {
     // This changes only the display title used locally within this workspace (resourceTitle is a
     // denormalized copy of the remote resource's title), never the remote resource.
-    let record = this.#getRecord();
+    let record = await this.impl.assertGatekeeperAppAccess(this.id);
     record.resourceTitle = title;
     this.impl.storage.gatekeepers.put(record);
   }
 
   async describe(): Promise<ResourceDescription> {
-    return this.facet.describe();
+    this.sessionGuard?.assertValid();
+    await this.impl.assertGatekeeperAppAccess(this.id);
+    let description = await this.facet.describe();
+    await this.impl.assertGatekeeperAppAccess(this.id);
+    this.sessionGuard?.assertValid();
+    return description;
   }
 
   async openSession(): Promise<RpcStub<Session>> {
-    // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return this.facet.startSession(new ApprovalQueueImpl(this.impl, this.id, this.caller));
+    this.sessionGuard?.assertValid();
+    await this.impl.assertGatekeeperAppAccess(this.id);
+    let requestContext = this.impl.makeGatekeeperRequestContext(
+        this.id, this.caller, this.sessionGuard);
+    let session: RpcStub<Session> | undefined;
+    try {
+      session = (await this.facet.startSession(
+          new ApprovalQueueImpl(this.impl, this.id, this.caller, this.sessionGuard),
+          requestContext)) as unknown as RpcStub<Session>;
+      await this.impl.assertGatekeeperAppAccess(this.id);
+      this.sessionGuard?.assertValid();
+      return session;
+    } catch (error) {
+      session?.[Symbol.dispose]();
+      throw error;
+    } finally {
+      this.impl.disposeGatekeeperRequestContext(requestContext);
+    }
   }
 
   async getCreationSpec(): Promise<GatekeeperCreationSpec> {
-    let record = this.#getRecord();
+    let record = await this.impl.assertGatekeeperAppAccess(this.id);
     if (!record.creationSpec) {
       throw new Error("This gatekeeper has no creation spec (created before blueprint support).");
     }
@@ -12179,14 +12659,30 @@ class SlashCommandAuthorizerImpl extends NativeRpcTarget implements ObservationA
   authorizeObservation(description: ObservationDescription): Promise<void> {
     return this.impl.authorizeObservation(this.gatekeeperId, description, this.caller);
   }
+  async assertAppAccess(): Promise<void> {
+    await this.impl.assertGatekeeperCallerAccess(this.gatekeeperId, this.caller);
+  }
+
 }
 
 @validateRpc()
 class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
-  constructor(private impl: OverseerImpl, private gatekeeperId: number,
-              private caller: GatekeeperCaller) {
+  private implementation: OverseerImpl;
+
+  constructor(impl: OverseerImpl, private gatekeeperId: number,
+              private caller: GatekeeperCaller, private sessionGuard?: HumanSessionGuard) {
     super();
+    this.implementation = impl;
   }
+
+  private get impl(): OverseerImpl {
+    this.sessionGuard?.assertValid();
+    return this.implementation;
+  }
+  async assertAppAccess(): Promise<void> {
+    await this.impl.assertGatekeeperCallerAccess(this.gatekeeperId, this.caller);
+  }
+
 
   authorizeObservation(description: ObservationDescription): Promise<void> {
     return this.impl.authorizeObservation(this.gatekeeperId, description, this.caller);

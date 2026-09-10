@@ -37,12 +37,14 @@ import {
 import type { ComponentProps, ReactElement, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type {
+  CollectionGrant,
   ContextCollectionContent,
   ContextCollectionMetadata,
-  ContextCollectionVisibility,
+  ContextCollectionRole,
   ContextDocumentSummary,
   ContextGitTokenCreateResult,
   ContextGitTokenInfo,
+  DirectoryAudienceTargets,
   EnabledCollectionInfo,
 } from "../src/context-types";
 import {
@@ -155,6 +157,55 @@ function fileToBase64(file: File): Promise<string> {
 
 function dataUri(contentType: string, base64Body: string): string {
   return `data:${contentType};base64,${base64Body}`;
+}
+type CollectionAccess = {
+  role: Exclude<ContextCollectionRole, "none">;
+  sources: string[];
+};
+
+function newMutationId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function roleLabel(role: ContextCollectionRole | "none"): string {
+  switch (role) {
+    case "owner":
+      return "Owner";
+    case "editor":
+      return "Editor";
+    case "reader":
+      return "Reader";
+    default:
+      return "No access";
+  }
+}
+
+function accessSources(access: CollectionAccess | null | undefined): string {
+  if (access?.role === "owner") return "Owner";
+  if (!access?.sources.length) return "Direct grant";
+  let groupCount = access.sources.filter(source => source.startsWith("group:")).length;
+  let labels = [
+    ...(access.sources.includes("everyone") ? ["Everyone"] : []),
+    ...(groupCount > 0 ? [`${groupCount} group grant${groupCount === 1 ? "" : "s"}`] : []),
+    ...(access.sources.some(source => source.startsWith("user:")) ? ["Direct grant"] : []),
+  ];
+  return labels.join(", ") || "Direct grant";
+}
+
+function grantTargetLabel(
+  grant: CollectionGrant,
+  targets: DirectoryAudienceTargets | null,
+): string {
+  if (grant.targetType === "everyone") return "Everyone";
+  if (grant.targetType === "user") {
+    return targets?.users.find((user) => user.userId === grant.targetId)?.displayName
+      ?? "Inactive user";
+  }
+  return targets?.groups.find((group) => group.groupId === grant.targetId)?.name
+    ?? "Inactive group";
 }
 
 const DEFAULT_COLLECTION_ICON = "📚";
@@ -301,24 +352,6 @@ function IconPickerButton({
 // Layout primitives
 // ---------------------------------------------------------------------------
 
-// Provenance for a row, framed as authorship: public collections are admin-published (and always
-// on), the rest are ones the user created.
-function CollectionProvenance({ source }: { source: EnabledCollectionInfo["source"] }) {
-  const isPublic = source === "public";
-  return (
-    <span
-      className="flex w-52 items-center gap-1 whitespace-nowrap"
-      title={
-        isPublic
-          ? "Provided by your organization for everyone"
-          : "A collection you created"
-      }
-    >
-      {isPublic ? <Buildings size={11} /> : <User size={11} />}
-      {isPublic ? "Required by your organization" : "Created by you"}
-    </span>
-  );
-}
 
 // Tile dimensions + matching fallback-book glyph size, keyed together so they can't drift.
 const ICON_TILE_SIZES = {
@@ -392,9 +425,17 @@ function CollectionRow({
           {hasDescription ? collection.description : "No description"}
         </p>
       </div>
-      {/* Fixed-width meta columns so rows line up like a table. */}
       <div className="hidden shrink-0 items-center gap-6 text-xs text-kumo-inactive lg:flex">
-        <CollectionProvenance source={collection.source} />
+        <span className="flex w-20 items-center gap-1 whitespace-nowrap" title={`Effective access: ${roleLabel(collection.role)}`}>
+          {collection.role === "owner" ? <Lock size={11} /> : <User size={11} />}
+          {roleLabel(collection.role)}
+        </span>
+        <span
+          className="flex w-44 items-center gap-1 whitespace-nowrap truncate"
+          title={`Access sources: ${accessSources(collection)}`}
+        >
+          <span className="truncate">{accessSources(collection)}</span>
+        </span>
         <span className="flex w-16 items-center justify-end gap-1 whitespace-nowrap">
           <Clock size={10} />
           {formatRelativeTime(collection.lastUpdated)}
@@ -666,21 +707,6 @@ function DeletePermanentlyDescription({
   );
 }
 
-// Visibility choices (admins only — non-admins can only make private collections).
-const VISIBILITY_OPTIONS = [
-  {
-    value: "private" as const,
-    Icon: Lock,
-    title: "Only me",
-    description: "Private to your account. Only you can view and edit it.",
-  },
-  {
-    value: "public" as const,
-    Icon: Buildings,
-    title: "Everyone",
-    description: "Shared across your organization and turned on for all users.",
-  },
-];
 
 const CONTENT_SOURCE_OPTIONS = [
   {
@@ -710,12 +736,9 @@ function CreateCollectionView({
   const toasts = useKumoToastManager();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [visibility, setVisibility] = useState<ContextCollectionVisibility>("private");
   const [source, setSource] = useState<ContextCollectionContent["source"]>("web");
   const [icon, setIcon] = useState(DEFAULT_COLLECTION_ICON);
   const [creating, setCreating] = useState(false);
-  // Only admins may create public collections.
-  const [isAdmin, setIsAdmin] = useState(false);
   const [supportsGitCollections, setSupportsGitCollections] = useState(false);
 
   useEffect(() => {
@@ -723,35 +746,37 @@ function CreateCollectionView({
     context
       .getViewerInfo()
       .then((info) => {
-        if (!cancelled) {
-          setIsAdmin(info.isAdmin);
-          setSupportsGitCollections(info.supportsGitCollections);
-        }
+        if (!cancelled) setSupportsGitCollections(info.supportsGitCollections);
       })
       .catch(() => {
-        if (!cancelled) {
-          setIsAdmin(false);
-          setSupportsGitCollections(false);
-        }
+        if (!cancelled) setSupportsGitCollections(false);
       });
     return () => {
       cancelled = true;
     };
   }, [context]);
 
+  const mutationRef = useRef<{ payloadKey: string; mutationId: string } | null>(null);
+
   const handleCreate = async () => {
     if (!title.trim() || creating) return;
     setCreating(true);
+    const payload = {
+      title: title.trim(),
+      description: description.trim(),
+      icon,
+      source,
+    };
+    const payloadKey = JSON.stringify(payload);
     try {
-      const metadata = await context.createContextCollection(
-        title.trim(),
-        description.trim(),
-        visibility,
-        icon,
-        source,
-      );
+      const pending = mutationRef.current;
+      const mutationId =
+        pending?.payloadKey === payloadKey ? pending.mutationId : newMutationId();
+      mutationRef.current = { payloadKey, mutationId };
+      const result = await context.createCollection({ ...payload, mutationId });
+      mutationRef.current = null;
       toasts.add({ title: "Collection created", variant: "success" });
-      onCreated(metadata.id);
+      onCreated(result.collectionId);
     } catch {
       toasts.add({ title: "Failed to create collection", variant: "error" });
       setCreating(false);
@@ -792,6 +817,10 @@ function CreateCollectionView({
             </div>
             <div className="ctx-rise" style={{ animationDelay: "120ms" }}>
               <CollectionDescriptionField value={description} onChange={setDescription} />
+            <p className="ctx-rise flex items-start gap-2 text-[12px] leading-4 text-kumo-subtle" style={{ animationDelay: "140ms" }}>
+              <Lock size={14} className="mt-0.5 shrink-0" />
+              New collections are private to you. You can share them with active users or groups after creation.
+            </p>
             </div>
             {supportsGitCollections && (
               <div className="ctx-rise" style={{ animationDelay: "160ms" }}>
@@ -811,54 +840,6 @@ function CreateCollectionView({
                         role="radio"
                         aria-checked={selected}
                         onClick={() => setSource(value)}
-                        className={`press flex items-start gap-3 rounded-xl border-2 px-3 py-2.5 text-left transition-[border-color,background-color] duration-150 ease-out ${
-                          selected
-                            ? "border-kumo-brand/50 bg-kumo-brand/[0.05]"
-                            : "border-kumo-line bg-kumo-base hover:border-kumo-ring/60"
-                        }`}
-                      >
-                        <Icon
-                          size={16}
-                          weight={selected ? "fill" : "regular"}
-                          className={`mt-0.5 shrink-0 ${selected ? "text-kumo-brand" : "text-kumo-subtle"}`}
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
-                            {optionTitle}
-                          </span>
-                          <span className="mt-0.5 block text-[12px] leading-4 tracking-[-0.2px] text-kumo-subtle">
-                            {optionDescription}
-                          </span>
-                        </span>
-                        <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
-                          {selected && (
-                            <Check size={13} weight="bold" className="text-kumo-brand" />
-                          )}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            {isAdmin && (
-              <div className="ctx-rise" style={{ animationDelay: "200ms" }}>
-                <FieldLabel>Visibility</FieldLabel>
-                <div role="radiogroup" aria-label="Visibility" className="grid gap-2">
-                  {VISIBILITY_OPTIONS.map(({
-                    value,
-                    Icon,
-                    title: optionTitle,
-                    description: optionDescription,
-                  }) => {
-                    const selected = visibility === value;
-                    return (
-                      <button
-                        key={value}
-                        type="button"
-                        role="radio"
-                        aria-checked={selected}
-                        onClick={() => setVisibility(value)}
                         className={`press flex items-start gap-3 rounded-xl border-2 px-3 py-2.5 text-left transition-[border-color,background-color] duration-150 ease-out ${
                           selected
                             ? "border-kumo-brand/50 bg-kumo-brand/[0.05]"
@@ -962,7 +943,8 @@ export default function ContextLibraryPage() {
   }, [loadAll]);
 
   const searchLower = search.toLowerCase();
-  // One combined list: public (org) collections first, then your own, each alphabetical.
+  // One ACL-filtered list, ordered by effective role then title. The registry never supplies rows
+  // that the current Subject cannot access.
   const filtered = useMemo(
     () =>
       enabled
@@ -973,8 +955,8 @@ export default function ContextLibraryPage() {
             c.description.toLowerCase().includes(searchLower),
         )
         .sort((a, b) => {
-          if (a.source !== b.source) return a.source === "public" ? -1 : 1;
-          return a.title.localeCompare(b.title);
+          const rank = { owner: 0, editor: 1, reader: 2 } as const;
+          return rank[a.role] - rank[b.role] || a.title.localeCompare(b.title);
         }),
     [enabled, searchLower],
   );
@@ -1122,28 +1104,33 @@ function MetaField({
   );
 }
 
-// The collection overview — identity, description, and metadata shown in the detail pane when no
-// file is selected. Collection-level actions (edit/delete) live on the index's ⋮ menu.
+// The collection overview — identity, role/sources, and metadata shown in the detail pane when no
+// file is selected. Collection-level actions are owner-only.
 function CollectionOverview({
   metadata,
-  canWrite,
+  access,
+  canManage,
+  canEditDocuments,
   supportsGitCollections,
   refreshingSource,
   onRefreshSource,
+  onManageAccess,
   onEditDetails,
   onManageGitTokens,
   onDelete,
 }: {
   metadata: ContextCollectionMetadata;
-  canWrite: boolean;
+  access: CollectionAccess;
+  canManage: boolean;
+  canEditDocuments: boolean;
   supportsGitCollections: boolean;
   refreshingSource: boolean;
   onRefreshSource: () => void;
+  onManageAccess: () => void;
   onEditDetails: () => void;
   onManageGitTokens: () => void;
   onDelete: () => void;
 }) {
-  const isPublic = metadata.visibility === "public";
   const isSynced = metadata.content.source === "git";
   return (
     <div className="ctx-scroll @container min-h-0 flex-1 overflow-auto">
@@ -1161,8 +1148,16 @@ function CollectionOverview({
                 </p>
               </div>
             </div>
-            {canWrite && (
+            {canManage && (
               <div className="flex shrink-0 items-center gap-2">
+                <WorkshopButton
+                  tone="secondary"
+                  className="h-9!"
+                  onClick={onManageAccess}
+                >
+                  <User size={14} className="mr-1.5" />
+                  Share
+                </WorkshopButton>
                 {isSynced && supportsGitCollections && (
                   <WorkshopButton
                     tone="secondary"
@@ -1176,6 +1171,7 @@ function CollectionOverview({
                 <CollectionOptionsMenu
                   isSynced={isSynced}
                   supportsGitCollections={supportsGitCollections}
+                  onManageAccess={onManageAccess}
                   onEditDetails={onEditDetails}
                   onManageGitTokens={onManageGitTokens}
                   onDelete={onDelete}
@@ -1185,14 +1181,17 @@ function CollectionOverview({
           </div>
 
           <div className="mt-9 grid grid-cols-2 gap-x-8 gap-y-5 @xl:grid-cols-4">
-            <MetaField label="Source">
+            <MetaField label="Role">
               <span className="inline-flex items-center gap-1.5">
-                {isPublic ? <Buildings size={12} className="shrink-0" /> : <User size={12} className="shrink-0" />}
-                {isPublic ? "Your organization" : "You"}
+                {access.role === "owner" ? <Lock size={12} className="shrink-0" /> : <User size={12} className="shrink-0" />}
+                {roleLabel(access.role)}
               </span>
             </MetaField>
-            <MetaField label="Access">
-              {isPublic ? "Everyone (required)" : "Private to you"}
+            <MetaField label="Access sources">
+              <span title={accessSources(access)}>{accessSources(access)}</span>
+            </MetaField>
+            <MetaField label="Content">
+              {isSynced ? "Git mirror" : "Web documents"}
             </MetaField>
             <MetaField label="Documents">{metadata.documentCount}</MetaField>
             <MetaField label={isSynced ? "Refreshed" : "Updated"} align="right">
@@ -1244,7 +1243,7 @@ function CollectionOverview({
                     ? supportsGitCollections
                       ? "This git mirror is empty. Mirror content from git, then refresh."
                       : "No Git content was cached before synchronization became unavailable."
-                    : canWrite
+                    : canEditDocuments
                     ? "Use the + in the Files panel to create or upload skills or files. Agents use the names and descriptions to decide what to read."
                     : "This collection is empty."}
                 </p>
@@ -1260,12 +1259,14 @@ function CollectionOverview({
 function CollectionOptionsMenu({
   isSynced,
   supportsGitCollections,
+  onManageAccess,
   onEditDetails,
   onManageGitTokens,
   onDelete,
 }: {
   isSynced: boolean;
   supportsGitCollections: boolean;
+  onManageAccess: () => void;
   onEditDetails: () => void;
   onManageGitTokens: () => void;
   onDelete: () => void;
@@ -1282,6 +1283,13 @@ function CollectionOptionsMenu({
         </WorkshopIconButton>
       }
     >
+      <DropdownMenu.Item
+        icon={<User size={13} className="mr-2" />}
+        onClick={onManageAccess}
+        className={MENU_ITEM}
+      >
+        Share
+      </DropdownMenu.Item>
       <DropdownMenu.Item
         icon={<PencilSimple size={13} className="mr-2" />}
         onClick={onEditDetails}
@@ -1309,6 +1317,260 @@ function CollectionOptionsMenu({
     </KebabMenu>
   );
 }
+
+// Owner-only ACL management. Target options come from the live directory projection returned by
+// listAccessTargets(); the UI never accepts a caller-supplied Subject, group, or admin flag.
+function CollectionSharingModal({
+  open,
+  collectionId,
+  onClose,
+}: {
+  open: boolean;
+  collectionId: string;
+  onClose: () => void;
+}) {
+  const context = useContextApi();
+  const toasts = useKumoToastManager();
+  const toastsRef = useRef(toasts);
+  toastsRef.current = toasts;
+  const { presenting, onOpenChangeComplete } = usePresentWhileOpen(open);
+  const [targets, setTargets] = useState<DirectoryAudienceTargets | null>(null);
+  const [grants, setGrants] = useState<CollectionGrant[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [selectedType, setSelectedType] = useState<"everyone" | "user" | "group">("user");
+  const [selectedId, setSelectedId] = useState("");
+  const [selectedRole, setSelectedRole] = useState<"reader" | "editor">("reader");
+  const mutationIds = useRef(new Map<string, string>());
+
+  const loadAccess = useCallback(async () => {
+    if (!open) return;
+    setLoading(true);
+    try {
+      const [nextTargets, nextGrants] = await Promise.all([
+        context.listAccessTargets(),
+        context.listAccess(collectionId),
+      ]);
+      setTargets(nextTargets);
+      setGrants(nextGrants);
+    } catch {
+      setTargets(null);
+      setGrants([]);
+      toastsRef.current.add({ title: "Sharing is unavailable", variant: "error" });
+    } finally {
+      setLoading(false);
+    }
+  }, [collectionId, context, open]);
+
+  useEffect(() => {
+    if (open) {
+      setSelectedType("user");
+      setSelectedId("");
+      setSelectedRole("reader");
+      setTargets(null);
+      setGrants([]);
+      void loadAccess();
+    }
+  }, [loadAccess, open]);
+
+  const selectedTargetAvailable =
+    !!targets &&
+    (selectedType === "everyone" ||
+      (selectedType === "user"
+        ? targets.users.some((user) => user.userId === selectedId)
+        : targets.groups.some((group) => group.groupId === selectedId)));
+  const selectedRoleForMutation = selectedType === "everyone" ? "reader" : selectedRole;
+  const selectedMutationKey = `set:${selectedType}:${selectedId}:${selectedRoleForMutation}`;
+
+  const setAccess = async () => {
+    if (!selectedTargetAvailable || saving) return;
+    setSaving(true);
+    const mutationId = mutationIds.current.get(selectedMutationKey) ?? newMutationId();
+    mutationIds.current.set(selectedMutationKey, mutationId);
+    try {
+      await context.setAccess({
+        collectionId,
+        targetType: selectedType,
+        targetId: selectedType === "everyone" ? "" : selectedId,
+        role: selectedRoleForMutation,
+        mutationId,
+      });
+      mutationIds.current.delete(selectedMutationKey);
+      toastsRef.current.add({ title: "Access updated", variant: "success" });
+      await loadAccess();
+    } catch {
+      toastsRef.current.add({ title: "Failed to update access", variant: "error" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeGrant = async (grant: CollectionGrant) => {
+    if (saving) return;
+    setSaving(true);
+    const mutationKey = `remove:${grant.key}`;
+    const mutationId = mutationIds.current.get(mutationKey) ?? newMutationId();
+    mutationIds.current.set(mutationKey, mutationId);
+    try {
+      await context.removeAccess({
+        collectionId,
+        targetType: grant.targetType,
+        targetId: grant.targetId,
+        mutationId,
+      });
+      mutationIds.current.delete(mutationKey);
+      toastsRef.current.add({ title: "Access removed", variant: "success" });
+      await loadAccess();
+    } catch {
+      toastsRef.current.add({ title: "Failed to remove access", variant: "error" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const targetOptions =
+    selectedType === "user"
+      ? (targets?.users ?? []).map((user) => ({ id: user.userId, label: user.displayName }))
+      : (targets?.groups ?? []).map((group) => ({ id: group.groupId, label: group.name }));
+
+  return (
+    <Dialog.Root
+      open={open && presenting}
+      onOpenChange={(next: boolean) => {
+        if (!saving && !next) onClose();
+      }}
+      onOpenChangeComplete={onOpenChangeComplete}
+    >
+      <Dialog
+        className="z-[1000]! w-[min(620px,calc(100vw-32px))]! overflow-visible bg-kumo-base p-0 top-[10%]! translate-y-0!"
+        size="sm"
+      >
+        <ModalHeader
+          title="Share collection"
+          description="Grant active users or groups reader access by default, or explicitly choose editor access."
+        />
+        <div className="space-y-5 px-4 py-5 sm:px-6">
+          <section className="space-y-2">
+            <FieldLabel>Share with</FieldLabel>
+            <div className="grid gap-2 sm:grid-cols-[130px_minmax(0,1fr)]">
+              <select
+                value={selectedType}
+                onChange={(e) => {
+                  const next = e.target.value as "everyone" | "user" | "group";
+                  setSelectedType(next);
+                  setSelectedId("");
+                  setSelectedRole("reader");
+                }}
+                disabled={loading || saving}
+                className="h-9 rounded-lg border border-kumo-line bg-kumo-base px-2.5 text-[13px] text-kumo-default focus:border-kumo-ring focus:outline-none"
+                aria-label="Share target type"
+              >
+                <option value="user">Active user</option>
+                <option value="group">Active group</option>
+                <option value="everyone">Everyone</option>
+              </select>
+              {selectedType === "everyone" ? (
+                <div className="flex h-9 items-center rounded-lg border border-kumo-line bg-kumo-fill px-2.5 text-[13px] text-kumo-default">
+                  Everyone in this organization
+                </div>
+              ) : (
+                <select
+                  value={selectedId}
+                  onChange={(e) => {
+                    setSelectedId(e.target.value);
+                    setSelectedRole("reader");
+                  }}
+                  disabled={loading || saving || !targets}
+                  className="h-9 min-w-0 rounded-lg border border-kumo-line bg-kumo-base px-2.5 text-[13px] text-kumo-default focus:border-kumo-ring focus:outline-none"
+                  aria-label={selectedType === "user" ? "Active user" : "Active group"}
+                >
+                  <option value="">
+                    {loading
+                      ? "Loading active targets…"
+                      : targetOptions.length
+                        ? "Choose a target…"
+                        : "No active targets"}
+                  </option>
+                  {targetOptions.map((target) => (
+                    <option key={target.id} value={target.id}>
+                      {target.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <FieldLabel>Role</FieldLabel>
+              <select
+                value={selectedType === "everyone" ? "reader" : selectedRole}
+                onChange={(e) => setSelectedRole(e.target.value as "reader" | "editor")}
+                disabled={selectedType === "everyone" || loading || saving}
+                className="h-8 rounded-lg border border-kumo-line bg-kumo-base px-2 text-[12px] text-kumo-default focus:border-kumo-ring focus:outline-none"
+                aria-label="Granted role"
+              >
+                <option value="reader">Reader</option>
+                <option value="editor">Editor</option>
+              </select>
+              <WorkshopButton
+                tone="primary"
+                className="ml-auto h-8!"
+                onClick={() => void setAccess()}
+                loading={saving}
+                disabled={!selectedTargetAvailable || loading}
+              >
+                Grant access
+              </WorkshopButton>
+            </div>
+          </section>
+
+          <section>
+            <FieldLabel>Current access</FieldLabel>
+            <div className="mt-2 overflow-hidden rounded-lg border border-kumo-line">
+              {loading ? (
+                <p className="px-3 py-3 text-[12px] text-kumo-subtle">Loading grants…</p>
+              ) : grants.length === 0 ? (
+                <p className="px-3 py-3 text-[12px] text-kumo-subtle">
+                  Only you can access this collection.
+                </p>
+              ) : (
+                <div className="divide-y divide-kumo-line">
+                  {grants.map((grant) => (
+                    <div key={grant.key} className="flex items-center gap-3 px-3 py-2">
+                      <div className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-kumo-fill text-kumo-subtle">
+                        {grant.targetType === "group" ? <Buildings size={14} /> : <User size={14} />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[13px] text-kumo-default">
+                          {grantTargetLabel(grant, targets)}
+                        </p>
+                        <p className="text-[11px] text-kumo-subtle">{roleLabel(grant.role)}</p>
+                      </div>
+                      <WorkshopIconButton
+                        aria-label={`Remove access for ${grantTargetLabel(grant, targets)}`}
+                        title="Remove access"
+                        className="!h-7 !w-7 text-kumo-subtle hover:bg-kumo-danger-tint hover:text-kumo-danger"
+                        onClick={() => void removeGrant(grant)}
+                        disabled={saving}
+                      >
+                        <X size={14} />
+                      </WorkshopIconButton>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-kumo-line px-4 py-3 sm:px-6">
+          <WorkshopButton tone="secondary" className="h-9!" disabled={saving} onClick={onClose}>
+            Close
+          </WorkshopButton>
+        </div>
+      </Dialog>
+    </Dialog.Root>
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // Collection Settings modal (edit metadata + delete)
@@ -1573,8 +1835,8 @@ function GitTokenManagementModal({
     try {
       const result = await context.listContextCollectionGitTokens(collectionId);
       setGitTokens(result.tokens);
-    } catch (err) {
-      toastsRef.current.add({ title: `Failed to load Git tokens: ${(err as Error).message}`, variant: "error" });
+    } catch {
+      toastsRef.current.add({ title: "Failed to load Git tokens", variant: "error" });
     } finally {
       setLoadingTokens(false);
     }
@@ -1591,8 +1853,8 @@ function GitTokenManagementModal({
       setNewGitToken(token);
       await loadGitTokens();
       toasts.add({ title: "Git token created", variant: "success" });
-    } catch (err) {
-      toasts.add({ title: `Failed to create Git token: ${(err as Error).message}`, variant: "error" });
+    } catch {
+      toasts.add({ title: "Failed to create Git token", variant: "error" });
     } finally {
       setCreatingToken(false);
     }
@@ -1604,8 +1866,8 @@ function GitTokenManagementModal({
       await context.revokeContextCollectionGitToken(collectionId, tokenId);
       await loadGitTokens();
       toasts.add({ title: "Git token revoked", variant: "success" });
-    } catch (err) {
-      toasts.add({ title: `Failed to revoke Git token: ${(err as Error).message}`, variant: "error" });
+    } catch {
+      toasts.add({ title: "Failed to revoke Git token", variant: "error" });
     } finally {
       setRevokingToken(null);
     }
@@ -2058,7 +2320,7 @@ function FolderView({
 
       {open && (
         <div
-          {...(isRoot ? dropHandlers : {})}
+          {...(isRoot && ctx.canWrite ? dropHandlers : {})}
           className={
             isRoot && isDragOver ? "rounded-md ring-1 ring-kumo-brand/40" : ""
           }
@@ -2189,16 +2451,19 @@ function CollectionEditor({
   const [metadata, setMetadata] = useState<ContextCollectionMetadata | null>(
     null,
   );
+  const [access, setAccess] = useState<CollectionAccess | null>(null);
   const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsMode, setSettingsMode] = useState<"edit" | "delete">("edit");
   const [gitTokensOpen, setGitTokensOpen] = useState(false);
+  const [sharingOpen, setSharingOpen] = useState(false);
   const openSettings = (m: "edit" | "delete") => {
     setSettingsMode(m);
     setSettingsOpen(true);
   };
-  // Default read-only until access loads so edit controls never flash to viewers.
-  const [canWrite, setCanWrite] = useState(false);
+  // Default to no controls until access loads so edit/share controls never flash to viewers.
+  const canManage = access?.role === "owner";
   const [supportsGitCollections, setSupportsGitCollections] = useState(false);
   const [refreshingSource, setRefreshingSource] = useState(false);
 
@@ -2249,43 +2514,55 @@ function CollectionEditor({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dirInputRef = useRef<HTMLInputElement>(null);
-  const canEditDocuments = canWrite && metadata?.content.source !== "git";
+  const canEditDocuments =
+    !!metadata &&
+    (access?.role === "owner" || access?.role === "editor") &&
+    metadata.content.source !== "git";
 
   const loadDocs = useCallback(async () => {
     try {
-      const [meta, list, writable, viewer] = await Promise.all([
+      const [meta, list, currentAccess, viewer] = await Promise.all([
         context.getContextCollectionMetadata(collectionId),
         context.listContextDocuments(collectionId),
-        context.canWriteContextCollection(collectionId),
+        context.getMyAccess(collectionId),
         context.getViewerInfo(),
       ]);
+      if (!meta) {
+        setMetadata(null);
+        setAccess(null);
+        setUnavailable(true);
+        return;
+      }
       setMetadata(meta);
       setDocs(list);
-      setCanWrite(writable);
+      setAccess(currentAccess);
+      setUnavailable(false);
       setSupportsGitCollections(viewer.supportsGitCollections);
-    } catch (err) {
-      console.error("Failed to load documents:", err);
+    } catch {
+      setMetadata(null);
+      setAccess(null);
+      setUnavailable(true);
     } finally {
       setLoading(false);
     }
   }, [context, collectionId]);
-
   useEffect(() => {
-    loadDocs();
+    void loadDocs();
   }, [loadDocs]);
-
   const handleRefreshArtifactSource = async () => {
+    if (!canManage) return;
     setRefreshingSource(true);
     try {
       await context.syncContextCollectionArtifactSource(collectionId);
       await loadDocs();
       toasts.add({ title: "Collection refreshed", variant: "success" });
-    } catch (err) {
-      toasts.add({ title: `Failed to refresh: ${(err as Error).message}`, variant: "error" });
+    } catch {
+      toasts.add({ title: "Failed to refresh collection", variant: "error" });
     } finally {
       setRefreshingSource(false);
     }
   };
+
 
   useEffect(() => {
     if (!selectedPath) return;
@@ -2389,9 +2666,9 @@ function CollectionEditor({
     const dest = joinPath(dirName(renaming), newName);
     try {
       await relocate(renaming, dest);
-    } catch (err) {
+    } catch {
       toasts.add({
-        title: `Failed to rename: ${(err as Error).message}`,
+        title: "Failed to rename",
         variant: "error",
       });
     } finally {
@@ -2406,9 +2683,9 @@ function CollectionEditor({
     const dest = joinPath(targetDir, baseName(from));
     try {
       await relocate(from, dest);
-    } catch (err) {
+    } catch {
       toasts.add({
-        title: `Failed to move: ${(err as Error).message}`,
+        title: "Failed to move",
         variant: "error",
       });
     }
@@ -2532,8 +2809,8 @@ function CollectionEditor({
     moveTo,
   };
 
-  // The collection is gone (deleted by an admin) or no longer accessible.
-  if (!loading && !metadata) {
+  // Direct selectors for a missing or invisible collection share one safe coded NOT_FOUND surface.
+  if (!loading && (unavailable || !metadata || !access)) {
     return (
       <div className="h-full bg-kumo-base px-5 py-4 sm:px-8">
         <div className="mx-auto max-w-[520px]">
@@ -2547,10 +2824,10 @@ function CollectionEditor({
           <div className="rounded-xl border border-kumo-line bg-kumo-base px-5 py-10 text-center shadow-[0_1px_2px_rgba(20,17,16,0.03)]">
             <BookOpen size={32} className="mx-auto mb-3 text-kumo-subtle" />
             <p className="m-0 text-[15px] leading-5 font-medium tracking-[-0.25px] text-kumo-default">
-              This collection is no longer available
+              Collection not found
             </p>
             <p className="mt-1 text-[13px] leading-[18px] font-normal tracking-[-0.25px] text-kumo-subtle">
-              It may have been deleted.
+              This collection may have been deleted or you may no longer have access.
             </p>
           </div>
         </div>
@@ -2560,20 +2837,27 @@ function CollectionEditor({
 
   return (
     <div className="ctx-rise flex h-full w-full min-w-0 overflow-hidden bg-kumo-base">
-      {metadata && (
-        <CollectionSettingsModal
-          open={settingsOpen}
-          initialMode={settingsMode}
-          metadata={metadata}
-          supportsGitCollections={supportsGitCollections}
-          collectionId={collectionId}
-          onClose={() => setSettingsOpen(false)}
-          onUpdated={loadDocs}
-          onDeleted={onBack}
-        />
+      {metadata && canManage && (
+        <>
+          <CollectionSettingsModal
+            open={settingsOpen}
+            initialMode={settingsMode}
+            metadata={metadata}
+            supportsGitCollections={supportsGitCollections}
+            collectionId={collectionId}
+            onClose={() => setSettingsOpen(false)}
+            onUpdated={loadDocs}
+            onDeleted={onBack}
+          />
+          <CollectionSharingModal
+            open={sharingOpen}
+            collectionId={collectionId}
+            onClose={() => setSharingOpen(false)}
+          />
+        </>
       )}
 
-      {metadata?.content.source === "git" && supportsGitCollections && (
+      {canManage && metadata?.content.source === "git" && supportsGitCollections && (
         <GitTokenManagementModal
           open={gitTokensOpen}
           collectionId={collectionId}
@@ -2669,11 +2953,12 @@ function CollectionEditor({
                     {metadata.title}
                   </span>
                 </button>
-                {canWrite && (
+                {canManage && (
                   <div className="pr-1 sm:hidden">
                     <CollectionOptionsMenu
                       isSynced={metadata.content.source === "git"}
                       supportsGitCollections={supportsGitCollections}
+                      onManageAccess={() => setSharingOpen(true)}
                       onEditDetails={() => openSettings("edit")}
                       onManageGitTokens={() => setGitTokensOpen(true)}
                       onDelete={() => openSettings("delete")}
@@ -2765,7 +3050,7 @@ function CollectionEditor({
                   ? supportsGitCollections
                     ? "No files yet. Mirror content from git, then refresh."
                     : "No Git content was cached before synchronization became unavailable."
-                  : canWrite ? "No files yet. Use + to create or upload skills or files." : "No files yet."}
+                  : canEditDocuments ? "No files yet. Use + to create or upload skills or files." : "No files yet."}
               </p>
             ) : (
               <FolderView folder={tree} depth={0} ctx={ctx} />
@@ -2803,13 +3088,16 @@ function CollectionEditor({
                 />
               </div>
             </>
-          ) : metadata ? (
+          ) : metadata && access ? (
             <CollectionOverview
               metadata={metadata}
-              canWrite={canWrite}
+              access={access}
+              canManage={canManage}
+              canEditDocuments={canEditDocuments}
               supportsGitCollections={supportsGitCollections}
               refreshingSource={refreshingSource}
               onRefreshSource={handleRefreshArtifactSource}
+              onManageAccess={() => setSharingOpen(true)}
               onEditDetails={() => openSettings("edit")}
               onManageGitTokens={() => setGitTokensOpen(true)}
               onDelete={() => openSettings("delete")}
@@ -3061,11 +3349,11 @@ function DocumentEditor({
       }
       // Also clears loading for not-found.
       setLoading(false);
-    }).catch((err) => {
+    }).catch(() => {
       if (cancelled) return;
       setLoading(false);
       toasts.add({
-        title: `Failed to load document: ${(err as Error).message}`,
+        title: "Failed to load document",
         variant: "error",
       });
     });
@@ -3128,8 +3416,8 @@ function DocumentEditor({
       if (isText && dirty) await save();
       await context.moveContextDocument(collectionId, path, newPath);
       onRenamed(newPath);
-    } catch (err) {
-      toasts.add({ title: `Rename failed: ${(err as Error).message}`, variant: "error" });
+    } catch {
+      toasts.add({ title: "Rename failed", variant: "error" });
       setFilename(baseName(path));
     } finally {
       setRenaming(false);

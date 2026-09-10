@@ -6,6 +6,7 @@ import {
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
   GatekeeperUserVerifier, ObservationDescription,
   stripTrailingSlashes,
+  type AppUiContext, type GatekeeperVerifierContext, type VerifierAppAuthority,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, exchangeAuthCode,
@@ -605,24 +606,37 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
     throw new Error(`Unsupported Slack resource URL: ${url}`);
   }
 
-  async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  async startResourceConfigurator(
+    resourceUrlPattern: string,
+    context: AppUiContext,
+  ): Promise<ResourceConfiguratorFrame> {
+    const authority = context.authority;
+    if (!authority) throw new Error("Slack app authority is unavailable.");
+    await authority.assertAppAccess();
+
     if (resourceUrlPattern === WORKSPACE_RESOURCE.urlPattern) {
+      let configuratorAuthority = authority.dup();
       return {
         iframeHtml: WORKSPACE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new WorkspaceConfiguratorUI(this.#api())),
+        ui: new RpcStub(new WorkspaceConfiguratorUI(
+            this.#api().withAppAccessGuard(() => configuratorAuthority.assertAppAccess()),
+            configuratorAuthority)),
       };
     }
     if (resourceUrlPattern === CONVERSATION_RESOURCE.urlPattern) {
       let teamId = await this.#account().getTeamId();
+      let configuratorAuthority = authority.dup();
       return {
         iframeHtml: CONVERSATION_CONFIGURATOR_HTML,
-        ui: new RpcStub(new ConversationConfiguratorUI(this.#api(), teamId)),
+        ui: new RpcStub(new ConversationConfiguratorUI(
+          this.#api().withAppAccessGuard(() => configuratorAuthority.assertAppAccess()),
+          teamId, configuratorAuthority)),
       };
     }
     if (resourceUrlPattern === THREAD_RESOURCE.urlPattern) {
       return {
         iframeHtml: THREAD_CONFIGURATOR_HTML,
-        ui: new RpcStub(new ThreadConfiguratorUI()),
+        ui: new RpcStub(new ThreadConfiguratorUI(authority.dup())),
       };
     }
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
@@ -659,8 +673,11 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
    * checks run against the observer's *own* Slack token.
    */
   @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    let props: SlackVerifierProps = { userObjectId: this.ctx.props.userObjectId };
+  async getVerifier(context: GatekeeperVerifierContext): Promise<Fetcher<GatekeeperUserVerifier>> {
+    let props: SlackVerifierProps = {
+      userObjectId: this.ctx.props.userObjectId,
+      authority: context.authority,
+    };
     return this.ctx.exports.SlackVerifier({ props });
   }
 }
@@ -681,6 +698,7 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
 
 type SlackVerifierProps = {
   userObjectId: string;
+  authority: Fetcher<VerifierAppAuthority>;
 };
 
 /**
@@ -698,7 +716,9 @@ export class SlackVerifier extends WorkerEntrypoint<Env, SlackVerifierProps>
   #api(): SlackApi {
     let account = this.ctx.exports.UserAccount.get(
         this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
-    return new SlackApi(createAccessTokenGetter(() => account));
+    return new SlackApi(
+        createAccessTokenGetter(() => account),
+        () => this.ctx.props.authority.requireAppAccess());
   }
 
   /**
@@ -707,6 +727,7 @@ export class SlackVerifier extends WorkerEntrypoint<Env, SlackVerifierProps>
    * re-checked on their next open).
    */
   async getTeamId(): Promise<string | null> {
+    await this.ctx.props.authority.requireAppAccess();
     try {
       return (await this.#api().authedTeamId()) || null;
     } catch (error) {
@@ -716,6 +737,7 @@ export class SlackVerifier extends WorkerEntrypoint<Env, SlackVerifierProps>
   }
 
   async hasConversationAccess(conversationId: string): Promise<boolean> {
+    await this.ctx.props.authority.requireAppAccess();
     try {
       await this.#api().getConversationInfo(conversationId);
       return true;
@@ -741,13 +763,25 @@ type SlackSessionContext = {
   // Set for workspace bindings only: routes conversation-scoped observations through the gatekeeper
   // so it can record which conversations were revealed and exclude observers who cannot access them.
   // Undefined for single-unit conversation/thread bindings, whose whole resource is verified up
-  // front. Held by in-process reference (the session runs in the gatekeeper's own isolate), so it is
-  // copied — not duped — across dupSessionContext.
+  // front. Held by in-process reference (the session runs in the gatekeeper's own isolate); the API
+  // token getter and tracker are carried across dupSessionContext, while each child receives its own
+  // queue duplicate.
   tracker?: SlackWorkspaceGatekeeperImpl;
 };
 
+function makeSessionContext(
+    api: SlackApi, approvalQueue: RpcStub<ApprovalQueue>,
+    tracker?: SlackWorkspaceGatekeeperImpl): SlackSessionContext {
+  return {
+    api: api.withAppAccessGuard(() => approvalQueue.assertAppAccess()),
+    approvalQueue,
+    tracker,
+  };
+}
+
 function dupSessionContext(ctx: SlackSessionContext): SlackSessionContext {
-  return { api: ctx.api, approvalQueue: ctx.approvalQueue.dup(), tracker: ctx.tracker };
+  let approvalQueue = ctx.approvalQueue.dup();
+  return makeSessionContext(ctx.api, approvalQueue, ctx.tracker);
 }
 
 // Authorize a conversation-scoped observation. For workspace bindings this records the revealed
@@ -804,14 +838,21 @@ function validateSearchQuery(query: string): void {
 
 // ── Cursor ──────────────────────────────────────────────────────────
 
+type SlackCursorPage<T> = {
+  items: T[];
+  nextCursor?: string;
+  authorize(): Promise<void>;
+};
+
 // Each page is authorized before it can reach the caller.
 class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   #ctx: SlackSessionContext;
   #loadPage: (
     ctx: SlackSessionContext, cursor: string | undefined,
-  ) => Promise<{ items: T[]; nextCursor?: string }>;
+  ) => Promise<SlackCursorPage<T>>;
   #cursor: string | undefined;
   #exhausted = false;
+  #pending?: SlackCursorPage<T>;
   // Serialize concurrent next() calls so each consumes a distinct page.
   #tail: Promise<void> = Promise.resolve();
 
@@ -819,7 +860,7 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
       ctx: SlackSessionContext,
       loadPage: (
         ctx: SlackSessionContext, cursor: string | undefined,
-      ) => Promise<{ items: T[]; nextCursor?: string }>) {
+      ) => Promise<SlackCursorPage<T>>) {
     super();
     this.#ctx = dupSessionContext(ctx);
     this.#loadPage = loadPage;
@@ -837,7 +878,14 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
 
   async #nextPage(): Promise<T[] | null> {
     while (!this.#exhausted) {
-      let page = await this.#loadPage(this.#ctx, this.#cursor);
+      let page = this.#pending;
+      if (!page) {
+        await this.#ctx.approvalQueue.assertAppAccess();
+        page = await this.#loadPage(this.#ctx, this.#cursor);
+        this.#pending = page;
+      }
+      await page.authorize();
+      this.#pending = undefined;
       this.#cursor = page.nextCursor;
       this.#exhausted = !page.nextCursor;
       if (page.items.length > 0) return page.items;
@@ -897,7 +945,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackWorkspaceSession> {
     return new SlackWorkspaceSessionImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup(), tracker: this });
+        makeSessionContext(this.#api(), approvalQueue.dup(), this));
   }
 
   // ── Observer tracking (data-set tracking by conversation) ─────────
@@ -969,6 +1017,9 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   async authorizeConversationObservation(
       queue: RpcStub<ApprovalQueue>, conversationIds: string[],
       description: ObservationDescription): Promise<void> {
+    // Data-set tracking reads gatekeeper storage and observer capabilities. Recheck the app policy
+    // immediately before those reads; authorizeObservation remains deliberately post-read.
+    if (conversationIds.length > 0) await queue.assertAppAccess();
     let check = conversationIds.length > 0
         ? await this.#prepareConversationObservation(conversationIds)
         : { excludeObservers: undefined, commit() {} };
@@ -1057,7 +1108,7 @@ export class SlackConversationGatekeeperImpl
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackConversation> {
     return new SlackConversationImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup() },
+        makeSessionContext(this.#api(), approvalQueue.dup()),
         this.ctx.props.conversationId);
   }
 
@@ -1133,7 +1184,7 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackThread> {
     return new SlackThreadImpl(
-        { api: this.#api(), approvalQueue: approvalQueue.dup() },
+        makeSessionContext(this.#api(), approvalQueue.dup()),
         this.ctx.props.conversationId, this.ctx.props.threadTs);
   }
 
@@ -1175,6 +1226,7 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   }
 
   async getInfo(): Promise<SlackWorkspaceInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let info = await this.#ctx.api.getWorkspaceInfo();
     await authorizeConversationObservation(this.#ctx, [], {
       title: "Read Slack workspace info",
@@ -1187,15 +1239,19 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
       types: SlackConversationTypeFilter[], title: string): Cursor<SlackConversationEntry> {
     return new SlackCursor<SlackConversationEntry>(this.#ctx, async (ctx, cursor) => {
       let page = await ctx.api.listUserConversations(types, cursor, CONVERSATION_PAGE_SIZE);
-      await authorizeConversationObservation(ctx, page.items.map(info => info.id), {
-        title: `${title} (${page.items.length})`,
-        description: page.items.length > 0
-            ? `Listed conversations:\n${page.items.map(info =>
-                `- ${info.name ? "#" + info.name : conversationLabel(info)}`).join("\n")}`
-            : "No conversations on this page.",
-      });
+      let conversationIds = page.items.map(info => info.id);
       let entries = page.items.map(info => conversationEntry(ctx, info));
-      return { items: entries, nextCursor: page.nextCursor };
+      return {
+        items: entries,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, conversationIds, {
+          title: `${title} (${page.items.length})`,
+          description: page.items.length > 0
+              ? `Listed conversations:\n${page.items.map(info =>
+                  `- ${info.name ? "#" + info.name : conversationLabel(info)}`).join("\n")}`
+              : "No conversations on this page.",
+        }),
+      };
     });
   }
 
@@ -1210,15 +1266,19 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   async listUsers(): Promise<Cursor<SlackUser>> {
     return new SlackCursor<SlackUser>(this.#ctx, async (ctx, cursor) => {
       let page = await ctx.api.listUsers(cursor, USER_PAGE_SIZE);
-      await authorizeConversationObservation(ctx, [], {
-        title: `List Slack members (${page.items.length})`,
-        description: `Read a page of ${page.items.length} workspace members.`,
-      });
-      return { items: page.items, nextCursor: page.nextCursor };
+      return {
+        items: page.items,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, [], {
+          title: `List Slack members (${page.items.length})`,
+          description: `Read a page of ${page.items.length} workspace members.`,
+        }),
+      };
     });
   }
 
   async getUser(userId: string): Promise<SlackUser> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let user = await this.#ctx.api.getUser(userId);
     await authorizeConversationObservation(this.#ctx, [], {
       title: `Read Slack user ${user.username}`,
@@ -1228,6 +1288,7 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   }
 
   async getConversation(conversationId: string): Promise<SlackConversation> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let info = await this.#ctx.api.getConversationInfo(conversationId);
     await authorizeConversationObservation(this.#ctx, [info.id], {
       title: `Open Slack conversation ${info.name ? "#" + info.name : info.id}`,
@@ -1241,14 +1302,17 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
     return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
       let page = await ctx.api.searchMessages(query, cursor, SEARCH_PAGE_SIZE);
       let channelIds = [...new Set(page.items.map(match => match.channelId))];
-      await authorizeConversationObservation(ctx, channelIds, {
-        title: `Search Slack (${page.items.length} results)`,
-        description:
-            `Search the workspace for messages.\n\nQuery: ${truncate(query)}\n\n` +
-            `Matched ${page.items.length} messages on this page.`,
-      });
       let entries = page.items.map(match => messageEntry(ctx, match.channelId, match.message));
-      return { items: entries, nextCursor: page.nextCursor };
+      return {
+        items: entries,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, channelIds, {
+          title: `Search Slack (${page.items.length} results)`,
+          description:
+              `Search the workspace for messages.\n\nQuery: ${truncate(query)}\n\n` +
+              `Matched ${page.items.length} messages on this page.`,
+        }),
+      };
     });
   }
 }
@@ -1269,6 +1333,7 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
   }
 
   async getInfo(): Promise<SlackConversationInfo> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let info = await this.#ctx.api.getConversationInfo(this.#conversationId);
     await authorizeConversationObservation(this.#ctx, [this.#conversationId], {
       title: `Read Slack conversation info ${info.name ? "#" + info.name : info.id}`,
@@ -1281,12 +1346,18 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
     let conversationId = this.#conversationId;
     return new SlackCursor<SlackUser>(this.#ctx, async (ctx, cursor) => {
       let page = await ctx.api.listConversationMembers(conversationId, cursor, MEMBER_PAGE_SIZE);
-      let users = await mapWithConcurrency(page.items, id => ctx.api.getUser(id));
-      await authorizeConversationObservation(ctx, [conversationId], {
-        title: `List Slack conversation members (${users.length})`,
-        description: `Read ${users.length} members of conversation ${conversationId}.`,
+      let users = await mapWithConcurrency(page.items, async id => {
+        await ctx.approvalQueue.assertAppAccess();
+        return await ctx.api.getUser(id);
       });
-      return { items: users, nextCursor: page.nextCursor };
+      return {
+        items: users,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, [conversationId], {
+          title: `List Slack conversation members (${users.length})`,
+          description: `Read ${users.length} members of conversation ${conversationId}.`,
+        }),
+      };
     });
   }
 
@@ -1294,14 +1365,17 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
     let conversationId = this.#conversationId;
     return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
       let page = await ctx.api.listHistory(conversationId, cursor, HISTORY_PAGE_SIZE);
-      await authorizeConversationObservation(ctx, [conversationId], {
-        title: `Read Slack messages (${page.items.length})`,
-        description:
-            `Read a page of ${page.items.length} messages from conversation ${conversationId}.`,
-      });
       let entries = page.items.map(message =>
           messageEntry(ctx, conversationId, message));
-      return { items: entries, nextCursor: page.nextCursor };
+      return {
+        items: entries,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, [conversationId], {
+          title: `Read Slack messages (${page.items.length})`,
+          description:
+              `Read a page of ${page.items.length} messages from conversation ${conversationId}.`,
+        }),
+      };
     });
   }
 
@@ -1317,16 +1391,20 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
     return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
       let info = await (infoPromise ??= ctx.api.getConversationInfo(conversationId));
       let effectiveQuery = info.name ? `in:#${info.name} ${query}` : query;
+      await ctx.approvalQueue.assertAppAccess();
       let page = await ctx.api.searchMessages(
           effectiveQuery, cursor, SEARCH_PAGE_SIZE, conversationId);
-      await authorizeConversationObservation(ctx, [conversationId], {
-        title: `Search Slack conversation (${page.items.length} results)`,
-        description:
-            `Search within ${conversationLabel(info)}.\n\nQuery: ${truncate(query)}\n\n` +
-            `Matched ${page.items.length} messages on this page.`,
-      });
       let entries = page.items.map(match => messageEntry(ctx, match.channelId, match.message));
-      return { items: entries, nextCursor: page.nextCursor };
+      return {
+        items: entries,
+        nextCursor: page.nextCursor,
+        authorize: () => authorizeConversationObservation(ctx, [conversationId], {
+          title: `Search Slack conversation (${page.items.length} results)`,
+          description:
+              `Search within ${conversationLabel(info)}.\n\nQuery: ${truncate(query)}\n\n` +
+              `Matched ${page.items.length} messages on this page.`,
+        }),
+      };
     });
   }
 }
@@ -1352,10 +1430,12 @@ class SlackThreadImpl extends RpcTarget implements SlackThread {
   // Resolve reply timestamps to the thread root once per session.
   #resolveRoot(): Promise<{ rootTs: string; root: SlackMessage | undefined }> {
     return this.#resolved ??= (async () => {
+      await this.#ctx.approvalQueue.assertAppAccess();
       let page = await this.#ctx.api.listReplies(
           this.#conversationId, this.#threadTs, undefined, 1);
       let first = page.items[0];
       if (first?.threadTs && first.threadTs !== this.#threadTs) {
+        await this.#ctx.approvalQueue.assertAppAccess();
         let rootPage = await this.#ctx.api.listReplies(
             this.#conversationId, first.threadTs, undefined, 1);
         return { rootTs: first.threadTs, root: rootPage.items[0] };
@@ -1365,6 +1445,7 @@ class SlackThreadImpl extends RpcTarget implements SlackThread {
   }
 
   async getRoot(): Promise<SlackMessage> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let { root } = await this.#resolveRoot();
     if (!root) throw new Error(`Thread ${this.#threadTs} not found.`);
     await authorizeConversationObservation(this.#ctx, [this.#conversationId], {
@@ -1375,10 +1456,12 @@ class SlackThreadImpl extends RpcTarget implements SlackThread {
   }
 
   async listReplies(): Promise<SlackMessage[]> {
+    await this.#ctx.approvalQueue.assertAppAccess();
     let { rootTs } = await this.#resolveRoot();
     let messages: SlackMessage[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < MAX_REPLY_PAGES; page++) {
+      await this.#ctx.approvalQueue.assertAppAccess();
       let result = await this.#ctx.api.listReplies(
           this.#conversationId, rootTs, cursor, HISTORY_PAGE_SIZE);
       messages.push(...result.items);

@@ -14,28 +14,135 @@ also safe because the directory deduplicates the complete event by idempotency k
 
 ## Identity and access
 
-The browser supplies only the desired boolean and an opaque idempotency key. The backend passes the
-authenticated User Durable Object id to the directory, which assigns the installation's single MVP
-tenant and a canonical opaque directory user id. Email, username, actor, tenant, role, and resource
-identifiers are not accepted from the mutation or history-query arguments.
+For the retained signup-setting mutation, the browser supplies only the desired boolean and an
+opaque idempotency key. For T03 directory mutations it supplies the bounded requested value,
+explicit target Subject where applicable, and UUID `mutationId`. The actor and organization always
+come from the verified session and configured directory; e-mail never selects an existing user.
 
 Audit history is exposed only on the existing `AdminApi` capability. A non-admin receives `null`
-from `AuthenticatedApi.getAdminApi()` and cannot select or enumerate a tenant. The directory also
-rejects internal reads for any tenant other than its own singleton tenant.
+from `AuthenticatedApi.getAdminApi()` and cannot select or enumerate an organization. Every method
+on a retained admin capability rechecks access-token expiry and current active-admin status.
+
+## Directory groups
+
+The admin Groups panel uses the same `AdminApi` capability to create, rename, replace membership,
+list, and delete groups. Every group read and mutation passes the Subject derived from the retained
+session guard, and the directory rechecks current active-administrator authority in that same
+Durable Object invocation. Group names are trimmed for display and indexed and sorted explicitly
+with the `pt-BR` locale; group IDs are server-generated UUIDs and are never supplied by the browser.
+
+Under issue #29, group state, memberships, receipts, and audit events are stored centrally in
+`scaleos_directory` and managed via PostgREST RPC by `CentralGroupsClient`. Group mutations are
+serialized using `this.ctx.blockConcurrencyWhile` in the singleton's queue alongside `setUserRole`
+and `setUserStatus`, preventing concurrent role or status changes during remote I/O. Administrator
+and session authority are validated before prepare and re-validated after SQL completion before
+returning success. Membership replacement verifies that new members are active directory users, while
+already-present disabled users may remain.
+
+The panel retains a caller-generated mutation UUID per operation and identical normalized payload
+when a response is uncertain. It blocks concurrent UI mutations while one is in flight and clears
+the pending UUID only after a confirmed RPC response. RPC arrays, membership arrays, mutation
+receipts, and compound create results are copied as needed and disposed in `finally` blocks.
+
+`AuthenticatedApi.listAudienceTargets()` is the sharing-picker directory projection. The browser
+supplies no Subject: the authenticated facade checks its session guard and passes the guard's
+Subject to the directory, which rechecks that the actor is effective-active in the same invocation.
+The response contains only `userId`/`displayName` for effective-active users and `groupId`/`name` for
+existing groups loaded from central SQL in a single query. It includes no e-mail, role, status,
+membership, secret, or audit data. The richer administrator listing remains available separately so
+an admin can remove a disabled existing member later.
+
+Group authorization is resolved inside `OrganizationDirectoryDurableObject` at the point of use.
+`resolveAudience()` denies missing, pending, and disabled Subjects locally first, then evaluates
+additive direct sources (`everyone`, `user:<subject>`). When group membership is required,
+it resolves candidate groups in a single batch query via `resolve_group_memberships`. Deleted or
+missing groups are excluded by the central SQL join and grant nothing. Valid direct sources remain
+additive even if the remote SQL source fails, while group-only access fails closed on remote error
+(`DEPENDENCY_UNAVAILABLE`) and never grants access. `resolveAudience()` remains an internal
+capability; the admin-only app-policy preview exposes only effective recipients and sources,
+evaluating candidate group memberships in a single batch query via `scaleos_directory.get_groups_members`.
+## Registered app policies
+
+`AdminApi.listAppPolicies()`, `previewAppPolicy()`, and `setAppPolicy()` recheck both the retained
+human-session guard and current active-admin role. Each policy is keyed by an exact registered
+vendor ID. Mutations canonicalize and validate the complete audience before committing; an absent
+row means `disabled` with no audience, and `enabled` is rejected for a vendor without
+`autoProvisionsAccount`. Preview resolves effective-active recipients and every current additive
+source without changing policy state.
+
+`setAppPolicy()` uses the directory-owned receipt, monotonic policy version, idempotency, and atomic
+audit transaction. The event uses `resourceType="directoryApp"`, `action="setAppPolicy"`, and
+`reasonCode="DIRECTORY_APP_POLICY_CHANGED"`. Its `change.field` is `appPolicy`; `before` and `after`
+contain only a bounded summary of mode, the `everyone` bit, and user/group counts. Audience IDs are
+never written to the event. Replaying the same actor, operation, mutation ID, and normalized payload
+returns the original policy and receipt without a second event; changing the payload conflicts.
+
+The directory decision is consumed at each operational app boundary, including retained UI,
+workspace, binding, queue, and hook capabilities. These checks do not create audit events: the
+administrative policy mutation is the auditable state change, while allow/deny resolution is a live
+authorization read.
 
 ## Stored data and retention
 
 Each event contains stable event, mutation-correlation, and idempotency identifiers; server time;
-tenant and actor ids; installation resource; action; before/after policy versions; result and reason;
-and the bounded `signupsEnabled` boolean transition. It does not store passwords, cookies, tokens,
-prompts, documents, connector responses, or arbitrary configuration patches.
+tenant and actor ids; resource and action; before/after resource-policy versions; result and reason;
+and a bounded transition. T03 adds directory-local events for first-admin bootstrap, user invitation,
+role changes, and lifecycle changes; T04 adds directory-group events, and T05 adds app-policy
+events.
+Group membership audit changes record only before/after counts, never the member ID list. The
+`AdminSettings` version and directory authorization version are intentionally separate clocks owned
+by their respective transactional authorities; event versions are interpreted with the resource.
+When another active admin resumes a provider mutation left pending, the single final event keeps
+the original `actorUserId` and records the current executor in optional `resumedByUserId`.
+No event stores invitation secrets, passwords, cookies, tokens, prompts, documents, connector
+responses, e-mail addresses, or arbitrary configuration patches.
 
 Events and matching idempotency receipts are retained for the lifetime of the deployment's Durable
-Object storage. T02 performs no automatic deletion and offers the newest 50 events by default (up
+Object storage. No automatic deletion is performed; the UI offers the newest 50 events by default (up
 to 200 per query). This deliberate local retention keeps late retries idempotent. A future retention
 or export policy must preserve retry detection separately before deleting event records.
 
-This is the reusable path for future administrative mutations: add a bounded action/change schema,
-commit it with the mutation in the `AdminSettings` outbox transaction, and deliver it idempotently
-to the organization directory. T02 does not add groups, invitations, user lifecycle, ACLs, a central
-collector, or Vault auditing.
+`AdminSettings` mutations use its durable outbox because their authority is a different DO.
+Directory-owned lifecycle mutations commit their state, receipt, and audit event directly in one
+directory transaction. Neither path adds a central collector; retention/export remains future work.
+
+## Central group audit storage (#28)
+
+Issue #28 transitions group administrative authority, receipts, and audit storage to the central
+Postgres database (`scaleos_directory`).
+
+### Group audit events
+
+New group administrative events are committed directly to `scaleos_directory.group_audit_events`
+in the same SQL transaction as the group mutation, monotonic version increment, and mutation receipt.
+Events adhere to the canonical `AdminAuditEvent` envelope:
+
+- `resourceType`: `"directoryGroup"`
+- `action` and `reasonCode`:
+  - `createGroup` → `DIRECTORY_GROUP_CREATED`
+  - `renameGroup` → `DIRECTORY_GROUP_RENAMED`
+  - `replaceGroupMembers` → `DIRECTORY_GROUP_MEMBERS_CHANGED`
+  - `deleteGroup` → `DIRECTORY_GROUP_DELETED`
+- `change`:
+  - `createGroup`: `{field: "name", before: null, after: "<name>"}`
+  - `renameGroup`: `{field: "name", before: "<oldName>", after: "<newName>"}`
+  - `replaceGroupMembers`: `{field: "members", before: "<beforeCount>", after: "<afterCount>"}`
+    (member IDs, emails, or personal details are never stored in the audit trail)
+  - `deleteGroup`: `{field: "name", before: "<oldName>", after: null}`
+- `result`: `"succeeded"`
+- `correlationId` and `idempotencyKey`: Bound to the caller's `mutationId`.
+
+### Storage and domain merging
+
+Under issue #29, `listAdminAuditEvents` combines group audit events fetched from
+`scaleos_directory.list_group_audit_events` with local audit events from other domains
+(such as user lifecycle and app policy events). The combined feed is sorted by `occurredAt`
+descending and `eventId` descending, applying the standard limit of 50 events (up to 200).
+If the central SQL directory is unavailable, the error is explicit (`DEPENDENCY_UNAVAILABLE`)
+rather than returning a silently incomplete local audit list.
+
+The central group version clock (`group_versions.version`) is incremented atomically under lock on each
+committed mutation and stored in `beforeVersion`/`afterVersion`. Retries with the same actor,
+operation, mutation ID, and normalized payload return the stored receipt without generating duplicate
+audit events. Stored audit records and receipts remain durable for the lifetime of the organization.
+The central directory schema, functions, and reader bindings remain unprovisioned in the live acceptance database.
