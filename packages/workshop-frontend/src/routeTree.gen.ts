@@ -19,6 +19,7 @@ import { Route as OutputsRouteImport } from './routes/outputs'
 import { Route as ProfileRouteImport } from './routes/profile'
 import { Route as ProvidersRouteImport } from './routes/providers'
 import { Route as SignupRouteImport } from './routes/signup'
+import { Route as VaultRouteImport } from './routes/vault'
 import { Route as WorkspacesRouteImport } from './routes/workspaces'
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 import { Route as AuthCentralRouteImport } from './routes/auth.central'
@@ -78,6 +79,11 @@ const ProvidersRoute = ProvidersRouteImport.update({
 const SignupRoute = SignupRouteImport.update({
   id: '/signup',
   path: '/signup',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const VaultRoute = VaultRouteImport.update({
+  id: '/vault',
+  path: '/vault',
   getParentRoute: () => rootRouteImport,
 } as any)
 const WorkspacesRoute = WorkspacesRouteImport.update({
@@ -142,6 +148,7 @@ export interface FileRoutesByFullPath {
   '/profile': typeof ProfileRoute
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
+  '/vault': typeof VaultRoute
   '/workspaces': typeof WorkspacesRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/auth/central': typeof AuthCentralRoute
@@ -164,6 +171,7 @@ export interface FileRoutesByTo {
   '/profile': typeof ProfileRoute
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
+  '/vault': typeof VaultRoute
   '/workspaces': typeof WorkspacesRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/auth/central': typeof AuthCentralRoute
@@ -187,6 +195,7 @@ export interface FileRoutesById {
   '/profile': typeof ProfileRoute
   '/providers': typeof ProvidersRoute
   '/signup': typeof SignupRoute
+  '/vault': typeof VaultRoute
   '/workspaces': typeof WorkspacesRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/auth/central': typeof AuthCentralRoute
@@ -211,6 +220,7 @@ export interface FileRouteTypes {
     | '/profile'
     | '/providers'
     | '/signup'
+    | '/vault'
     | '/workspaces'
     | '/auth/callback'
     | '/auth/central'
@@ -233,6 +243,7 @@ export interface FileRouteTypes {
     | '/profile'
     | '/providers'
     | '/signup'
+    | '/vault'
     | '/workspaces'
     | '/auth/callback'
     | '/auth/central'
@@ -255,6 +266,7 @@ export interface FileRouteTypes {
     | '/profile'
     | '/providers'
     | '/signup'
+    | '/vault'
     | '/workspaces'
     | '/auth/callback'
     | '/auth/central'
@@ -278,6 +290,7 @@ export interface RootRouteChildren {
   ProfileRoute: typeof ProfileRoute
   ProvidersRoute: typeof ProvidersRoute
   SignupRoute: typeof SignupRoute
+  VaultRoute: typeof VaultRoute
   WorkspacesRoute: typeof WorkspacesRoute
   AuthCallbackRoute: typeof AuthCallbackRoute
   AuthCentralRoute: typeof AuthCentralRoute
@@ -360,6 +373,13 @@ declare module '@tanstack/react-router' {
       path: '/signup'
       fullPath: '/signup'
       preLoaderRoute: typeof SignupRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/vault': {
+      id: '/vault'
+      path: '/vault'
+      fullPath: '/vault'
+      preLoaderRoute: typeof VaultRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/workspaces': {
@@ -446,6 +466,7 @@ const rootRouteChildren: RootRouteChildren = {
   ProfileRoute: ProfileRoute,
   ProvidersRoute: ProvidersRoute,
   SignupRoute: SignupRoute,
+  VaultRoute: VaultRoute,
   WorkspacesRoute: WorkspacesRoute,
   AuthCallbackRoute: AuthCallbackRoute,
   AuthCentralRoute: AuthCentralRoute,
