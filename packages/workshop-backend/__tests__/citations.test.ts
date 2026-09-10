@@ -253,6 +253,14 @@ describe("document citation storage", () => {
     expect(serialized).not.toContain('"evidenceId"');
     expect(serialized).not.toContain('"blockHash"');
     expect(serialized).not.toContain('"citation-a"');
+    const hiddenProjection = toDocumentExportProjection(moved, {...view, mode: "none"});
+    expect(hiddenProjection.citations).toMatchObject({
+      mode: "none",
+      links: [],
+      evidence: [],
+    });
+    expect(JSON.stringify(hiddenProjection)).not.toContain("First evidence");
+    expect(JSON.stringify(hiddenProjection)).not.toContain("Second evidence");
   });
 
   it("rejects cross-chat references and protects citation mode with CAS", async () => {

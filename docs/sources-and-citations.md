@@ -35,7 +35,7 @@ Workspace Docs reuses the existing Markdown, HTML, and PDF exporters. Each owner
 
 - `inline` exports visible markers.
 - `endnotes` exports markers and the visible numbered evidence list.
-- `none` exports neither markers nor endnotes.
+- `none` exports neither markers nor endnotes and does not pass evidence text to the export handler.
 - Links needing review or orphaned are excluded. Unavailable links export only `[?]`.
 
 The projection contains the current document plus only cited visible evidence and safe source links. It excludes raw MCP payloads, uncited evidence, return IDs, citation IDs, block hashes, tokens, and hidden citation metadata. Collaborator exports do not receive the owner's private evidence projection. Gadgets without the citation capability and legacy Workspace Docs instances that have not initialized blocks retain their previous citation-free export path.

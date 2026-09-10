@@ -210,43 +210,45 @@ export function toDocumentExportProjection(
   if (view.gadgetId !== document.gadgetId || view.documentRevision !== document.revision) {
     throw new Error("Document export projection revisions do not match.");
   }
-  const evidenceByRef = new Map(view.evidence.map((item) => [evidenceRefKey(item.ref), item]));
-  const evidenceIndexes = new Map<string, number>();
   const evidence: DocumentExportProjection["citations"]["evidence"] = [];
   const links: DocumentExportProjection["citations"]["links"] = [];
-  for (const link of view.links) {
-    if (link.state === "unavailable") {
-      links.push({ blockId: link.blockId, state: "unavailable" });
-      continue;
-    }
-    if (link.state !== "valid") continue;
-    const indexes = link.evidence.map((ref) => {
-      const key = evidenceRefKey(ref);
-      const existing = evidenceIndexes.get(key);
-      if (existing !== undefined) return existing;
-      const item = evidenceByRef.get(key);
-      if (item?.status !== "available") {
-        throw new Error("A valid document citation has no available evidence.");
+  if (view.mode !== "none") {
+    const evidenceByRef = new Map(view.evidence.map((item) => [evidenceRefKey(item.ref), item]));
+    const evidenceIndexes = new Map<string, number>();
+    for (const link of view.links) {
+      if (link.state === "unavailable") {
+        links.push({ blockId: link.blockId, state: "unavailable" });
+        continue;
       }
-      const index = evidence.length;
-      evidenceIndexes.set(key, index);
-      evidence.push({
-        text: item.evidence.text,
-        kind: item.evidence.kind,
-        ...(item.evidence.locator === undefined ? {} : { locator: item.evidence.locator }),
-        sources: item.sources.map((source) => {
-          const href = buildVaultNoteUrl(item.vaultWebUrl, source.note);
-          return {
-            ref: source.ref,
-            type: source.type,
-            ...(source.title === undefined ? {} : { title: source.title }),
-            ...(href === undefined ? {} : { href }),
-          };
-        }),
+      if (link.state !== "valid") continue;
+      const indexes = link.evidence.map((ref) => {
+        const key = evidenceRefKey(ref);
+        const existing = evidenceIndexes.get(key);
+        if (existing !== undefined) return existing;
+        const item = evidenceByRef.get(key);
+        if (item?.status !== "available") {
+          throw new Error("A valid document citation has no available evidence.");
+        }
+        const index = evidence.length;
+        evidenceIndexes.set(key, index);
+        evidence.push({
+          text: item.evidence.text,
+          kind: item.evidence.kind,
+          ...(item.evidence.locator === undefined ? {} : { locator: item.evidence.locator }),
+          sources: item.sources.map((source) => {
+            const href = buildVaultNoteUrl(item.vaultWebUrl, source.note);
+            return {
+              ref: source.ref,
+              type: source.type,
+              ...(source.title === undefined ? {} : { title: source.title }),
+              ...(href === undefined ? {} : { href }),
+            };
+          }),
+        });
+        return index;
       });
-      return index;
-    });
-    links.push({ blockId: link.blockId, state: "valid", evidence: indexes });
+      links.push({ blockId: link.blockId, state: "valid", evidence: indexes });
+    }
   }
   return {
     document: {
