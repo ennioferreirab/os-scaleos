@@ -1,8 +1,12 @@
 // Durable lifecycle for approval-gated MCP tool calls. The owning facet supplies its isolated SQLite
 // database; claims are persisted before external I/O so an interrupted write is never replayed.
 
+import type { RpcStub } from "cloudflare:workers";
+import type { CapturedToolResult, ToolReturnCapture, ToolReturnCaptureOutcome }
+  from "@gadgets/workshop-shared/gatekeeper";
 import { callMayHaveTakenEffect, type McpClient, type McpToolCallResult } from "./client.js";
 import type { McpLog } from "./log.js";
+import type { McpExecutionConnection } from "./connection.js";
 import type { StoredAction } from "./session.js";
 import { toCallResult } from "./tools.js";
 
@@ -22,6 +26,8 @@ type ActionRow = {
   retryable: number | null;
   result_json: string | null;
   error: string | null;
+  return_id: string | null;
+  capture_error: string | null;
 };
 
 function fromRow(row: ActionRow): StoredAction {
@@ -37,6 +43,8 @@ function fromRow(row: ActionRow): StoredAction {
       ? JSON.parse(row.result_json) as StoredAction["result"]
       : undefined,
     error: row.error ?? undefined,
+    returnId: row.return_id ?? undefined,
+    captureError: row.capture_error ?? undefined,
   };
 }
 
@@ -60,8 +68,16 @@ export class ActionStore {
       claimed_at INTEGER,
       retryable INTEGER CHECK (retryable IS NULL OR retryable IN (0, 1)),
       result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
-      error TEXT
+      error TEXT,
+      return_id TEXT,
+      capture_error TEXT
     ) STRICT`);
+    try {
+      sql.exec("ALTER TABLE mcp_actions ADD COLUMN return_id TEXT");
+    } catch {}
+    try {
+      sql.exec("ALTER TABLE mcp_actions ADD COLUMN capture_error TEXT");
+    } catch {}
     // A fresh store means a fresh Durable Object activation. Any persisted claim belonged to an
     // interrupted prior activation and must never be replayed because the write may have landed.
     sql.exec(
@@ -80,13 +96,15 @@ export class ActionStore {
 
   #save(action: StoredAction): void {
     this.#sql.exec(
-      `UPDATE mcp_actions SET state = ?, claimed_at = ?, retryable = ?, result_json = ?, error = ?
+      `UPDATE mcp_actions SET state = ?, claimed_at = ?, retryable = ?, result_json = ?, error = ?, return_id = ?, capture_error = ?
        WHERE id = ?`,
       action.state,
       action.claimedAt ?? null,
       action.retryable === undefined ? null : Number(action.retryable),
       action.result === undefined ? null : JSON.stringify(action.result),
       action.error ?? null,
+      action.returnId ?? null,
+      action.captureError ?? null,
       action.id,
     );
   }
@@ -129,8 +147,14 @@ export class ActionStore {
 
   async apply(
     id: number,
-    call: (fn: (client: McpClient) => Promise<McpToolCallResult>) => Promise<McpToolCallResult>,
+    call: (
+      fn: (client: McpClient) => Promise<McpToolCallResult>,
+      onConnection: (connection: McpExecutionConnection) => void,
+    ) => Promise<McpToolCallResult>,
     log: McpLog,
+    capture?: RpcStub<ToolReturnCapture> | { captureResult(result: CapturedToolResult): Promise<ToolReturnCaptureOutcome> },
+    sourceProvider?: "vault",
+    vaultWebUrl?: string,
   ): Promise<void> {
     const stored = this.get(id);
     if (!stored) throw new Error(`MCP action ${id} is unknown.`);
@@ -150,8 +174,14 @@ export class ActionStore {
     this.#save(stored);
 
     let result: McpToolCallResult;
+    let connection: McpExecutionConnection | undefined;
     try {
-      result = await call(client => client.callTool(stored.toolName, stored.args));
+      result = await call(
+        client => client.callTool(stored.toolName, stored.args),
+        selected => {
+          connection = selected;
+        },
+      );
     } catch (err) {
       const mayHaveLanded = callMayHaveTakenEffect(err);
       stored.state = "failed";
@@ -171,33 +201,84 @@ export class ActionStore {
 
     stored.state = "applied";
     stored.retryable = undefined;
-    try {
-      const flattened = toCallResult(result);
-      const encoded = JSON.stringify(flattened);
-      const bytes = encoder.encode(encoded).byteLength;
-      stored.result = bytes > MAX_RESULT_BYTES
-        ? {
-            status: "ok",
-            content: [],
-            text: `(The server's response was too large to retain: ${bytes} bytes.)`,
-            isError: flattened.isError,
-          }
-        : flattened;
-    } catch (err) {
-      stored.result = {
-        status: "ok",
-        content: [],
-        text: "(The call succeeded, but its response could not be read back.)",
-      };
-      log.warn("could not record tool call result", {
-        event: "action.result.unreadable", actionId: id, toolName: stored.toolName, error: err,
-      });
+
+    let returnId: string | undefined;
+    let captureError: string | undefined;
+
+    if (capture) {
+      try {
+        if (!connection) {
+          throw new Error("The executing MCP connection metadata was unavailable.");
+        }
+        const outcome = await capture.captureResult({
+          content: result.content,
+          structuredContent: result.structuredContent,
+          isError: result.isError,
+          connectionGeneration: connection.generation,
+          secrets: connection.secrets,
+          vaultWebUrl,
+          sourceProvider,
+        });
+        if (outcome.status === "stored" || outcome.status === "partial") {
+          returnId = outcome.returnId;
+          stored.returnId = outcome.returnId;
+        } else if (outcome.status === "failed") {
+          captureError = outcome.error;
+          stored.captureError = outcome.error;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        captureError = msg;
+        stored.captureError = msg;
+        log.warn("action result capture failed", {
+          event: "action.capture.failed", actionId: id, error: err,
+        });
+      }
+    }
+
+    if (!capture) {
+      try {
+        const flattened = toCallResult(result);
+        const encoded = JSON.stringify(flattened);
+        const bytes = encoder.encode(encoded).byteLength;
+        stored.result = bytes > MAX_RESULT_BYTES
+          ? {
+              status: "ok",
+              content: [],
+              text: `(The server's response was too large to retain: ${bytes} bytes.)`,
+              isError: flattened.isError,
+            }
+          : flattened;
+      } catch (err) {
+        stored.result = {
+          status: "ok",
+          content: [],
+          text: "(The call succeeded, but its response could not be read back.)",
+        };
+        log.warn("could not record tool call result", {
+          event: "action.result.unreadable", actionId: id, toolName: stored.toolName, error: err,
+        });
+      }
+    } else {
+      // Chat-bound results are resolved from the Workshop's deletion-aware retained return after
+      // observation authorization. Keeping a second payload copy here would bypass deletion races.
+      stored.result = undefined;
     }
     this.#save(stored);
     this.#prune();
     log.info("tool call applied", { event: "action.applied", actionId: id, toolName: stored.toolName });
   }
 
+
+  /** Clears an applied action payload while retaining the row that prevents replay. */
+  deleteActionReturn(id: number): void {
+    this.#sql.exec(
+      `UPDATE mcp_actions
+       SET return_id = NULL, result_json = NULL, capture_error = 'This action result was deleted.'
+       WHERE id = ?`,
+      id,
+    );
+  }
   reject(id: number): void {
     const stored = this.get(id);
     if (!stored || stored.state === "rejected") return;

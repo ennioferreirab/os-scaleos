@@ -2,6 +2,7 @@ import { launch, type Page } from "@cloudflare/puppeteer";
 import { RpcSession, type RpcStub, type RpcTransport } from "capnweb";
 import { createLogger } from "@gadgets/backend-utils/logger";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import type { DocumentExportProjection } from "@gadgets/workshop-shared/citations";
 import BROWSER_EXPORT_RUNTIME from "./generated/browser-export-runtime.txt";
 import HTML_SANITIZER_RUNTIME from "./generated/html-sanitizer-runtime.txt";
 import {
@@ -130,14 +131,20 @@ function scriptUrl(source: string): string {
   return `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
 }
 
-function makeExportHtml(clientCode: string, formatId: string): string {
+function makeExportHtml(
+  clientCode: string,
+  formatId: string,
+  documentProjection?: DocumentExportProjection,
+): string {
   let clientPrefix = String.raw`//# sourceURL=client.js
 const { gadget, RpcStub, RpcTarget } = globalThis.__workshopExportRuntime;
 delete globalThis.__workshopExportRuntime;
 `;
   let clientUrl = scriptUrl(clientPrefix + clientCode);
   let runtimeUrl = scriptUrl(
-      `globalThis.gadgetExportFormatId = ${JSON.stringify(formatId)};\n` +
+    `globalThis.gadgetExportFormatId = ${JSON.stringify(formatId)};\n` +
+      `globalThis.__workshopDocumentExportProjection = ` +
+      `${JSON.stringify(documentProjection ?? null)};\n` +
       `globalThis.__workshopExportClientUrl = ${JSON.stringify(clientUrl)};\n` +
       BROWSER_EXPORT_RUNTIME);
 
@@ -165,6 +172,7 @@ export async function renderGadgetInBrowser(
   documentTitle: string,
   gadget: RpcStub<any>,
   format: GadgetExportFormat,
+  documentProjection?: DocumentExportProjection,
 ): Promise<ReadableStream<Uint8Array>> {
   const deadline = createExportDeadline("Browser export timed out.");
 
@@ -217,7 +225,7 @@ export async function renderGadgetInBrowser(
               status: 200,
               contentType: "text/html",
               headers: {"Content-Security-Policy": EXPORT_DOCUMENT_CSP},
-              body: makeExportHtml(clientCode, format.id),
+              body: makeExportHtml(clientCode, format.id, documentProjection),
             });
           } else {
             void request.abort();

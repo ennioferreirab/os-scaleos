@@ -25,11 +25,25 @@ export type ConnectionEnv = InsecureEnv & {
   MCP_CLIENT_NAME?: string;
 };
 
+/** Trusted identity and secrets of the exact connection selected for one MCP operation. */
+export type McpExecutionConnection = {
+  /** Persisted generation used to fence the operation. */
+  generation: number;
+  /** Exact connection secrets that must be removed from any retained application payload. */
+  secrets: string[];
+};
+
 export type WithClientOptions = {
   /** False for a call that may have taken effect, so a dropped session is not retried. See above. */
   retryOnExpiry?: boolean;
   /** Absolute deadline shared with time spent waiting for a discovery slot. */
   deadline?: number;
+  /**
+   * Runs after selecting the connection but before initialization or tool I/O. The snapshot comes
+   * from the same account read that constructs the client, so capture provenance cannot race a
+   * reconnect or credential rotation.
+   */
+  onConnection?: (connection: McpExecutionConnection) => void | Promise<void>;
 };
 
 /**
@@ -100,6 +114,10 @@ export async function withClient<T>(
     throw notDispatched(err);
   }
   const { authorization, sessionId, generation } = connection;
+  await options.onConnection?.({
+    generation,
+    secrets: authorization ? [authorization] : [],
+  });
   const client = new McpClient(
     endpoint, async method => {
       if (method === "tools/call") {

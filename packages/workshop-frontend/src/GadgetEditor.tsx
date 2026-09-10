@@ -12,6 +12,7 @@ import {
   ArrowsOutSimple,
   DotsThree,
   Pulse,
+  BookOpenText,
   type Icon,
 } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget } from 'capnweb'
@@ -29,15 +30,21 @@ import {
   WorkpieceSummary,
   BlueprintOutput,
   WorkpiecesSubscriber,
-} from '@gadgets/workshop-shared/api'
-import ObserverConfigModal from './ObserverConfigModal'
-import GadgetCodeInterface from './GadgetCodeInterface'
-import GadgetUI from './GadgetUI'
-import GadgetUseView from './GadgetUseView'
-import Connections from './Connections'
-import Activity, { type ActivityView } from './Activity'
-import { CountBadge } from './components/CountBadge'
-import ActivityNotifications from './ActivityNotifications'
+  DocumentEvidenceView,
+} from "@gadgets/workshop-shared/api";
+import {
+  isDocumentCitationsUnsupportedError,
+  toDocumentCitationProjection,
+} from "@gadgets/workshop-shared/citations";
+import ObserverConfigModal from "./ObserverConfigModal";
+import GadgetCodeInterface from "./GadgetCodeInterface";
+import GadgetUI, { type GadgetCitationFocus } from "./GadgetUI";
+import GadgetUseView from "./GadgetUseView";
+import Connections from "./Connections";
+import SourcesPanel from "./SourcesPanel";
+import Activity, { type ActivityView } from "./Activity";
+import { CountBadge } from "./components/CountBadge";
+import ActivityNotifications from "./ActivityNotifications";
 import WorkpiecePicker, {
   WORKPIECE_RAIL_COLLAPSED_WIDTH,
   WORKPIECE_RAIL_EXPANDED_WIDTH,
@@ -156,13 +163,14 @@ function formatConsoleLogs(logs: BufferedLogEntry[], heading: string): string {
 
 // ─── right-panel tabs ─────────────────────────────────────────────────────────
 
-type RightTab = 'app' | 'code' | 'connections'
+type RightTab = 'app' | 'sources' | 'code' | 'connections'
 
 type WorkspaceView =
   | { mode: 'chat' }
   // `appId` is absent only while lazily migrating the legacy "open" value.
   | { mode: 'app'; appId?: WorkpieceId }
   | { mode: 'activity' }
+  | { mode: 'sources' }
 
 function formatHeaderCost(cost: number) {
   if (cost === 0) return '$0'
@@ -172,9 +180,15 @@ function formatHeaderCost(cost: number) {
 
 // The first tab is named after what the selected workpiece is ("Document" for a gadget built from
 // a document blueprint), falling back to "App" when it declares no format.
-function rightTabs(output: BlueprintOutput | undefined, t: WorkspaceT): { value: RightTab; label: string }[] {
+function rightTabs(
+  output: BlueprintOutput | undefined,
+  t: WorkspaceT,
+  hasGadget: boolean,
+): { value: RightTab; label: string }[] {
+  if (!hasGadget) return [{ value: 'sources', label: t('workspace.sources.title') }]
   return [
     { value: 'app', label: formatOf(output).noun },
+    { value: 'sources', label: t('workspace.sources.title') },
     { value: 'code', label: t('workspace.common.code') },
     { value: 'connections', label: t('workspace.editor.connections') },
   ]
@@ -501,7 +515,7 @@ export default function GadgetEditor() {
   // telemetry subscriptions this component opens, so no client-side gating is needed here.
   const isUseOnly = metadata?.role === 'use'
 
-  // ── layout ───────────────────────────────────────────────────────────────────
+  const [citationFocus, setCitationFocus] = useState<GadgetCitationFocus | null>(null)
   const [chatWidth, setChatWidth] = useState(getInitialChatWidth)
   const chatWidthRef = useRef(chatWidth)
   const [isResizing, setIsResizing] = useState(false)
@@ -713,6 +727,141 @@ export default function GadgetEditor() {
   const selectedGadgetSummary = selectedGadgetId !== null
     ? visibleGadgets.find(g => g.id === selectedGadgetId)
     : undefined
+  const [documentEvidenceCapability, setDocumentEvidenceCapability] = useState<{
+    gadgetId: WorkpieceId
+    chatId: number
+    supported: boolean
+  } | null>(null)
+  const [documentEvidence, setDocumentEvidence] = useState<DocumentEvidenceView | null>(null)
+  const [documentEvidenceLoading, setDocumentEvidenceLoading] = useState(false)
+  const [documentEvidenceError, setDocumentEvidenceError] = useState(false)
+  const documentEvidenceGenerationRef = useRef(0)
+  const documentEvidenceContextRef = useRef({
+    overseer,
+    gadgetId: selectedGadgetId,
+    chatId: effectiveSelectedChatId,
+  })
+  documentEvidenceContextRef.current = {
+    overseer,
+    gadgetId: selectedGadgetId,
+    chatId: effectiveSelectedChatId,
+  }
+  const documentEvidenceSupported =
+    selectedGadgetId !== null &&
+    effectiveSelectedChatId !== null &&
+    documentEvidenceCapability?.gadgetId === selectedGadgetId &&
+    documentEvidenceCapability.chatId === effectiveSelectedChatId
+      ? documentEvidenceCapability.supported
+      : null
+
+  const refreshDocumentEvidence = useCallback(async (): Promise<DocumentEvidenceView | null> => {
+    const requestContext = {
+      overseer,
+      gadgetId: selectedGadgetId,
+      chatId: effectiveSelectedChatId,
+    }
+    const liveContext = documentEvidenceContextRef.current
+    if (liveContext.overseer !== requestContext.overseer ||
+        liveContext.gadgetId !== requestContext.gadgetId ||
+        liveContext.chatId !== requestContext.chatId) return null
+
+    const generation = ++documentEvidenceGenerationRef.current
+    const currentOverseer = requestContext.overseer?.stub
+    const currentGadgetId = requestContext.gadgetId
+    const currentChatId = requestContext.chatId
+    const isCurrent = () => {
+      const current = documentEvidenceContextRef.current
+      return documentEvidenceGenerationRef.current === generation &&
+        current.overseer === requestContext.overseer &&
+        current.gadgetId === requestContext.gadgetId &&
+        current.chatId === requestContext.chatId
+    }
+
+    if (!currentOverseer || currentGadgetId === null || currentChatId === null) {
+      if (isCurrent()) {
+        setDocumentEvidenceCapability(null)
+        setDocumentEvidence(null)
+        setDocumentEvidenceLoading(false)
+        setDocumentEvidenceError(false)
+      }
+      return null
+    }
+
+    if (isCurrent()) {
+      setDocumentEvidenceCapability(null)
+      setDocumentEvidence(null)
+      setDocumentEvidenceLoading(true)
+      setDocumentEvidenceError(false)
+    }
+    try {
+      const view = await currentOverseer.getDocumentEvidence(currentGadgetId, currentChatId)
+      if (!isCurrent()) return null
+      if (view.gadgetId !== currentGadgetId) {
+        throw new Error('Document evidence returned for the wrong gadget.')
+      }
+      setDocumentEvidenceCapability({
+        gadgetId: currentGadgetId,
+        chatId: currentChatId,
+        supported: true,
+      })
+      setDocumentEvidence(view)
+      setDocumentEvidenceError(false)
+      return view
+    } catch (cause) {
+      if (!isCurrent()) return null
+      const unsupported = isDocumentCitationsUnsupportedError(cause)
+      if (!unsupported) {
+        reportIssue('document-evidence.load', cause, {
+          gadgetId: String(currentGadgetId),
+        })
+      }
+      setDocumentEvidenceCapability({
+        gadgetId: currentGadgetId,
+        chatId: currentChatId,
+        supported: false,
+      })
+      setDocumentEvidence(null)
+      setDocumentEvidenceError(!unsupported)
+      return null
+    } finally {
+      if (isCurrent()) setDocumentEvidenceLoading(false)
+    }
+  }, [
+    effectiveSelectedChatId,
+    overseer,
+    selectedGadgetId,
+  ])
+
+  useEffect(() => {
+    documentEvidenceGenerationRef.current += 1
+    setDocumentEvidenceCapability(null)
+    setDocumentEvidence(null)
+    setDocumentEvidenceLoading(false)
+    setDocumentEvidenceError(false)
+  }, [effectiveSelectedChatId, overseer, selectedGadgetId])
+
+  useEffect(() => {
+    if (activeTab !== 'app' && activeTab !== 'sources') return
+    void refreshDocumentEvidence()
+  }, [activeTab, refreshDocumentEvidence])
+
+  const gadgetCitationProjection = useMemo(() => {
+    if (
+      documentEvidenceSupported !== true ||
+      selectedGadgetId === null ||
+      documentEvidence?.gadgetId !== selectedGadgetId
+    )
+      return null;
+    return toDocumentCitationProjection(documentEvidence);
+  }, [documentEvidence, documentEvidenceSupported, selectedGadgetId]);
+  const selectedDocumentEvidence =
+    documentEvidenceSupported === true && documentEvidence?.gadgetId === selectedGadgetId
+      ? documentEvidence
+      : null;
+
+  useEffect(() => {
+    setCitationFocus(null)
+  }, [selectedGadgetId, effectiveSelectedChatId])
 
   // Lazily normalize legacy "open" preferences once the accepted app list is known. Draft apps
   // remain session-only until accepted; at that point this effect persists them automatically.
@@ -816,8 +965,10 @@ export default function GadgetEditor() {
     && singleInitialChat && visibleGadgets.length <= 1
   const hasAnyApps = allGadgets.length > 0
   const showingActivity = workspaceView?.mode === 'activity'
+  const showingSources = workspaceView?.mode === 'sources'
   const showFullEditor = layoutModeReady && (
-    showingActivity || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
+    showingActivity || showingSources
+      || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
   )
   const showOutputRail = layoutModeReady && hasAnyApps && !showFullEditor
   const paneShowsActivity = showingActivity || activityClosing
@@ -921,6 +1072,40 @@ export default function GadgetEditor() {
     setWorkspaceView({ mode: 'activity' })
   }, [workspaceView])
 
+  const openSources = useCallback(() => {
+    setWorkspaceTransitionEnabled(true)
+    setActivityClosing(false)
+    activityReturnViewRef.current = null
+    setActiveTab('sources')
+    setWorkspaceView({ mode: 'sources' })
+  }, [])
+  const handleOpenCitation = useCallback((citationId: string) => {
+    if (selectedGadgetId === null) return
+    const link = selectedDocumentEvidence?.links.find(candidate => candidate.id === citationId)
+    if (!link) return
+    setCitationFocus({
+      gadgetId: selectedGadgetId,
+      blockId: link.blockId,
+      citationId: link.id,
+    })
+    openSources()
+  }, [openSources, selectedDocumentEvidence, selectedGadgetId])
+
+  const handleNavigateToDocumentBlock = useCallback((blockId: string, citationId: string) => {
+    if (selectedGadgetId === null) return
+    const link = selectedDocumentEvidence?.links.find(candidate =>
+      candidate.id === citationId && candidate.blockId === blockId)
+    if (!link) return
+    setCitationFocus({
+      gadgetId: selectedGadgetId,
+      blockId: link.blockId,
+      citationId: link.id,
+    })
+    setActiveTab('app')
+    setWorkspaceVisibility('open', selectedGadgetId)
+  }, [selectedDocumentEvidence, selectedGadgetId, setWorkspaceVisibility])
+
+
   const closeWorkspacePane = useCallback(() => {
     if (workspaceView?.mode !== 'activity') {
       setWorkspaceVisibility('closed')
@@ -928,7 +1113,7 @@ export default function GadgetEditor() {
     }
     setWorkspaceTransitionEnabled(true)
     const returnView = activityReturnViewRef.current
-    const returnShowsPane = returnView?.mode === 'app'
+    const returnShowsPane = returnView?.mode === 'app' || returnView?.mode === 'sources'
       || (returnView === null && hasAnyApps && !simpleMode)
     setActivityClosing(!returnShowsPane)
     setWorkspaceView(returnView)
@@ -995,13 +1180,13 @@ export default function GadgetEditor() {
       }
       return
     }
-
+    void refreshDocumentEvidence()
     let output = turnOutputRef.current
     turnOutputRef.current = null
     if (!output || output.chatId !== chatId || output.userSelectedTab) return
     if (output.wroteGadgetCode) setActiveTab('app')
     else if (output.wroteFile) setActiveTab('code')
-  }, [])
+  }, [refreshDocumentEvidence])
 
   const handleStreamingActiveFileChange = useCallback(
       (chatId: number, file: ActiveFileTarget | null | undefined) => {
@@ -1024,7 +1209,15 @@ export default function GadgetEditor() {
     let output = turnOutputRef.current
     if (output?.chatId === selectedChatIdRef.current) output.userSelectedTab = true
     setActiveTab(tab)
-  }, [])
+    if (tab === 'sources') {
+      setWorkspaceTransitionEnabled(true)
+      setActivityClosing(false)
+      activityReturnViewRef.current = null
+      setWorkspaceView({ mode: 'sources' })
+    } else if (workspaceView?.mode === 'sources' && selectedGadgetId !== null) {
+      setWorkspaceVisibility('open', selectedGadgetId)
+    }
+  }, [selectedGadgetId, setWorkspaceVisibility, workspaceView?.mode])
 
   useEffect(() => {
     setChatChanges(undefined)
@@ -1380,12 +1573,18 @@ export default function GadgetEditor() {
   }
 
   const openMobilePane = (tab: RightTab) => {
+    if (tab === 'sources') {
+      openSources()
+      return
+    }
     handleTabSelect(tab)
     if (selectedGadgetId !== null) setWorkspaceVisibility('open', selectedGadgetId)
   }
 
   const mobilePreviewActive = showFullEditor && !paneShowsActivity && activeTab === 'app'
-  const mobileMoreActive = showFullEditor && !paneShowsActivity && activeTab !== 'app'
+  const mobileSourcesActive = showFullEditor && !paneShowsActivity && activeTab === 'sources'
+  const mobileMoreActive = showFullEditor && !paneShowsActivity
+    && (activeTab === 'code' || activeTab === 'connections')
 
   // ── always render the full two-pane edit layout; preview overlays on top ──────
   return (
@@ -1484,6 +1683,14 @@ export default function GadgetEditor() {
           {showReconnecting && <ReconnectingChip />}
 
           <WorkshopIconButton
+            onClick={openSources}
+            title={t('workspace.sources.title')}
+            aria-label={t('workspace.sources.title')}
+          >
+            <BookOpenText size={16} />
+          </WorkshopIconButton>
+
+          <WorkshopIconButton
             onClick={() => setShareModalOpen(true)}
             title={t('workspace.editor.shareWorkspace')}
             aria-label={t('workspace.editor.shareWorkspace')}
@@ -1547,6 +1754,16 @@ export default function GadgetEditor() {
           }`}
         >
           {t('workspace.editor.preview')}
+        </button>
+        <button
+          type="button"
+          onClick={openSources}
+          aria-current={mobileSourcesActive ? 'page' : undefined}
+          className={`flex h-9 min-w-0 flex-1 items-center justify-center rounded-lg px-3 text-[14px] font-medium ${
+            mobileSourcesActive ? 'bg-kumo-tint text-kumo-default' : 'text-kumo-subtle'
+          }`}
+        >
+          {t('workspace.sources.title')}
         </button>
         <button
           type="button"
@@ -1700,6 +1917,7 @@ export default function GadgetEditor() {
                   onSelectedChatHasProposedChangesChange={setSelectedChatHasProposedChanges}
                   onOpenGadget={handleSelectWorkpiece}
                   outputOfWorkpiece={outputOfWorkpiece}
+                  onOpenSources={openSources}
                 />
               </div>
 
@@ -1731,7 +1949,7 @@ export default function GadgetEditor() {
           <div className="absolute inset-y-0 -left-2 -right-2" />
         </div>
 
-        {/* ── RIGHT: App / Code / Connections tabs ───────────────────────────── */}
+        {/* ── RIGHT: Output / Sources / Code / Connections tabs ─────────────── */}
         <div
           className={`flex flex-shrink-0 min-w-0 overflow-hidden bg-kumo-base max-md:!w-full max-md:!opacity-100 ${!showFullEditor ? 'max-md:hidden' : ''} ${workspaceTransitionClass}`}
           style={{
@@ -1747,6 +1965,8 @@ export default function GadgetEditor() {
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
               {paneShowsActivity ? (
                 <PaneLabel icon={Pulse} title={t('workspace.editor.activity')} />
+              ) : activeTab === 'sources' ? (
+                <PaneLabel icon={BookOpenText} title={t('workspace.sources.title')} />
               ) : visibleGadgets.length > 1 ? (
                 <PaneWorkpieceTabs
                   gadgets={visibleGadgets}
@@ -1774,7 +1994,7 @@ export default function GadgetEditor() {
                       onClick={() => setActivityView(tab.value)}
                     />
                   ))
-                  : rightTabs(selectedGadgetSummary?.output, t).map(tab => (
+                  : rightTabs(selectedGadgetSummary?.output, t, selectedGadgetSummary !== undefined).map(tab => (
                     <PaneTab
                       key={tab.value}
                       active={activeTab === tab.value}
@@ -1784,7 +2004,7 @@ export default function GadgetEditor() {
                   ))}
               </div>
 
-              {!paneShowsActivity && (
+              {!paneShowsActivity && activeTab !== 'sources' && (
                 <GadgetExportMenu
                   gadget={selectedGadgetStub}
                   gadgetTitle={selectedGadgetSummary?.title ?? t('workspace.editor.defaultGadgetTitle')}
@@ -1863,8 +2083,12 @@ export default function GadgetEditor() {
                   reloadTrigger={uiReloadTrigger}
                   isVisible={activeTab === 'app' && !previewMode}
                   chatId={previewChatId}
+                  citationProjection={gadgetCitationProjection}
+                  focusCitation={citationFocus}
+                  onOpenCitation={handleOpenCitation}
                   onConsoleLog={handleClientConsoleLog}
                   onIframeEscape={isGadgetFullscreen ? exitGadgetFullscreen : undefined}
+                  onRefreshCitationProjection={refreshDocumentEvidence}
                 />
               ) : !previewMode && (
                 <NoGadgetPlaceholder height="100%" />
@@ -1880,6 +2104,26 @@ export default function GadgetEditor() {
                   </div>
                 </div>
               )}
+            </div>
+
+            <div className={activeTab === 'sources' ? 'h-full min-h-0' : 'hidden'}>
+              <SourcesPanel
+                overseer={overseer.stub}
+                documentEvidence={selectedDocumentEvidence}
+                documentEvidenceLoading={documentEvidenceLoading}
+                documentEvidenceError={documentEvidenceError}
+                documentSupported={
+                  selectedGadgetId === null || effectiveSelectedChatId === null
+                    ? undefined
+                    : documentEvidenceSupported
+                }
+                onRefreshDocumentEvidence={refreshDocumentEvidence}
+                focusCitationId={citationFocus?.citationId}
+                onNavigateToDocument={handleNavigateToDocumentBlock}
+                chatId={effectiveSelectedChatId}
+                gadgetId={selectedGadgetSummary?.id}
+                isVisible={activeTab === 'sources' && !paneShowsActivity}
+              />
             </div>
 
             <div className={activeTab === 'code' ? 'h-full' : 'hidden'}>
@@ -1955,7 +2199,11 @@ export default function GadgetEditor() {
               reloadTrigger={uiReloadTrigger}
               isVisible={true}
               chatId={previewChatId}
+              citationProjection={gadgetCitationProjection}
+              focusCitation={citationFocus}
+              onOpenCitation={handleOpenCitation}
               onConsoleLog={handleClientConsoleLog}
+              onRefreshCitationProjection={refreshDocumentEvidence}
             />
           )}
         </div>

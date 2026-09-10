@@ -1,14 +1,42 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
+import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime, ToolReturn, ToolReturnSummary, ReturnPage, ListReturnsOptions, AuthorizedReturn } from '@gadgets/workshop-shared/api';
+import type {
+  AuthorizedEvidence,
+  CitationMutationResult,
+  CitationSet,
+  DocumentCitation,
+  DocumentCitationInput,
+  DocumentEvidenceView,
+  Evidence,
+  EvidenceRef,
+  EvidenceSource,
+  ReturnAnswerLink,
+  SetCitationModeInput,
+  SetDocumentCitationsInput,
+  CitationMode,
+} from "@gadgets/workshop-shared/api";
+import {
+  DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE,
+  evidenceRefKey,
+  isDocumentCitationsUnsupportedError,
+  resolveCitationSet,
+  sha256Hex,
+  toDocumentExportProjection,
+  validateCitationLinks,
+  validateEvidenceRefs,
+  type CitationDocumentSnapshot,
+  type DocumentExportProjection,
+} from "@gadgets/workshop-shared/citations";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, ToolObservationRequest, ToolReturnCapture, ToolReturnCaptureOutcome, CapturedToolResult } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   GatekeeperRequestContext,
   SlashCommandResult,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { normalizeVaultEvidence, type NormalizedVaultEnvelope } from "@gadgets/workshop-shared/evidence";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -73,8 +101,120 @@ import {
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 
-let CODE_MODE_HARNESS =
-`import { WorkerEntrypoint, restore } from "cloudflare:workers";
+type CitationDocumentFacet = {
+  getDocumentCapabilities?: () => Promise<unknown>;
+  getDocument?: () => Promise<unknown>;
+  [Symbol.dispose]?: () => void;
+};
+
+const MISSING_DOCUMENT_CAPABILITY_RPC_MESSAGE =
+  'The RPC receiver does not implement the method "getDocumentCapabilities"';
+
+function isMissingDocumentCapabilityRpcError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.replace(/\.$/, "") === MISSING_DOCUMENT_CAPABILITY_RPC_MESSAGE
+  );
+}
+
+/** Read and validate the citation document contract published by a gadget facet. */
+export async function readCitationDocumentFromFacet(
+  facet: CitationDocumentFacet,
+  gadgetId: WorkpieceId,
+): Promise<CitationDocumentSnapshot | undefined> {
+  try {
+    if (
+      typeof facet.getDocumentCapabilities !== "function" ||
+      typeof facet.getDocument !== "function"
+    ) {
+      throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+    }
+    let capabilities: unknown;
+    try {
+      capabilities = await facet.getDocumentCapabilities();
+    } catch (error) {
+      if (isMissingDocumentCapabilityRpcError(error)) {
+        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+      }
+      throw error;
+    }
+    if (
+      capabilities === null ||
+      typeof capabilities !== "object" ||
+      !("documentVersion" in capabilities) ||
+      !("citationsVersion" in capabilities) ||
+      capabilities.documentVersion !== 2 ||
+      capabilities.citationsVersion !== 1
+    ) {
+      throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+    }
+    const document = await facet.getDocument();
+    if (
+      document !== null &&
+      typeof document === "object" &&
+      "revision" in document &&
+      document.revision === 0 &&
+      "title" in document &&
+      typeof document.title === "string" &&
+      document.title.length <= 10_000 &&
+      "blocks" in document &&
+      document.blocks === null &&
+      "legacyContent" in document &&
+      typeof document.legacyContent === "string"
+    ) {
+      return undefined;
+    }
+    if (
+      document === null ||
+      typeof document !== "object" ||
+      !("revision" in document) ||
+      typeof document.revision !== "number" ||
+      !Number.isInteger(document.revision) ||
+      document.revision < 0 ||
+      !("title" in document) ||
+      typeof document.title !== "string" ||
+      document.title.length > 10_000 ||
+      !("blocks" in document) ||
+      !Array.isArray(document.blocks) ||
+      document.blocks.length > 10_000
+    ) {
+      throw new Error("The document gadget returned an invalid document.");
+    }
+    const blockIds = new Set<string>();
+    let htmlLength = 0;
+    const blocks = document.blocks.map((block) => {
+      if (
+        block === null ||
+        typeof block !== "object" ||
+        !("id" in block) ||
+        typeof block.id !== "string" ||
+        block.id.length === 0 ||
+        block.id.length > 256 ||
+        blockIds.has(block.id) ||
+        !("html" in block) ||
+        typeof block.html !== "string" ||
+        block.html.length > 1_000_000 ||
+        !("version" in block) ||
+        typeof block.version !== "number" ||
+        !Number.isInteger(block.version) ||
+        block.version < 0
+      ) {
+        throw new Error("The document gadget returned an invalid block.");
+      }
+      blockIds.add(block.id);
+      htmlLength += block.html.length;
+      if (htmlLength > 10_000_000) {
+        throw new Error("The document gadget returned an oversized document.");
+      }
+      return { id: block.id, html: block.html, version: block.version };
+    });
+    return { gadgetId, revision: document.revision, title: document.title, blocks };
+  } finally {
+    facet[Symbol.dispose]?.();
+  }
+}
+
+let CODE_MODE_HARNESS = `import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
@@ -968,6 +1108,248 @@ type CodeUpdate = {
   update: Uint8Array;
 };
 
+
+/** Maximum application payload retained per tool call (1 MiB). */
+export const MAX_CALL_PAYLOAD_BYTES = 1024 * 1024;
+
+/** Maximum application payload retained per chat conversation (50 MiB). */
+export const MAX_CHAT_PAYLOAD_BYTES = 50 * 1024 * 1024;
+
+/** Maximum size of each UTF-8 payload chunk (64 KiB). */
+export const PAYLOAD_CHUNK_BYTES = 64 * 1024;
+
+/** Stored record of an authorized tool return. */
+export type ToolReturnRecord = ToolReturn;
+
+/** Stored chunk of a tool return's serialized payload. */
+export type ToolReturnChunkRecord = {
+  /** Composed primary key `${returnId}.${keyString(chunkIndex)}`. */
+  id: string;
+  /** Return ID this chunk belongs to. */
+  returnId: string;
+  /** 0-based chunk index. */
+  chunkIndex: number;
+  /** Chat ID owning the return. */
+  chatId: number;
+  /** Chunk payload UTF-8 string. */
+
+  data: string;
+};
+/** Legacy source snapshot row retained only as input to the per-return evidence migration. */
+type LegacySourceSnapshotRecord = {
+  id: string;
+  gatekeeperId: WorkpieceId;
+  connectionGeneration?: number;
+  provider: string;
+  ref: string;
+  type: string;
+  title?: string;
+  occurredAt?: string;
+  observedAccess: {
+    type: string;
+    tags: string[];
+    sensitivity: string;
+  };
+  contentHash: string;
+  fingerprint: string;
+  occurrences: Array<{
+    returnId: string;
+    executionId: string;
+    externalId: string;
+  }>;
+};
+
+/** Legacy evidence row retained only as input to the per-return evidence migration. */
+type LegacyEvidenceRecord = {
+  id: string;
+  gatekeeperId: WorkpieceId;
+  sourceIds: string[];
+  text: string;
+  kind: Evidence["kind"];
+  locator?: string;
+  confidence?: number;
+  fingerprint: string;
+  occurrences: Array<{
+    returnId: string;
+    executionId: string;
+    externalId: string;
+    payloadPath: string;
+  }>;
+};
+
+/** Legacy fields that may still exist on a return written before evidence became per-return. */
+type LegacyToolReturnRecord = ToolReturnRecord & {
+  sourceIds?: string[];
+  evidenceIds?: string[];
+};
+
+/** Private citation metadata stored separately from document content and captured payloads. */
+type StoredCitationSet = CitationSet & {
+  chatId?: number;
+};
+
+/** Current version of the one-time legacy evidence migration. */
+const LEGACY_EVIDENCE_MIGRATION_VERSION = 1;
+type PreparedEvidenceNormalization = {
+  sources: EvidenceSource[];
+  evidence: Evidence[];
+  answerLinks: ReturnAnswerLink[];
+  coverage: { complete: boolean; reasons: string[] };
+  state: "normalized" | "conflict";
+  reason?: string;
+  byteCount: number;
+};
+
+/**
+ * Splits a UTF-8 string into chunks of at most maxBytes.
+ */
+export function chunkUtf8String(str: string, maxBytes = PAYLOAD_CHUNK_BYTES): string[] {
+  const encoder = new TextEncoder();
+  const chunks: string[] = [];
+  let currentStart = 0;
+
+  while (currentStart < str.length) {
+    let low = 1;
+    let high = Math.min(str.length - currentStart, maxBytes);
+    let best = 1;
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const sub = str.slice(currentStart, currentStart + mid);
+      if (encoder.encode(sub).byteLength <= maxBytes) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    chunks.push(str.slice(currentStart, currentStart + best));
+    currentStart += best;
+  }
+  return chunks;
+}
+
+function sanitizePayloadText(
+  text: string,
+  secrets: readonly (string | null | undefined)[] = [],
+): { text: string; redacted: boolean } {
+  let clean = text;
+  let redacted = false;
+  for (const secret of secrets) {
+    if (secret && secret.length > 0 && clean.includes(secret)) {
+      clean = clean.split(secret).join("[redacted]");
+      redacted = true;
+    }
+  }
+  if (/Bearer\s+[A-Za-z0-9._\-+/=]+/i.test(clean)) {
+    clean = clean.replace(/Bearer\s+[A-Za-z0-9._\-+/=]+/gi, "Bearer [redacted]");
+    redacted = true;
+  }
+  if (/Authorization\s*:\s*[^\s,;]+/i.test(clean)) {
+    clean = clean.replace(/Authorization\s*:\s*[^\s,;]+/gi, "Authorization: [redacted]");
+    redacted = true;
+  }
+  if (/(?:set-cookie|cookie)\s*:\s*[^\r\n]+/i.test(clean)) {
+    clean = clean.replace(/(?:set-cookie|cookie)\s*:\s*[^\r\n]+/gi, "Cookie: [redacted]");
+    redacted = true;
+  }
+  return { text: clean, redacted };
+}
+
+export function sanitizeCapturedPayload(
+  payload: { content?: unknown[]; structuredContent?: unknown; isError?: boolean },
+  secrets: readonly (string | null | undefined)[] = [],
+): { content: unknown[]; structuredContent?: unknown; isError: boolean; redacted: boolean } {
+  let anyRedacted = false;
+
+  const sanitizeValue = (val: unknown): unknown => {
+    if (typeof val === "string") {
+      const res = sanitizePayloadText(val, secrets);
+      if (res.redacted) anyRedacted = true;
+      return res.text;
+    }
+    if (Array.isArray(val)) {
+      return val.map(sanitizeValue);
+    }
+    if (val !== null && typeof val === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        const lower = k.toLowerCase();
+        if (lower === "authorization" || lower === "cookie" || lower === "set-cookie" || lower === "access_token" || lower === "token" || lower === "refresh_token") {
+          out[k] = "[redacted]";
+          anyRedacted = true;
+        } else {
+          out[k] = sanitizeValue(v);
+        }
+      }
+      return out;
+    }
+    return val;
+  };
+
+  const content = Array.isArray(payload.content) ? payload.content.map(sanitizeValue) : [];
+  const structuredContent = payload.structuredContent !== undefined ? sanitizeValue(payload.structuredContent) : undefined;
+  return {
+    content,
+    ...(structuredContent !== undefined ? { structuredContent } : {}),
+    isError: payload.isError ?? false,
+    redacted: anyRedacted,
+  };
+}
+
+function prepareEvidenceNormalization(
+  envelope: NormalizedVaultEnvelope,
+): PreparedEvidenceNormalization {
+  const sources: EvidenceSource[] = envelope.sources.map(source => ({
+    id: source.id,
+    ref: source.ref,
+    type: source.type,
+    ...(source.title !== undefined ? { title: source.title } : {}),
+    ...(source.occurredAt !== undefined ? { occurredAt: source.occurredAt } : {}),
+    ...(source.sensitivity !== undefined ? { sensitivity: source.sensitivity } : {}),
+    ...(source.note !== undefined
+      ? { note: { brain: source.note.brain, slug: source.note.slug } }
+      : {}),
+  }));
+  const evidence: Evidence[] = envelope.items.map(item => ({
+    id: item.id,
+    sourceIds: [...item.sourceIds],
+    text: item.text,
+    kind: item.kind,
+    ...(item.locator !== undefined ? { locator: item.locator } : {}),
+    ...(item.confidence !== undefined ? { confidence: item.confidence } : {}),
+  }));
+  const answerLinks = envelope.answerLinks.map(link => ({
+    claimIndex: link.claimIndex,
+    evidenceIds: [...link.evidenceIds],
+  }));
+  const reason = envelope.textConflict
+    ? "Vault text and structured evidence disagree; both are shown without merging."
+    : undefined;
+  const coverage = envelope.textConflict
+    ? {
+        complete: false,
+        reasons: [...envelope.coverage.reasons, reason!],
+      }
+    : envelope.coverage;
+  const byteCount = new TextEncoder().encode(JSON.stringify({
+    sources,
+    evidence,
+    answerLinks,
+    coverage,
+  })).byteLength;
+
+  return {
+    sources,
+    evidence,
+    answerLinks,
+    coverage,
+    state: envelope.textConflict ? "conflict" : "normalized",
+    ...(reason !== undefined ? { reason } : {}),
+    byteCount,
+  };
+}
 /**
  * The Overseer's storage schema. Exported for the git-migration tests, which drive
  * migrateCodeLogToGit() over synthetic legacy workspaces built on mock storage with the real
@@ -1045,6 +1427,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // True if any past observation was authorized that had the `prohibitAllSharing` flag set
       // in its `ObservationDescription`.
       prohibitAllSharing: false,
+      // Version of the one-time migration from shared source/evidence rows to per-return arrays.
+      // The stamp is written in the same transaction as all copied return manifests and retired
+      // row deletion, so a crash retries the whole migration without losing evidence.
+      evidenceStorageVersion: 0,
     },
 
     collections: {
@@ -1133,6 +1519,54 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           },
         }
       }),
+
+      // Captured MCP tool returns for chat sessions.
+      toolReturns: collection<ToolReturnRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byChatId(record: ToolReturnRecord) {
+            return record.chatId !== undefined ? record.chatId : null;
+          },
+          byActionRecordId(record: ToolReturnRecord) {
+            return record.actionRecordId;
+          },
+        },
+      }),
+
+      // Chunks of UTF-8 payload for captured tool returns (at most 64 KiB per chunk).
+      toolReturnChunks: collection<ToolReturnChunkRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byChatId(chunk: ToolReturnChunkRecord) {
+            return chunk.chatId !== undefined ? chunk.chatId : null;
+          },
+          byReturnId(chunk: ToolReturnChunkRecord) {
+            return chunk.returnId;
+          },
+        },
+      }),
+      // READ-ONLY LEGACY: normalized source snapshots from the pre per-return evidence schema.
+      // These rows are migration input only and are deleted after their return manifests are
+      // rewritten atomically.
+      sourceSnapshots: collection<LegacySourceSnapshotRecord>()({
+        primaryKey: "id",
+      }),
+
+      // READ-ONLY LEGACY: normalized evidence rows from the pre per-return evidence schema.
+      evidence: collection<LegacyEvidenceRecord>()({
+        primaryKey: "id",
+      }),
+
+      // Private citation metadata, separate from document content and captured returns.
+      citationSets: collection<StoredCitationSet>()({
+        primaryKey: "gadgetId",
+      }),
+
+      // Tracks total application payload bytes per chat (up to 50 MiB).
+      chatPayloadBytes: collection<{ chatId: number; bytes: number }>()({
+        primaryKey: "chatId",
+      }),
+
 
       boundHooks: collection<BoundHookRecord>()({
         primaryKey: "id",
@@ -1309,7 +1743,518 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
 
-// Validates a client-supplied commit oid before it reaches the git store.
+/**
+ * Migrate legacy shared source/evidence rows into the per-return manifests.
+ *
+ * The migration is deliberately lazy for storage-only callers (including tests): the first
+ * return/evidence read or delete invokes it. All manifests, retired rows, and the version stamp
+ * are committed in one transaction, so a retry after a failed transaction is deterministic.
+ */
+export function migrateLegacyEvidence(storage: OverseerStorage): void {
+  if (storage.evidenceStorageVersion.get() >= LEGACY_EVIDENCE_MIGRATION_VERSION) return;
+
+  storage.transaction(() => {
+    if (storage.evidenceStorageVersion.get() >= LEGACY_EVIDENCE_MIGRATION_VERSION) return;
+
+    const sourceRows = Array.from(storage.sourceSnapshots.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const evidenceRows = Array.from(storage.evidence.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const sourcesById = new Map(sourceRows.map(source => [source.id, source]));
+    const evidenceById = new Map(evidenceRows.map(item => [item.id, item]));
+
+    const returns = Array.from(storage.toolReturns.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    for (const stored of returns) {
+      const record = stored as LegacyToolReturnRecord;
+      const sourceIds = record.sourceIds ?? [];
+      const evidenceIds = record.evidenceIds ?? [];
+      if (sourceIds.length === 0 && evidenceIds.length === 0) continue;
+
+      const sources = [...(record.sources ?? [])];
+      const sourceIdsPresent = new Set(sources.map(source => source.id));
+      for (const sourceId of sourceIds) {
+        if (sourceIdsPresent.has(sourceId)) continue;
+        const source = sourcesById.get(sourceId);
+        if (!source) continue;
+        sources.push({
+          id: source.id,
+          ref: source.ref,
+          type: source.type,
+          ...(source.title !== undefined ? {title: source.title} : {}),
+          ...(source.occurredAt !== undefined ? {occurredAt: source.occurredAt} : {}),
+          sensitivity: source.observedAccess.sensitivity,
+        });
+        sourceIdsPresent.add(sourceId);
+      }
+
+      const evidence = [...(record.evidence ?? [])];
+      const evidenceIdsPresent = new Set(evidence.map(item => item.id));
+      for (const evidenceId of evidenceIds) {
+        if (evidenceIdsPresent.has(evidenceId)) continue;
+        const item = evidenceById.get(evidenceId);
+        if (!item) continue;
+        evidence.push({
+          id: item.id,
+          sourceIds: [...item.sourceIds],
+          text: item.text,
+          kind: item.kind,
+          ...(item.locator !== undefined ? { locator: item.locator } : {}),
+          ...(item.confidence !== undefined ? { confidence: item.confidence } : {}),
+        });
+        evidenceIdsPresent.add(evidenceId);
+      }
+
+      // Delete the retired fields from the serialized row after copying them. This makes a
+      // successful migration observable and prevents a later reader from treating the old schema
+      // as another source of truth.
+      delete record.sourceIds;
+      delete record.evidenceIds;
+      record.sources = sources;
+      record.evidence = evidence;
+      storage.toolReturns.put(record);
+    }
+
+    for (const source of sourceRows) storage.sourceSnapshots.delete(source.id);
+    for (const item of evidenceRows) storage.evidence.delete(item.id);
+    storage.evidenceStorageVersion.put(LEGACY_EVIDENCE_MIGRATION_VERSION);
+  });
+}
+
+export function listReturnsFromStorage(
+  storage: OverseerStorage,
+  options: ListReturnsOptions,
+): ReturnPage {
+  migrateLegacyEvidence(storage);
+  const { chatId, beforeId, limit = 25, query, connectorId, sourceType } = options;
+  const clampedLimit = Math.min(Math.max(1, limit), 100);
+  const normalizedQuery = query?.trim();
+  if (normalizedQuery && normalizedQuery.length > 200) {
+    throw new Error("Return search query must be at most 200 characters.");
+  }
+
+  let entries = Array.from(storage.toolReturns.byChatId.get(chatId));
+  entries.sort((a, b) => b.calledAt.getTime() - a.calledAt.getTime() || b.id.localeCompare(a.id));
+
+  if (connectorId !== undefined) {
+    entries = entries.filter(entry => entry.gatekeeperId === connectorId);
+  }
+  if (sourceType !== undefined) {
+    entries = entries.filter(entry => entry.observed !== false
+      && (entry.sources ?? []).some(source => source.type === sourceType));
+  }
+  if (normalizedQuery) {
+    const needle = normalizedQuery.toLocaleLowerCase();
+    entries = entries.filter(entry => {
+      const observed = entry.observed !== false;
+      if (!observed) return entry.tool.toLocaleLowerCase().includes(needle);
+      const sourceText = (entry.sources ?? []).flatMap(source => [
+        source.ref,
+        source.type,
+        source.title ?? "",
+        source.occurredAt ?? "",
+        source.sensitivity ?? "",
+        source.note?.brain ?? "",
+        source.note?.slug ?? "",
+      ]);
+      const evidenceText = (entry.evidence ?? []).flatMap(item =>
+        [item.text, item.kind, item.locator ?? ""]);
+      return [entry.tool, ...sourceText, ...evidenceText]
+        .some(value => value.toLocaleLowerCase().includes(needle));
+    });
+  }
+
+  if (beforeId !== undefined) {
+    const index = entries.findIndex(entry => entry.id === beforeId);
+    if (index < 0) {
+      throw new Error(`Invalid pagination cursor: beforeId "${beforeId}" was not found in this chat's returns.`);
+    }
+    entries = entries.slice(index + 1);
+  }
+
+  const paged = entries.slice(0, clampedLimit);
+  const nextBeforeId = entries.length > clampedLimit ? paged[paged.length - 1].id : undefined;
+
+  return {
+    entries: paged.map(entry => {
+      const operational = {
+        id: entry.id,
+        actionRecordId: entry.actionRecordId,
+        chatId: entry.chatId,
+        gatekeeperId: entry.gatekeeperId,
+        tool: entry.tool,
+        calledAt: entry.calledAt,
+        executionState: entry.executionState,
+        captureState: entry.captureState,
+        connectorTitle: storage.gatekeepers.get(entry.gatekeeperId)?.resourceTitle,
+      };
+      if (entry.observed === false) {
+        return {
+          ...operational,
+          observed: false as const,
+        };
+      }
+      const sourceTypes = [...new Set((entry.sources ?? []).map(source => source.type))];
+      return {
+        ...operational,
+        observed: true as const,
+        byteCount: entry.byteCount,
+        coverage: entry.coverage,
+        redacted: entry.redacted ?? false,
+        sourceProvider: entry.sourceProvider,
+        sourceTypes,
+        sourceCount: entry.sources?.length ?? 0,
+        evidenceCount: entry.evidence?.length ?? 0,
+        normalizationState: entry.normalizationState ?? "unsupported",
+        normalizationReason: entry.normalizationReason,
+      };
+    }),
+    nextBeforeId,
+  };
+}
+
+export function getReturnFromStorage(
+  storage: OverseerStorage,
+  returnId: string,
+): AuthorizedReturn {
+  migrateLegacyEvidence(storage);
+  const record = storage.toolReturns.get(returnId);
+  if (!record) {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "Return not found.",
+    };
+  }
+  if (record.executionState === "applied" && record.observed === false) {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "Action result has not yet been authorized as an observation.",
+    };
+  }
+  if (record.captureState === "partial") {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "The tool response was too large to retain and was only partially captured.",
+    };
+  }
+  if (record.captureState === "failed") {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "Capture failed for this tool return.",
+    };
+  }
+  if (record.captureState === "deleted") {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "This tool return has been deleted.",
+    };
+  }
+
+  const chunks = Array.from(storage.toolReturnChunks.byReturnId.get(returnId));
+  chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+  const serialized = chunks.map(chunk => chunk.data).join("");
+  let parsed: { content?: unknown[]; structuredContent?: unknown; isError?: boolean } = {};
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return {
+      status: "unavailable",
+      returnId,
+      reason: "Could not read stored return payload.",
+    };
+  }
+
+  const content = Array.isArray(parsed.content) ? parsed.content : [];
+  const textBlocks: string[] = [];
+  for (const block of content) {
+    if (block !== null && typeof block === "object" && "type" in block && block.type === "text"
+        && "text" in block && typeof block.text === "string") {
+      textBlocks.push(block.text);
+    }
+  }
+  const sources = record.sources ?? [];
+  const evidence = record.evidence ?? [];
+
+  return {
+    status: "available",
+    return: record,
+    content,
+    structuredContent: parsed.structuredContent,
+    text: textBlocks.join("\n"),
+    sources,
+    evidence,
+    answerLinks: record.answerLinks ?? [],
+    normalization: {
+      state: record.normalizationState ?? "unsupported",
+      reason: record.normalizationReason,
+    },
+    isError: parsed.isError,
+  };
+}
+
+export function deleteReturnFromStorage(
+  storage: OverseerStorage,
+  _ctx: unknown,
+  returnId: string,
+): void {
+  migrateLegacyEvidence(storage);
+  const record = storage.toolReturns.get(returnId);
+  if (!record || record.captureState === "deleted") return;
+
+  storage.transaction(() => {
+    storage.toolReturnChunks.byReturnId.delete(returnId);
+    if (record.captureState === "stored" && record.chatId !== undefined) {
+      const currentBytes = storage.chatPayloadBytes.get(record.chatId)?.bytes ?? 0;
+      const retainedBytes = record.byteCount + (record.normalizationByteCount ?? 0);
+      storage.chatPayloadBytes.put({
+        chatId: record.chatId,
+        bytes: Math.max(0, currentBytes - retainedBytes),
+      });
+    }
+    // Keep only the tombstone needed for idempotent deletion; normalized source/evidence arrays
+    // and the frozen human URL are live retained data and must not survive the delete.
+    record.sources = [];
+    record.evidence = [];
+    record.answerLinks = [];
+    record.vaultWebUrl = undefined;
+    record.normalizationByteCount = 0;
+    record.captureState = "deleted";
+    storage.toolReturns.put(record);
+  });
+}
+function unavailableEvidence(ref: EvidenceRef, reason: string): AuthorizedEvidence {
+  return {
+    status: "unavailable",
+    ref: {...ref},
+    reason,
+  };
+}
+
+/** Resolve captured evidence references without exposing data from unavailable returns. */
+export function getEvidenceFromStorage(
+  storage: OverseerStorage,
+  refs: readonly EvidenceRef[],
+): AuthorizedEvidence[] {
+  migrateLegacyEvidence(storage);
+  const result: AuthorizedEvidence[] = [];
+  for (const ref of refs) {
+    const record = storage.toolReturns.get(ref.returnId);
+    if (!record) {
+      result.push(unavailableEvidence(ref, "The captured return is no longer available."));
+      continue;
+    }
+    if (record.observed === false) {
+      result.push(unavailableEvidence(ref, "The return has not been authorized as an observation."));
+      continue;
+    }
+    if (record.captureState !== "stored") {
+      result.push(unavailableEvidence(ref, "The captured return is not available."));
+      continue;
+    }
+    if (record.chatId === undefined || storage.chatMeta.get(record.chatId) === undefined) {
+      result.push(unavailableEvidence(ref, "The conversation containing this return is no longer available."));
+      continue;
+    }
+    const item = (record.evidence ?? []).find(candidate => candidate.id === ref.evidenceId);
+    if (!item) {
+      result.push(unavailableEvidence(ref, "The requested evidence is no longer available."));
+      continue;
+    }
+    const sourcesById = new Map((record.sources ?? []).map(source => [source.id, source]));
+    const sources: EvidenceSource[] = [];
+    let missingSource = false;
+    for (const sourceId of item.sourceIds) {
+      const source = sourcesById.get(sourceId);
+      if (!source) {
+        missingSource = true;
+        break;
+      }
+      sources.push(source);
+    }
+    if (missingSource) {
+      result.push(unavailableEvidence(ref, "The evidence's source is no longer available."));
+      continue;
+    }
+    result.push({
+      status: "available",
+      ref: {...ref},
+      returnId: record.id,
+      ...(record.vaultWebUrl === undefined ? {} : { vaultWebUrl: record.vaultWebUrl }),
+      evidence: { ...item, sourceIds: [...item.sourceIds] },
+      sources,
+    });
+  }
+  return result;
+}
+
+function citationRefsForSet(set: CitationSet | undefined): EvidenceRef[] {
+  if (!set) return [];
+  return set.links.flatMap(link => link.evidence);
+}
+
+function currentCitationSet(
+  storage: OverseerStorage,
+  gadgetId: WorkpieceId,
+): StoredCitationSet | undefined {
+  return storage.citationSets.get(gadgetId);
+}
+
+
+
+
+/** Read a document's citation metadata and resolve all of its referenced evidence. */
+export async function getDocumentEvidenceFromStorage(
+  storage: OverseerStorage,
+  document: CitationDocumentSnapshot,
+): Promise<DocumentEvidenceView> {
+  migrateLegacyEvidence(storage);
+  const set = currentCitationSet(storage, document.gadgetId);
+  const refs = citationRefsForSet(set);
+  const evidence = getEvidenceFromStorage(storage, refs);
+  return resolveCitationSet(document, set, evidence);
+}
+
+function citationConflict(
+  set: StoredCitationSet | undefined,
+  documentRevision: number,
+): CitationMutationResult {
+  return {
+    status: "conflict",
+    citationRevision: set?.citationRevision ?? 0,
+    documentRevision,
+    mode: set?.mode ?? "inline",
+  };
+}
+
+/** Replace a document's citation set after host-side document and evidence validation. */
+export async function setDocumentCitationsInStorage(
+  storage: OverseerStorage,
+  input: SetDocumentCitationsInput,
+  document: CitationDocumentSnapshot,
+): Promise<CitationMutationResult> {
+  migrateLegacyEvidence(storage);
+  validateCitationLinks(input.links);
+  if (input.gadgetId !== document.gadgetId) {
+    throw new Error("Citation input does not match the document gadget.");
+  }
+  if (!Number.isInteger(input.expectedDocumentRevision) || input.expectedDocumentRevision < 0) {
+    throw new Error("Invalid expected document revision.");
+  }
+  if (!Number.isInteger(input.expectedCitationRevision) || input.expectedCitationRevision < 0) {
+    throw new Error("Invalid expected citation revision.");
+  }
+
+  const existing = currentCitationSet(storage, input.gadgetId);
+  const mode: CitationMode = input.mode ?? existing?.mode ?? "inline";
+  if (mode !== "inline" && mode !== "endnotes" && mode !== "none") {
+    throw new Error("Invalid citation presentation mode.");
+  }
+  if (input.expectedDocumentRevision !== document.revision
+      || input.expectedCitationRevision !== (existing?.citationRevision ?? 0)) {
+    return citationConflict(existing, document.revision);
+  }
+
+  const refs = input.links.flatMap(link => link.evidence);
+  validateEvidenceRefs(refs);
+  const authorized = getEvidenceFromStorage(storage, refs);
+  if (authorized.some(item => item.status !== "available")) {
+    throw new Error("One or more cited evidence items are unavailable.");
+  }
+
+  const chatIds = new Set<number>();
+  for (const ref of refs) {
+    const record = storage.toolReturns.get(ref.returnId);
+    if (record?.chatId !== undefined) chatIds.add(record.chatId);
+  }
+  if (chatIds.size > 1) {
+    throw new Error("Citations must reference one conversation.");
+  }
+  if (existing?.chatId !== undefined
+      && [...chatIds].some(chatId => chatId !== existing.chatId)) {
+    throw new Error("Citations must remain within their original conversation.");
+  }
+
+  const blocksById = new Map(document.blocks.map(block => [block.id, block]));
+  const linkIds = new Set<string>();
+  const links: DocumentCitation[] = [];
+  for (const inputLink of input.links) {
+    const block = blocksById.get(inputLink.blockId);
+    if (!block) throw new Error(`No document block named "${inputLink.blockId}".`);
+    const id = inputLink.id ?? crypto.randomUUID();
+    if (linkIds.has(id)) throw new Error("Citation IDs must be unique.");
+    linkIds.add(id);
+    links.push({
+      id,
+      blockId: block.id,
+      blockVersion: block.version,
+      blockHash: await sha256Hex(block.html),
+      evidence: inputLink.evidence.map(ref => ({...ref})),
+    });
+  }
+
+  const chatId = existing?.chatId ?? [...chatIds][0];
+  return storage.transaction(() => {
+    const fresh = currentCitationSet(storage, input.gadgetId);
+    if ((fresh?.citationRevision ?? 0) !== input.expectedCitationRevision) {
+      return citationConflict(fresh, document.revision);
+    }
+    const citationRevision = input.expectedCitationRevision + 1;
+    storage.citationSets.put({
+      gadgetId: input.gadgetId,
+      citationRevision,
+      mode,
+      links,
+      ...(chatId !== undefined ? {chatId} : {}),
+    });
+    return {
+      status: "applied",
+      citationRevision,
+      documentRevision: document.revision,
+      mode,
+    };
+  });
+}
+
+/** Change a document's citation presentation mode with a citation metadata CAS check. */
+export function setCitationModeInStorage(
+  storage: OverseerStorage,
+  input: SetCitationModeInput,
+  documentRevision: number,
+): CitationMutationResult {
+  migrateLegacyEvidence(storage);
+  if (!Number.isInteger(input.expectedCitationRevision) || input.expectedCitationRevision < 0) {
+    throw new Error("Invalid expected citation revision.");
+  }
+  if (input.mode !== "inline" && input.mode !== "endnotes" && input.mode !== "none") {
+    throw new Error("Invalid citation presentation mode.");
+  }
+  return storage.transaction(() => {
+    const existing = currentCitationSet(storage, input.gadgetId);
+    if ((existing?.citationRevision ?? 0) !== input.expectedCitationRevision) {
+      return citationConflict(existing, documentRevision);
+    }
+    const citationRevision = input.expectedCitationRevision + 1;
+    storage.citationSets.put({
+      gadgetId: input.gadgetId,
+      citationRevision,
+      mode: input.mode,
+      links: existing?.links ?? [],
+      ...(existing?.chatId !== undefined ? {chatId: existing.chatId} : {}),
+    });
+    return {
+      status: "applied",
+      citationRevision,
+      documentRevision,
+      mode: input.mode,
+    };
+  });
+}
+
 function validateOid(oid: string): string {
   if (!/^[0-9a-f]{40}$/.test(oid)) {
     throw new Error("Invalid commit id.");
@@ -2157,9 +3102,6 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // Auto-create the workspace's single gadget and record it as the default gadget. New workspaces
-  // normally start with zero gadgets and the agent creates gadgets explicitly (never assigning
-  // `defaultGadgetId`); the exceptions are blueprint instantiation, which still creates a fresh
   // workspace containing one gadget, and the git-storage migration, which recovers the implicit
   // gadget of a legacy workspace whose only code was chat-proposed (see migrateCodeLogToGit).
   // `commitId` is the gadget's initial commit, written by the caller beforehand: every permanent
@@ -2312,6 +3254,7 @@ class OverseerImpl implements AgentHooks {
 
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
+    this.storage.citationSets.delete(id);
     this.#runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
   }
@@ -4261,26 +5204,41 @@ class OverseerImpl implements AgentHooks {
     return resolved.formats;
   }
 
-  async exportGadget(gadgetId: WorkpieceId, formatId: string, chatId?: number)
-      : Promise<ReadableStream<Uint8Array>> {
+  async exportGadget(
+    gadgetId: WorkpieceId,
+    formatId: string,
+    chatId?: number,
+    includePrivateEvidence = false,
+  ): Promise<ReadableStream<Uint8Array>> {
     this.checkChatExistsAndMaterializeChanges(chatId);
     let {formats, handler, gadget} = await this.#resolveGadgetExportFormats(gadgetId, chatId);
     if (!gadget) throw new Error("The Gadget server stub is unavailable.");
     using exportGadget = gadget;
     let format = formats.find(candidate => candidate.id === formatId);
     if (!format) throw new Error(`This Gadget does not support export format: ${formatId}`);
+    let documentProjection = includePrivateEvidence
+      ? await this.#readDocumentExportProjection(gadgetId, chatId)
+      : undefined;
 
     if (format.mode === "server") {
       if (!handler) throw new Error("The Gadget export handler is unavailable.");
       return await exportServerFormat(() =>
-        handler.export(exportGadget, format.id));
+        handler.export(exportGadget, format.id, documentProjection),
+      );
     } else {
       let browser = this.env.BROWSER;
       if (!browser) throw new Error("Gadget export is not configured for this deployment.");
       let bundle = await this.getGadgetUiBundle(gadgetId, chatId);
       if (!bundle) throw new Error("This Gadget does not have a UI to export.");
       let title = this.getGadgetRecord(gadgetId).title;
-      return renderGadgetInBrowser(browser, bundle.jsCode, title, exportGadget.dup(), format);
+      return renderGadgetInBrowser(
+        browser,
+        bundle.jsCode,
+        title,
+        exportGadget.dup(),
+        format,
+        documentProjection,
+      );
     }
   }
 
@@ -4521,7 +5479,14 @@ class OverseerImpl implements AgentHooks {
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
     await this.assertGatekeeperAppAccess(record.gatekeeperId);
     let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
-    await gatekeeper.applyAction(record.action);
+    let captureStub = this.createActionCaptureStub(record);
+    try {
+      await gatekeeper.applyAction(record.action, captureStub);
+    } finally {
+      if (captureStub && Symbol.dispose in captureStub && typeof captureStub[Symbol.dispose] === "function") {
+        captureStub[Symbol.dispose]();
+      }
+    }
     record.state = "approved";
     record.appliedAt = new Date();
     record.resolvedBy = resolvedBy;
@@ -4745,6 +5710,503 @@ class OverseerImpl implements AgentHooks {
 
     this.storage.actions.put(record);
     this.#associateAction(caller, actionId);
+  }
+
+  getChatPayloadBytes(chatId: number): number {
+    return this.storage.chatPayloadBytes.get(chatId)?.bytes ?? 0;
+  }
+
+  setChatPayloadBytes(chatId: number, bytes: number): void {
+    this.storage.chatPayloadBytes.put({ chatId, bytes });
+  }
+
+  async prepareToolObservation(
+    gatekeeperId: number,
+    request: ToolObservationRequest,
+    caller: GatekeeperCaller,
+  ): Promise<NativeRpcStub<ToolReturnCapture> | undefined> {
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (request.description.prohibitAllSharing &&
+        (await this.getSharingManager()).hasAnyShares()) {
+      throw new Error(
+          "This observation was blocked because it contains sensitive data that must only be " +
+          "shown to the account owner, but this workspace is shared with other users. Try again " +
+          "from a workspace that is not shared.");
+    }
+
+    const excludedObservers = request.description.excludeObservers?.length
+        ? await this.#checkExcludeObservers(request.description.excludeObservers)
+        : [];
+
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (request.description.prohibitAllSharing) this.storage.prohibitAllSharing.put(true);
+    if (excludedObservers.length > 0) {
+      const gatekeeperIds = [...this.storage.gatekeepers.list()].map(gatekeeper => gatekeeper.id);
+      for (const observer of excludedObservers) {
+        this.storage.observers.delete(observer.profileId);
+        await this.#removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
+      }
+      await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    }
+
+    let actionId = this.storage.nextActionId.get();
+    this.storage.nextActionId.put(actionId + 1);
+
+    let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
+
+    let record: ActionRecord = {
+      id: actionId,
+      gatekeeperId,
+      caller,
+      resourceTitle: gatekeeper?.resourceTitle,
+      resourceUrl: gatekeeper?.resourceUrl,
+      createdAt: new Date(),
+      state: "approved",
+      type: "observation",
+      description: request.description,
+    };
+
+    this.storage.actions.put(record);
+    this.#associateAction(caller, actionId);
+
+    const chatId = gatekeeperCallerChatId(caller);
+    if (chatId === undefined) {
+      return undefined;
+    }
+
+    const returnId = `ret_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    return new NativeRpcStub(new ToolReturnCaptureImpl(this, {
+      actionRecordId: actionId,
+      chatId,
+      gatekeeperId,
+      connectionGeneration: request.connectionGeneration,
+      tool: request.tool,
+      returnId,
+      observed: true,
+    }));
+  }
+
+  createActionCaptureStub(
+    record: ActionRecord & { type: "action" },
+  ): NativeRpcStub<ToolReturnCapture> | undefined {
+    const chatId = gatekeeperCallerChatId(record.caller);
+    if (chatId === undefined) {
+      return undefined;
+    }
+
+    const tool = record.description.actionKind?.label ?? record.description.title ?? "action";
+    const returnId = `ret_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+
+    return new NativeRpcStub(new ToolReturnCaptureImpl(this, {
+      actionRecordId: record.id,
+      chatId,
+      gatekeeperId: record.gatekeeperId,
+      tool,
+      returnId,
+      observed: false,
+    }));
+  }
+  async captureToolReturn(
+    params: {
+      actionRecordId: number;
+      chatId: number;
+      gatekeeperId: number;
+      connectionGeneration?: number;
+      tool: string;
+      returnId: string;
+      observed?: boolean;
+    },
+    result: CapturedToolResult,
+  ): Promise<ToolReturnCaptureOutcome> {
+    const sanitized = sanitizeCapturedPayload(result, result.secrets ?? []);
+    const serialized = JSON.stringify(sanitized);
+    const byteCount = new TextEncoder().encode(serialized).byteLength;
+    const connectionGeneration = result.connectionGeneration ?? params.connectionGeneration;
+    const observed = params.observed ?? true;
+    const sourceProvider = result.sourceProvider;
+    const vaultWebUrl = sourceProvider === "vault" ? result.vaultWebUrl : undefined;
+    if (this.storage.chatMeta.get(params.chatId) === undefined) {
+      return {
+        status: "failed",
+        error: "The chat was deleted while the tool call was in flight.",
+      };
+    }
+
+    if (byteCount > MAX_CALL_PAYLOAD_BYTES) {
+      return this.storage.transaction(() => {
+        if (this.storage.chatMeta.get(params.chatId) === undefined) {
+          return {
+            status: "failed" as const,
+            error: "The chat was deleted while the tool call was in flight.",
+          };
+        }
+        const reason = "Payload exceeded per-call limit (1 MiB)";
+        this.storage.toolReturns.put({
+          id: params.returnId,
+          actionRecordId: params.actionRecordId,
+          chatId: params.chatId,
+          gatekeeperId: params.gatekeeperId,
+          connectionGeneration,
+          tool: params.tool,
+          calledAt: new Date(),
+          executionState: "applied",
+          captureState: "partial",
+          payloadRef: params.returnId,
+          byteCount,
+          normalizationVersion: 1,
+          coverage: { complete: false, reasons: [reason] },
+          redacted: sanitized.redacted,
+          observed,
+          sourceProvider,
+          ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+          sources: [],
+          evidence: [],
+          answerLinks: [],
+          normalizationState: sourceProvider === "vault" ? "invalid" : "unsupported",
+          normalizationReason: sourceProvider === "vault"
+            ? "Oversized Vault payload was not normalized."
+            : "This connector does not provide structured sources.",
+          normalizationByteCount: 0,
+        });
+        return {
+          status: "partial" as const,
+          returnId: params.returnId,
+          byteCount,
+        };
+      });
+    }
+
+    let prepared: PreparedEvidenceNormalization | undefined;
+    let normalizationState: ToolReturn["normalizationState"] = "unsupported";
+    let normalizationReason: string | undefined =
+      "This connector does not provide structured sources.";
+    if (sourceProvider === "vault") {
+      const normalized = normalizeVaultEvidence(sanitized.structuredContent, sanitized.content);
+      if (normalized.status === "normalized") {
+        prepared = prepareEvidenceNormalization(normalized.envelope);
+        normalizationState = prepared.state;
+        normalizationReason = prepared.reason;
+      } else {
+        normalizationState = "invalid";
+        normalizationReason = normalized.reason;
+      }
+    }
+
+    const normalizationByteCount = prepared?.byteCount ?? 0;
+    const coverage = prepared?.coverage ?? (
+      sourceProvider === "vault"
+        ? { complete: false, reasons: [normalizationReason!] }
+        : { complete: true, reasons: [] }
+    );
+
+    return this.storage.transaction(() => {
+      if (this.storage.chatMeta.get(params.chatId) === undefined) {
+        return {
+          status: "failed",
+          error: "The chat was deleted while the tool call was in flight.",
+        };
+      }
+
+      const currentChatBytes = this.getChatPayloadBytes(params.chatId);
+      if (currentChatBytes + byteCount + normalizationByteCount > MAX_CHAT_PAYLOAD_BYTES) {
+        const reason = "Chat payload limit exceeded (50 MiB)";
+        this.storage.toolReturns.put({
+          id: params.returnId,
+          actionRecordId: params.actionRecordId,
+          chatId: params.chatId,
+          gatekeeperId: params.gatekeeperId,
+          connectionGeneration,
+          tool: params.tool,
+          calledAt: new Date(),
+          executionState: "applied",
+          captureState: "failed",
+          payloadRef: params.returnId,
+          byteCount: 0,
+          normalizationVersion: 1,
+          coverage: { complete: false, reasons: [reason] },
+          redacted: sanitized.redacted,
+          observed,
+          sourceProvider,
+          ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+          sources: [],
+          evidence: [],
+          answerLinks: [],
+          normalizationState,
+          normalizationReason,
+          normalizationByteCount: 0,
+        });
+        return {
+          status: "failed",
+          error: "Chat payload storage limit exceeded (50 MiB).",
+        };
+      }
+      const chunks = chunkUtf8String(serialized, PAYLOAD_CHUNK_BYTES);
+      for (let index = 0; index < chunks.length; index++) {
+        this.storage.toolReturnChunks.put({
+          id: `${params.returnId}.${index}`,
+          returnId: params.returnId,
+          chunkIndex: index,
+          chatId: params.chatId,
+          data: chunks[index],
+        });
+      }
+      this.setChatPayloadBytes(
+        params.chatId,
+        currentChatBytes + byteCount + normalizationByteCount,
+      );
+
+      this.storage.toolReturns.put({
+        id: params.returnId,
+        actionRecordId: params.actionRecordId,
+        chatId: params.chatId,
+        gatekeeperId: params.gatekeeperId,
+        connectionGeneration,
+        tool: params.tool,
+        calledAt: new Date(),
+        executionState: "applied",
+        captureState: "stored",
+        payloadRef: params.returnId,
+        byteCount,
+        normalizationVersion: 1,
+        coverage,
+        redacted: sanitized.redacted,
+        observed,
+        sourceProvider,
+        ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+        sources: prepared?.sources ?? [],
+        evidence: prepared?.evidence ?? [],
+        answerLinks: prepared?.answerLinks ?? [],
+        normalizationState,
+        normalizationReason,
+        normalizationByteCount,
+      });
+
+      return {
+        status: "stored",
+        returnId: params.returnId,
+        byteCount,
+      };
+    });
+  }
+
+  async authorizeActionReturn(
+    gatekeeperId: number,
+    caller: GatekeeperCaller,
+    returnId: string,
+    description: ObservationDescription,
+  ): Promise<string | null> {
+    const resolveRecord = (): ToolReturnRecord | undefined => {
+      const record = this.storage.toolReturns.get(returnId);
+      const callerChatId = gatekeeperCallerChatId(caller);
+      if (!record || record.captureState !== "stored" ||
+          record.gatekeeperId !== gatekeeperId || callerChatId === undefined ||
+          record.chatId !== callerChatId || !this.storage.chatMeta.get(record.chatId)) {
+        return undefined;
+      }
+      const action = this.storage.actions.get(record.actionRecordId);
+      if (!action || action.type !== "action" || action.gatekeeperId !== gatekeeperId ||
+          !sameGatekeeperCaller(action.caller, caller)) {
+        return undefined;
+      }
+      return record;
+    };
+
+    if (!resolveRecord()) return null;
+    await this.authorizeObservation(gatekeeperId, description, caller);
+
+    return this.storage.transaction(() => {
+      const record = resolveRecord();
+      if (!record) return null;
+      const chunks = Array.from(this.storage.toolReturnChunks.byReturnId.get(returnId));
+      chunks.sort((left, right) => left.chunkIndex - right.chunkIndex);
+      const serialized = chunks.map(chunk => chunk.data).join("");
+      try {
+        JSON.parse(serialized);
+      } catch {
+        return null;
+      }
+      record.observed = true;
+      this.storage.toolReturns.put(record);
+      return serialized;
+    });
+  }
+
+  async clearRetainedActionPayload(record: ToolReturnRecord): Promise<void> {
+    const action = this.storage.actions.get(record.actionRecordId);
+    if (!action || action.type !== "action" || action.gatekeeperId !== record.gatekeeperId) return;
+    const gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
+    const deleteActionReturn = gatekeeper.deleteActionReturn;
+    if (typeof deleteActionReturn !== "function") {
+      throw new Error("The gatekeeper cannot delete its retained action result.");
+    }
+    await (deleteActionReturn as (actionId: number) => Promise<void>)(action.action);
+  }
+
+  listReturns(options: ListReturnsOptions): Promise<ReturnPage> {
+    return Promise.resolve(listReturnsFromStorage(this.storage, options));
+  }
+
+  getReturn(returnId: string): Promise<AuthorizedReturn> {
+    return Promise.resolve(getReturnFromStorage(this.storage, returnId));
+  }
+
+  async getEvidence(refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    validateEvidenceRefs(refs);
+    return getEvidenceFromStorage(this.storage, refs);
+  }
+
+  /**
+   * Agent-only citation access. The persisted turn initiator is checked against the current owner
+   * profile on every call: collaborators and gadget-originated turns never receive this capability.
+   */
+  async #assertAgentCitationOwner(
+      chatId: number, initiator: AiChatAuthorInfo, gadgetId?: WorkpieceId): Promise<void> {
+    let ownerProfileId = await this.getOwnerProfileId();
+    let activeInitiator = this.storage.activeAgents.get(chatId)?.initiator;
+    if (activeInitiator === undefined
+        || activeInitiator.type !== "user"
+        || activeInitiator.id !== ownerProfileId
+        || initiator.type !== activeInitiator.type
+        || initiator.id !== activeInitiator.id) {
+      throw new Error("Unauthorized: citation tools are only available to the workspace owner.");
+    }
+    this.getChatMetaOrThrow(chatId);
+    if (gadgetId !== undefined) this.resolveWorkpieceRoot(gadgetId, true, chatId);
+  }
+
+  /**
+   * Keep agent citation references within the turn's chat. Missing/deleted returns are handled by
+   * the ordinary unavailable result; a known return in another chat is rejected without revealing
+   * any of its contents.
+   */
+  #assertEvidenceChat(chatId: number, refs: EvidenceRef[]): void {
+    for (let ref of refs) {
+      let record = this.storage.toolReturns.get(ref.returnId);
+      if (record !== undefined && record.chatId !== chatId) {
+        throw new Error("Evidence references must belong to the current chat.");
+      }
+    }
+  }
+
+  #assertDocumentCitationChat(chatId: number, gadgetId: WorkpieceId): void {
+    let set = currentCitationSet(this.storage, gadgetId);
+    if (set?.chatId !== undefined && set.chatId !== chatId) {
+      throw new Error("Document citations are not available outside their original chat.");
+    }
+  }
+
+  async getAgentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo, refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    await this.#assertAgentCitationOwner(chatId, initiator);
+    this.#assertEvidenceChat(chatId, refs);
+    return this.getEvidence(refs);
+  }
+
+  async getAgentDocumentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo,
+      gadgetId: WorkpieceId): Promise<DocumentEvidenceView> {
+    await this.#assertAgentCitationOwner(chatId, initiator, gadgetId);
+    this.#assertDocumentCitationChat(chatId, gadgetId);
+    let document = await this.#readCitationDocument(gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, gadgetId);
+    return getDocumentEvidenceFromStorage(this.storage, document);
+  }
+
+  async setAgentDocumentCitations(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetDocumentCitationsInput): Promise<CitationMutationResult> {
+    await this.#assertAgentCitationOwner(chatId, initiator, input.gadgetId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    validateCitationLinks(input.links);
+    let refs = input.links.flatMap(link => link.evidence);
+    this.#assertEvidenceChat(chatId, refs);
+    let document = await this.#readCitationDocument(input.gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    return setDocumentCitationsInStorage(this.storage, input, document);
+  }
+
+  async setAgentCitationMode(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetCitationModeInput): Promise<CitationMutationResult> {
+    await this.#assertAgentCitationOwner(chatId, initiator, input.gadgetId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    let document = await this.#readCitationDocument(input.gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    return setCitationModeInStorage(this.storage, input, document.revision);
+  }
+
+  async #readDocumentExportProjection(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+  ): Promise<DocumentExportProjection | undefined> {
+    try {
+      const document = await this.#readCitationDocument(gadgetId, chatId, true);
+      if (!document) return undefined;
+      const evidence = await getDocumentEvidenceFromStorage(this.storage, document);
+      return toDocumentExportProjection(document, evidence);
+    } catch (error) {
+      if (isDocumentCitationsUnsupportedError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  async #readCitationDocument(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+  ): Promise<CitationDocumentSnapshot>;
+  async #readCitationDocument(
+    gadgetId: WorkpieceId,
+    chatId: number | undefined,
+    allowLegacy: true,
+  ): Promise<CitationDocumentSnapshot | undefined>;
+  async #readCitationDocument(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+    allowLegacy = false,
+  ): Promise<CitationDocumentSnapshot | undefined> {
+    if (chatId === undefined) {
+      this.getGadgetRecord(gadgetId);
+    } else {
+      this.resolveWorkpieceRoot(gadgetId, true, chatId);
+    }
+    const facet = (await this.getGadgetFacet(
+      gadgetId,
+      chatId,
+    )) as unknown as CitationDocumentFacet;
+    const document = await readCitationDocumentFromFacet(facet, gadgetId);
+    if (!document && !allowLegacy) {
+      throw new Error("The document gadget must initialize blocks before using citations.");
+    }
+    return document;
+  }
+
+  async getDocumentEvidence(
+      gadgetId: WorkpieceId, chatId?: number): Promise<DocumentEvidenceView> {
+    const document = await this.#readCitationDocument(gadgetId, chatId);
+    return getDocumentEvidenceFromStorage(this.storage, document);
+  }
+
+  async setDocumentCitations(
+      input: SetDocumentCitationsInput, chatId?: number): Promise<CitationMutationResult> {
+    if (chatId !== undefined) {
+      validateCitationLinks(input.links);
+      this.#assertEvidenceChat(chatId, input.links.flatMap(link => link.evidence));
+    }
+    const document = await this.#readCitationDocument(input.gadgetId, chatId);
+    return setDocumentCitationsInStorage(this.storage, input, document);
+  }
+
+  async setCitationMode(
+      input: SetCitationModeInput, chatId?: number): Promise<CitationMutationResult> {
+    const document = await this.#readCitationDocument(input.gadgetId, chatId);
+    return setCitationModeInStorage(this.storage, input, document.revision);
+  }
+
+  async deleteReturn(returnId: string): Promise<void> {
+    const record = this.storage.toolReturns.get(returnId);
+    if (!record || record.captureState === "deleted") return;
+    await this.clearRetainedActionPayload(record);
+    deleteReturnFromStorage(this.storage, this.ctx, returnId);
   }
 
   async getChatAttachmentData(chatId: number, id: string): Promise<Uint8Array> {
@@ -9093,6 +10555,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // Fire off the agent (asynchronously).
       this.impl.startAgent(chatId, userMeta.aiModel, author,
                            this.impl.users.idFromString(resolveUserId).toString());
+
     } else {
       // TODO: Flag as needing user attention.
     }
@@ -9132,6 +10595,19 @@ export type GatekeeperCaller = {
   /** Kernel-trusted Subject of the hook owner. */
   ownerSubject?: string;
 };
+
+function gatekeeperCallerChatId(caller: GatekeeperCaller): number | undefined {
+  return caller.from === "hook" ? undefined : caller.chatId;
+}
+
+function sameGatekeeperCaller(left: GatekeeperCaller, right: GatekeeperCaller): boolean {
+  if (left.from !== right.from ||
+      gatekeeperCallerChatId(left) !== gatekeeperCallerChatId(right)) return false;
+  if (left.from === "gadget" && right.from === "gadget") {
+    return left.gadgetId === right.gadgetId;
+  }
+  return true;
+}
 
 type GatekeeperLoopbackProps = {
   overseerId: string;
@@ -9676,14 +11152,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUserId, this.sessionGuard);
+    return new GadgetClientImpl(
+      this.impl,
+      record.id,
+      this.clientUserId,
+      this.isOwner,
+      this.sessionGuard,
+    );
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.sessionGuard);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.isOwner, this.sessionGuard);
   }
 
   async deleteSelf(): Promise<void> {
@@ -10607,7 +12089,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Delete the chat's messages and the attachment content referenced by them. Attachment metadata
     // is canonical in each message's ChatAttachmentRef, so no separate attachment index is needed.
-    this.impl.ctx.storage.transactionSync(() => {
+    this.impl.storage.transaction(() => {
       for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
         if (msg.type === "message") {
           for (let attachment of msg.attachments ?? []) {
@@ -10634,6 +12116,23 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       this.impl.storage.chatModelData.delete(
           `${keyString(entry.chatId)}.${keyString(entry.sequence)}`);
     }
+
+    // Clean up every live payload copy before removing the Workshop manifests. Applied action
+    // tombstones remain in the gatekeeper so deleting a chat can never make a write replayable.
+    migrateLegacyEvidence(this.impl.storage);
+    const retainedReturns = Array.from(this.impl.storage.toolReturns.byChatId.get(chatId));
+    for (const retained of retainedReturns) {
+      await this.impl.clearRetainedActionPayload(retained);
+    }
+    this.impl.storage.transaction(() => {
+      for (const retained of retainedReturns) {
+        this.impl.storage.toolReturnChunks.byReturnId.delete(retained.id);
+        this.impl.storage.toolReturns.delete(retained.id);
+      }
+      this.impl.storage.toolReturnChunks.byChatId.delete(chatId);
+      this.impl.storage.toolReturns.byChatId.delete(chatId);
+      this.impl.storage.chatPayloadBytes.delete(chatId);
+    });
 
     // Defensively drop any resume record so a deleted chat is never resumed. (Aborting the agent
     // below also clears this via the tracked promise's finally, but the chat may have no live
@@ -10946,6 +12445,58 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     (await this.impl.getSharingManager())
         .updateShareLink(this.#sharingCaller(), linkId, note);
   }
+
+  async listReturns(options: ListReturnsOptions): Promise<ReturnPage> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Tool returns are only accessible by the workspace owner.");
+    }
+    return await this.impl.listReturns(options);
+  }
+
+  async getReturn(returnId: string): Promise<AuthorizedReturn> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Tool returns are only accessible by the workspace owner.");
+    }
+    return this.impl.getReturn(returnId);
+  }
+  async getEvidence(refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Tool returns are only accessible by the workspace owner.");
+    }
+    return this.impl.getEvidence(refs);
+  }
+
+  async getDocumentEvidence(
+      gadgetId: WorkpieceId, chatId?: number): Promise<DocumentEvidenceView> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.getDocumentEvidence(gadgetId, chatId);
+  }
+
+  async setDocumentCitations(
+      input: SetDocumentCitationsInput, chatId?: number): Promise<CitationMutationResult> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.setDocumentCitations(input, chatId);
+  }
+
+  async setCitationMode(
+      input: SetCitationModeInput, chatId?: number): Promise<CitationMutationResult> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.setCitationMode(input, chatId);
+  }
+
+
+  async deleteReturn(returnId: string): Promise<void> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Tool returns are only accessible by the workspace owner.");
+    }
+    return this.impl.deleteReturn(returnId);
+  }
 }
 
 // Restricted capability handed to "use"-role collaborators. It implements the full `Overseer`
@@ -11203,6 +12754,24 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }): Promise<void> { this.#deny(); }
   async deleteBlueprint(_blueprintId: string): Promise<void> { this.#deny(); }
   async retryBlueprintPublish(_blueprintId: string): Promise<void> { this.#deny(); }
+  async listReturns(_options: ListReturnsOptions): Promise<ReturnPage> {
+    return { entries: [] };
+  }
+  async getReturn(_returnId: string): Promise<AuthorizedReturn> { this.#deny(); }
+  async getEvidence(_refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> { this.#deny(); }
+  async getDocumentEvidence(
+      _gadgetId: WorkpieceId, _chatId?: number): Promise<DocumentEvidenceView> {
+    this.#deny();
+  }
+  async setDocumentCitations(
+      _input: SetDocumentCitationsInput, _chatId?: number): Promise<CitationMutationResult> {
+    this.#deny();
+  }
+  async setCitationMode(
+      _input: SetCitationModeInput, _chatId?: number): Promise<CitationMutationResult> {
+    this.#deny();
+  }
+  async deleteReturn(_returnId: string): Promise<void> { this.#deny(); }
   async listObserverRequirements(
       _role: CollaboratorRole): Promise<ObserverBindingNeed[]> { this.#deny(); }
   async listCollaborators(): Promise<CollaboratorInfo[]> { this.#deny(); }
@@ -11232,8 +12801,13 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
   private implementation: OverseerImpl;
 
-  constructor(impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string, private sessionGuard?: HumanSessionGuard) {
+  constructor(
+    impl: OverseerImpl,
+    private id: WorkpieceId,
+    private clientUserId: string,
+    private includePrivateEvidence: boolean,
+    private sessionGuard?: HumanSessionGuard,
+  ) {
     super();
     this.implementation = impl;
   }
@@ -11288,7 +12862,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async export(formatId: string, chatId?: number): Promise<ReadableStream<Uint8Array>> {
-    return this.impl.exportGadget(this.id, formatId, chatId);
+    return this.impl.exportGadget(this.id, formatId, chatId, this.includePrivateEvidence);
   }
 
   async listBindings(chatId?: number): Promise<GadgetBindingInfo[]> {
@@ -11727,6 +13301,45 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
         controller: Fetcher<HookController<Hook>>, callback: NativeRpcStub<Hook>,
         description: HookDescription): Promise<void> {
     return this.impl.bindHook(this.gatekeeperId, controller, callback, description, this.caller);
+  }
+
+  @skipRpcValidation()
+  prepareToolObservation(request: ToolObservationRequest): Promise<NativeRpcStub<ToolReturnCapture> | undefined> {
+    return this.impl.prepareToolObservation(this.gatekeeperId, request, this.caller);
+  }
+
+  authorizeActionReturn(
+    returnId: string,
+    description: ObservationDescription,
+  ): Promise<string | null> {
+    return this.impl.authorizeActionReturn(
+      this.gatekeeperId,
+      this.caller,
+      returnId,
+      description,
+    );
+  }
+}
+
+@validateRpc()
+class ToolReturnCaptureImpl extends NativeRpcTarget implements ToolReturnCapture {
+  constructor(
+    private impl: OverseerImpl,
+    private params: {
+      actionRecordId: number;
+      chatId: number;
+      gatekeeperId: number;
+      connectionGeneration?: number;
+      tool: string;
+      returnId: string;
+      observed?: boolean;
+    },
+  ) {
+    super();
+  }
+
+  async captureResult(result: CapturedToolResult): Promise<ToolReturnCaptureOutcome> {
+    return this.impl.captureToolReturn(this.params, result);
   }
 }
 

@@ -39,6 +39,10 @@ export type McpCallResult =
       structuredContent?: unknown;
       /** True when the tool itself reported failure (the call succeeded; the tool did not). */
       isError?: boolean;
+      /** Stable return ID for durable citation, present only when capture succeeded in a chat context. */
+      returnId?: string;
+      /** Present when durable return capture failed; the call result is delivered without a citable return ID. */
+      captureError?: string;
     }
   | {
       status: "pending";

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DocumentExportProjection } from "@gadgets/workshop-shared/citations";
 
 const launch = vi.hoisted(() => vi.fn());
 vi.mock("@cloudflare/puppeteer", () => ({ launch }));
@@ -205,6 +206,7 @@ function render(
   pdfChunks?: string[],
   closePdf = true,
   contentType = "application/pdf",
+  documentProjection?: DocumentExportProjection,
 ) {
   let { gadget, harness } = makeHarness(pdfChunks, closePdf);
   let stream = renderGadgetInBrowser(
@@ -219,6 +221,7 @@ function render(
       contentType,
       fileExtension: ".test",
     },
+    documentProjection,
   );
   return { stream, harness };
 }
@@ -323,6 +326,46 @@ describe("renderGadgetInBrowser", () => {
     expect(harness.exportDocumentCsp()).toContain("img-src data: blob:");
     expect(harness.exportDocumentCsp()).toContain("media-src data: blob:");
     expect(harness.blobRequestContinued()).toBe(true);
+  });
+
+  it("initializes the browser client with one frozen minimized document projection", async () => {
+    const projection: DocumentExportProjection = {
+      document: {
+        revision: 4,
+        title: "Frozen document",
+        blocks: [{ id: "block-1", html: "<p>Visible document</p>", version: 2 }],
+      },
+      citations: {
+        documentRevision: 4,
+        citationRevision: 3,
+        mode: "endnotes",
+        links: [{ blockId: "block-1", state: "valid", evidence: [0] }],
+        evidence: [
+          {
+            text: "Visible evidence",
+            kind: "excerpt",
+            sources: [
+              {
+                ref: "vault://team/note",
+                type: "note",
+                title: "Source note",
+                href: "https://vault.example.test/app/notas?brain=team&slug=note",
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const { stream, harness } = render(undefined, true, "application/pdf", projection);
+
+    await collect(await stream);
+    const src = /<script src="([^"]+)"/.exec(harness.exportDocument())?.[1];
+    expect(src).toBeDefined();
+    const runtime = decodeURIComponent(src!.replace("data:text/javascript;charset=utf-8,", ""));
+    expect(runtime).toContain(JSON.stringify(projection));
+    expect(runtime).not.toContain("__workshopDocumentCitationProjection");
+    expect(runtime).not.toContain("return-1");
+    expect(runtime).not.toContain("citation-1");
   });
 
   it("exports an inert snapshot with locally bundled DOMPurify", async () => {

@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 
 import { McpSessionBase, type McpSessionHost, type StoredAction } from "../src/session.js";
 import { MAX_TOOL_NAME_CHARS } from "../src/client.js";
+import type { WithClientOptions } from "../src/connection.js";
 import { classifyTool } from "../src/tools.js";
 
 it("reports an execution failure distinctly from a rejected approval", async () => {
@@ -260,6 +261,214 @@ it("refuses oversized tool names before consulting the host", async () => {
 
   await expect(session.callTool(oversized)).rejects.toThrow(/tool name.*at most/i);
   expect(finds).toBe(0);
+});
+
+it("allocates before I/O and captures read result before delivery when chat is active", async () => {
+  const entry = classifyTool({ name: "search", annotations: { readOnlyHint: true } }, "byo");
+  let ioCompleted = false;
+  let prepareCalledBeforeIo = false;
+  let captured = false;
+
+  const host = {
+    serverName: "Vault",
+    endpoint: "https://vault.example.com",
+    scope: {},
+    sourceProvider: "vault" as const,
+    vaultWebUrl: "https://vault.example/",
+    findTool: async () => entry,
+    call: async <T>(
+      fn: (client: { callTool(): Promise<{ content: { type: "text"; text: string }[]; structuredContent: { facts: never[] } }> }) => Promise<T>,
+      options: WithClientOptions,
+    ) => {
+      await options.onConnection?.({ generation: 2, secrets: ["vault-secret"] });
+      ioCompleted = true;
+      return fn({
+        callTool: async () => ({
+          content: [{ type: "text" as const, text: "knowledge" }],
+          structuredContent: { facts: [] },
+        }),
+      });
+    },
+  } as unknown as McpSessionHost;
+
+  const queue = {
+    assertAppAccess() {},
+    prepareToolObservation: async (req: any) => {
+      prepareCalledBeforeIo = !ioCompleted;
+      expect(req.tool).toBe("search");
+      expect(req.connectionGeneration).toBe(2);
+      return {
+        captureResult: async (res: any) => {
+          captured = true;
+          expect(res.connectionGeneration).toBe(2);
+          expect(res.secrets).toEqual(["vault-secret"]);
+          expect(res.content[0].text).toBe("knowledge");
+          expect(res.sourceProvider).toBe("vault");
+          expect(res.vaultWebUrl).toBe("https://vault.example/");
+          return { status: "stored" as const, returnId: "ret_obs_1", byteCount: 50 };
+        },
+      };
+    },
+    authorizeObservation: () => {},
+  };
+
+  const session = new McpSessionBase(host, queue as never);
+  const result = await session.callTool("search", { q: "test" });
+
+  expect(prepareCalledBeforeIo).toBe(true);
+  expect(captured).toBe(true);
+  expect(result).toMatchObject({
+    status: "ok",
+    text: "knowledge",
+    returnId: "ret_obs_1",
+  });
+});
+
+it("surfaces capture failure without returnId when storage capture fails", async () => {
+  const entry = classifyTool({ name: "search", annotations: { readOnlyHint: true } }, "byo");
+  const host = {
+    serverName: "Vault",
+    endpoint: "https://vault.example.com",
+    scope: {},
+    findTool: async () => entry,
+    call: async <T>(
+      fn: (client: { callTool(): Promise<{ content: { type: "text"; text: string }[] }> }) => Promise<T>,
+      options: WithClientOptions,
+    ) => {
+      await options.onConnection?.({ generation: 3, secrets: ["rotated-secret"] });
+      return fn({
+        callTool: async () => ({ content: [{ type: "text" as const, text: "data" }] }),
+      });
+    },
+  } as unknown as McpSessionHost;
+
+  const queue = {
+    assertAppAccess() {},
+    prepareToolObservation: async () => ({
+      captureResult: async () => ({ status: "failed" as const, error: "Quota exceeded" }),
+    }),
+    authorizeObservation: () => {},
+  };
+
+  const session = new McpSessionBase(host, queue as never);
+  const result = await session.callTool("search");
+
+  expect(result.status).toBe("ok");
+  if (result.status === "ok") {
+    expect(result.returnId).toBeUndefined();
+    expect(result.captureError).toBe("Quota exceeded");
+  }
+});
+
+it("reuses the same returnId when getActionResult is called repeatedly", async () => {
+  const appliedAction: StoredAction = {
+    id: 10,
+    toolName: "create_doc",
+    args: {},
+    state: "applied",
+    submittedAt: 0,
+    returnId: "ret_act_10",
+    result: undefined,
+  };
+  const observations: unknown[] = [];
+  const host = {
+    serverName: "Docs",
+    endpoint: "https://docs.example.com",
+    scope: {},
+    lookupAction: () => appliedAction,
+    deleteActionReturn: () => {},
+  } as unknown as McpSessionHost;
+  const queue = {
+    assertAppAccess() {},
+    authorizeActionReturn: (_returnId: string, desc: unknown) => {
+      observations.push(desc);
+      return JSON.stringify({
+        content: [{ type: "text", text: "Created document" }],
+      });
+    },
+  };
+
+  const session = new McpSessionBase(host, queue as never);
+  const first = await session.getActionResult(10);
+  const second = await session.getActionResult(10);
+
+  expect(first).toEqual(second);
+  if (first.status === "ok" && second.status === "ok") {
+    expect(first.returnId).toBe("ret_act_10");
+    expect(second.returnId).toBe("ret_act_10");
+  }
+  expect(observations).toHaveLength(2); // Each collection audits the observation
+});
+
+it("disposes observation capture handle when host.call fails (RAG-OS-008)", async () => {
+  const entry = classifyTool({ name: "search", annotations: { readOnlyHint: true } }, "byo");
+  let disposed = false;
+
+  const host = {
+    serverName: "Vault",
+    endpoint: "https://vault.example.com",
+    scope: {},
+    findTool: async () => entry,
+    call: async <T>(
+      _fn: (client: never) => Promise<T>,
+      options: WithClientOptions,
+    ) => {
+      await options.onConnection?.({ generation: 4, secrets: ["vault-secret"] });
+      throw new Error("Network timeout contacting MCP endpoint");
+    },
+  } as unknown as McpSessionHost;
+
+  const queue = {
+    assertAppAccess() {},
+    prepareToolObservation: async () => ({
+      captureResult: async () => ({ status: "stored" as const, returnId: "ret_1", byteCount: 10 }),
+      [Symbol.dispose]: () => {
+        disposed = true;
+      },
+    }),
+    authorizeObservation: () => {},
+  };
+
+  const session = new McpSessionBase(host, queue as never);
+  await expect(session.callTool("search")).rejects.toThrow(/Network timeout/);
+  expect(disposed).toBe(true);
+});
+
+it("marks action result failed if its return was deleted before collection (RAG-OS-006)", async () => {
+  const appliedAction: StoredAction = {
+    id: 15,
+    toolName: "create_doc",
+    args: {},
+    state: "applied",
+    submittedAt: 0,
+    returnId: "ret_deleted_15",
+    result: undefined,
+  };
+  let deletedId: number | undefined;
+  const host = {
+    serverName: "Docs",
+    endpoint: "https://docs.example.com",
+    scope: {},
+    lookupAction: () => appliedAction,
+    deleteActionReturn: (id: number) => {
+      deletedId = id;
+    },
+  } as unknown as McpSessionHost;
+  const queue = {
+    assertAppAccess() {},
+    authorizeActionReturn: async (returnId: string) => {
+      expect(returnId).toBe("ret_deleted_15");
+      return null;
+    },
+  };
+
+  const session = new McpSessionBase(host, queue as never);
+  const outcome = await session.getActionResult(15);
+  expect(outcome.status).toBe("failed");
+  if (outcome.status === "failed") {
+    expect(outcome.message).toContain("deleted");
+  }
+  expect(deletedId).toBe(15);
 });
 
 it("denies every retained MCP read before consulting the host", async () => {

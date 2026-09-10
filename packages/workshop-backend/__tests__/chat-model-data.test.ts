@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, ToolCall } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import type { AiToolCall } from "@gadgets/workshop-shared/api";
-import { makeStoredAssistantMessage, rehydrateStoredAssistantMessage } from "../src/agent.js";
+import {
+  makeStoredAssistantMessage,
+  publicToolCallInput,
+  rehydrateStoredAssistantMessage,
+} from "../src/agent.js";
 
 // A representative completed step: signed thinking, redacted thinking, signed text, and two tool
 // calls (one with a Google-style thought signature). Extra fields unknown to the Workshop stand in
@@ -79,6 +83,64 @@ describe("rehydrateStoredAssistantMessage", () => {
         stored, makeToolCallRecords().slice(0, 1), 1, 2);
 
     expect(result).toBeUndefined();
+  });
+});
+
+describe("private citation tool data", () => {
+  it("keeps evidence references only in the private snapshot and rehydrates them", () => {
+    const args = {
+      refs: [{returnId: "private-return", evidenceId: "private-evidence"}],
+    };
+    const message = {
+      ...makeAssistantMessage(),
+      content: [{
+        type: "toolCall",
+        id: "citation-call",
+        name: "getEvidence",
+        arguments: args,
+      }],
+    } as AssistantMessage;
+    const stored = makeStoredAssistantMessage(message);
+    const storedCall = stored.content[0];
+
+    expect(storedCall).toMatchObject({type: "toolCall", arguments: args});
+    const publicRecord: AiToolCall = {
+      toolCallId: "citation-call",
+      toolName: "getEvidence",
+      input: {count: 1},
+    };
+    expect(rehydrateStoredAssistantMessage(stored, [publicRecord], 1, 2)).toEqual(message);
+  });
+
+  it("removes evidence refs, links, and revisions from public transcript inputs", () => {
+    const evidenceRead = publicToolCallInput({
+      type: "toolCall",
+      id: "read",
+      name: "getEvidence",
+      arguments: {
+        refs: [{returnId: "private-return", evidenceId: "private-evidence"}],
+      },
+    } as ToolCall);
+    const citationWrite = publicToolCallInput({
+      type: "toolCall",
+      id: "write",
+      name: "setDocumentCitations",
+      arguments: {
+        gadget: "DOC",
+        expectedDocumentRevision: 17,
+        expectedCitationRevision: 5,
+        links: [{
+          blockId: "private-block",
+          evidence: [{returnId: "private-return", evidenceId: "private-evidence"}],
+        }],
+        mode: "endnotes",
+      },
+    } as ToolCall);
+
+    expect(evidenceRead).toEqual({count: 1});
+    expect(citationWrite).toEqual({gadget: "DOC", linkCount: 1, mode: "endnotes"});
+    expect(JSON.stringify([evidenceRead, citationWrite])).not.toContain("private-");
+    expect(JSON.stringify(citationWrite)).not.toContain("Revision");
   });
 });
 

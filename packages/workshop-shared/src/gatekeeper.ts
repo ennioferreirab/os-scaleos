@@ -904,7 +904,14 @@ export interface Gatekeeper<Session> extends DurableObject {
    * the gatekeeper is nevertheless expected to submit all actions for approval; there is no mode
    * in which it's OK to skip the check.
    */
-  applyAction(action: number): Promise<void>;
+  applyAction(action: number, capture?: RpcStub<ToolReturnCapture>): Promise<void>;
+
+  /**
+   * Clears a completed action's retained result without removing the action tombstone. Gatekeepers
+   * that retain action results implement this so explicit return/chat deletion removes every live
+   * payload copy without making the action replayable.
+   */
+  deleteActionReturn?(action: number): Promise<void>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
@@ -955,6 +962,67 @@ export interface ObservationAuthorizer extends RpcTarget {
    * data to the gadget, this is OK.
    */
   authorizeObservation(description: ObservationDescription): Promise<void>;
+}
+
+/**
+ * Request to prepare and authorize an observation for a tool call before external I/O.
+ */
+export type ToolObservationRequest = {
+  /** The wire name of the tool to execute. */
+  tool: string;
+  /** The human-readable description and policy metadata for the observation. */
+  description: ObservationDescription;
+  /** The observed connection generation, if known. */
+  connectionGeneration?: number;
+};
+
+/**
+ * Application-level result of an MCP tool call to capture.
+ */
+export type CapturedToolResult = {
+  /** Content blocks returned by the server. */
+  content?: unknown[];
+  /** Structured JSON content returned by the server, if any. */
+  structuredContent?: unknown;
+  /** True when the tool itself reported failure. */
+  isError?: boolean;
+  /** Observed executing connection generation. */
+  connectionGeneration?: number;
+  /** Known connection secrets to redact from persisted application content. */
+  secrets?: string[];
+  /** Trusted connector classification used to select a strict evidence normalizer. */
+  sourceProvider?: "vault";
+  /** Trusted human Vault URL captured from deployment configuration, never from MCP payload. */
+  vaultWebUrl?: string;
+};
+
+/**
+ * Outcome of capturing a tool result.
+ */
+export type ToolReturnCaptureOutcome =
+  | {
+      /** Successful capture state. */
+      status: "stored" | "partial";
+      /** Workspace-local durable return ID. */
+      returnId: string;
+      /** Byte count of the application payload. */
+      byteCount: number;
+    }
+  | {
+      /** Capture failure state. */
+      status: "failed";
+      /** Error explaining why capture failed (e.g. quota exceeded). */
+      error: string;
+    };
+
+/**
+ * Capability for capturing an authorized tool call's application result before delivery to the caller.
+ */
+export interface ToolReturnCapture extends RpcTarget {
+  /**
+   * Record the application payload of the completed tool call.
+   */
+  captureResult(result: CapturedToolResult): Promise<ToolReturnCaptureOutcome>;
 }
 
 /**
@@ -1050,6 +1118,27 @@ export interface ApprovalQueue extends ObservationAuthorizer {
    *   does not complete, any SQL writes performed just before submit() are rolled back...
    */
   submitAction(action: number, description: ActionDescription): Promise<void>;
+
+  /**
+   * Authorizes an applied action result as an observation, then resolves its retained payload.
+   * Resolution is bound to this queue's gatekeeper and caller and happens after authorization so
+   * concurrent deletion cannot expose an earlier cached copy. The string is the sanitized JSON
+   * payload; null means the return is unavailable or does not belong to this queue.
+   */
+  authorizeActionReturn(
+    returnId: string,
+    description: ObservationDescription,
+  ): Promise<string | null>;
+
+  /**
+   * Prepares and authorizes an observation for an MCP tool call before external I/O takes place.
+   * When the caller is associated with a chat, an ActionRecord is allocated and an active
+   * ToolReturnCapture contract stub is returned to capture the application payload before delivery.
+   * When no chat is associated, authorizes the observation normally and returns undefined.
+   */
+  prepareToolObservation?(
+    request: ToolObservationRequest,
+  ): Promise<RpcStub<ToolReturnCapture> | undefined>;
 
   /**
    * Notifies the overseer that the gadget (or an agent) has requested to register a persistent

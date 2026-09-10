@@ -2033,6 +2033,52 @@ export interface Overseer extends RpcTarget {
       : Promise<ActionHistoryPage>;
 
   /**
+   * Fetch one page of summarized tool returns captured for a chat session.
+   */
+  listReturns(options: ListReturnsOptions): Promise<ReturnPage>;
+
+  /**
+   * Retrieve an authorized tool return and its application payload by return ID.
+   */
+  getReturn(returnId: string): Promise<AuthorizedReturn>;
+
+  /**
+   * Resolve evidence references from returns owned by this workspace.
+   *
+   * The result contains no application text for references that are unavailable. The owner-only
+   * implementation checks the return's chat and observation state before exposing each item.
+   */
+  getEvidence(refs: EvidenceRef[]): Promise<AuthorizedEvidence[]>;
+
+  /**
+   * Read the current document and its citation projection for a document-capable gadget.
+   * `chatId` selects that chat's live gadget code, including a provisional document created there.
+   *
+   * This is owner-only; unsupported/custom document gadgets fail without being rewritten.
+   */
+  getDocumentEvidence(gadgetId: WorkpieceId, chatId?: number): Promise<DocumentEvidenceView>;
+
+  /**
+   * Replace a document's citation links after checking both the document and citation revisions.
+   * `chatId` selects that chat's live gadget code.
+   *
+   * This is owner-only and stores only local evidence references plus block anchors.
+   */
+  setDocumentCitations(
+      input: SetDocumentCitationsInput, chatId?: number): Promise<CitationMutationResult>;
+
+  /**
+   * Change only the document's citation presentation mode using a citation-revision CAS.
+   * `chatId` selects that chat's live gadget code.
+   */
+  setCitationMode(input: SetCitationModeInput, chatId?: number): Promise<CitationMutationResult>;
+
+  /**
+   * Delete an authorized tool return and its stored application payload.
+   */
+  deleteReturn(returnId: string): Promise<void>;
+
+  /**
    * Approve an action that is currently in the "pending" state. The action will be performed on
    * approval.
    */
@@ -2781,6 +2827,369 @@ export type ActionHistoryPage = {
   nextBeforeId?: number;
 };
 
+/** Provider source metadata retained inside one captured return. */
+export type EvidenceSource = {
+  /** Provider-local source identifier; only meaningful within its containing return. */
+  id: string;
+  /** Human-readable provider reference, not an authorization grant. */
+  ref: string;
+  /** Provider-defined source type, retained for display and filtering only. */
+  type: string;
+  title?: string;
+  occurredAt?: string;
+  /** Provider classification for display; it never grants access. */
+  sensitivity?: string;
+  /** Human navigation identity for a Vault note, when supplied by Vault. */
+  note?: {
+    brain: string;
+    slug: string;
+  };
+};
+
+/** Normalized evidence that can be cited without treating the whole return as one source. */
+export type Evidence = {
+  /** Provider-local evidence identifier; only meaningful within its containing return. */
+  id: string;
+  sourceIds: string[];
+  text: string;
+  kind: "fact" | "excerpt" | "synthesis" | "unknown";
+  locator?: string;
+  /**
+   * Factual confidence score between 0 and 1 from the same execution.
+   * Only emitted and accepted for kind "fact" with finite numbers in [0, 1];
+   * omitted for excerpt, synthesis, or unknown kinds. Never inferred from text.
+   */
+  confidence?: number;
+};
+
+/** Claim-to-evidence association supplied by the provider for this execution. */
+export type ReturnAnswerLink = {
+  claimIndex: number;
+  evidenceIds: string[];
+};
+/** Presentation mode for document citation markers and endnotes. */
+export type CitationMode = "inline" | "endnotes" | "none";
+
+/** Local reference to one evidence item retained in one captured return. */
+export type EvidenceRef = {
+  /** Workspace-local ID of the captured return containing the evidence. */
+  returnId: string;
+  /** Provider-local evidence ID within that return. */
+  evidenceId: string;
+};
+
+/** Citation link anchored to one immutable document block version. */
+export type DocumentCitation = {
+  /** Workspace-local identifier for this citation link. */
+  id: string;
+  /** Stable document block ID containing the citation marker. */
+  blockId: string;
+  /** Document block version observed when this link was saved. */
+  blockVersion: number;
+  /** SHA-256 hash of the block HTML observed when this link was saved. */
+  blockHash: string;
+  /** Evidence references displayed by this citation marker. */
+  evidence: EvidenceRef[];
+};
+
+/** Private citation set persisted for a document gadget. */
+export type CitationSet = {
+  /** Document gadget owning this citation set. */
+  gadgetId: WorkpieceId;
+  /** Monotonic revision used for citation metadata compare-and-swap. */
+  citationRevision: number;
+  /** Presentation mode for this document's citations. */
+  mode: CitationMode;
+  /** Citation links for the saved document revision. */
+  links: DocumentCitation[];
+};
+
+/** Client-provided citation link before the host adds block version and hash. */
+export type DocumentCitationInput = {
+  /** Optional stable identifier; generated by the host when absent. */
+  id?: string;
+  /** Stable document block ID to anchor this citation to. */
+  blockId: string;
+  /** Evidence references attached to this citation marker. */
+  evidence: EvidenceRef[];
+};
+
+/** Input for replacing a document's citation links with a document CAS check. */
+export type SetDocumentCitationsInput = {
+  /** Document gadget whose citations are being replaced. */
+  gadgetId: WorkpieceId;
+  /** Document revision the caller read before building these links. */
+  expectedDocumentRevision: number;
+  /** Citation metadata revision the caller read before this replacement. */
+  expectedCitationRevision: number;
+  /** Citation links to validate and persist. */
+  links: DocumentCitationInput[];
+  /** Optional mode change applied atomically with the link replacement. */
+  mode?: CitationMode;
+};
+
+/** Input for changing only a document's citation presentation mode. */
+export type SetCitationModeInput = {
+  /** Document gadget whose citation mode is being changed. */
+  gadgetId: WorkpieceId;
+  /** Citation metadata revision the caller read before this change. */
+  expectedCitationRevision: number;
+  /** New citation presentation mode. */
+  mode: CitationMode;
+};
+
+/** Result of a citation metadata compare-and-swap mutation. */
+export type CitationMutationResult =
+  | {
+      /** The mutation was committed. */
+      status: "applied";
+      /** New citation metadata revision. */
+      citationRevision: number;
+      /** Document content revision observed by the host. */
+      documentRevision: number;
+      /** Effective presentation mode after the mutation. */
+      mode: CitationMode;
+    }
+  | {
+      /** A document or citation revision changed; no metadata was written. */
+      status: "conflict";
+      /** Current citation metadata revision. */
+      citationRevision: number;
+      /** Current document content revision observed by the host. */
+      documentRevision: number;
+      /** Current persisted presentation mode. */
+      mode: CitationMode;
+    };
+
+/** State derived by comparing one saved citation anchor with the current document. */
+export type CitationState = "valid" | "needs_review" | "orphaned" | "unavailable";
+
+/** An evidence reference resolved under the current workspace authorization. */
+export type AuthorizedEvidence =
+  | {
+      /** Evidence was available and includes its retained text. */
+      status: "available";
+      /** Reference used to resolve this item. */
+      ref: EvidenceRef;
+      /** Return containing this evidence. */
+      returnId: string;
+      /** Human Vault URL frozen with the captured return, when available. */
+      vaultWebUrl?: string;
+      /** Normalized evidence item. */
+      evidence: Evidence;
+      /** Sources retained alongside the return. */
+      sources: EvidenceSource[];
+    }
+  | {
+      /** Evidence is not currently available to this caller. */
+      status: "unavailable";
+      /** Reference that could not be resolved. */
+      ref: EvidenceRef;
+      /** User-safe explanation that does not disclose hidden payload data. */
+      reason: string;
+    };
+
+/** Citation link with validity derived from the current document and evidence access. */
+export type DocumentCitationView = DocumentCitation & {
+  /** Current state of this citation link. */
+  state: CitationState;
+};
+
+/** Current document citation projection and its authorized evidence details. */
+export type DocumentEvidenceView = {
+  /** Document gadget owning this projection. */
+  gadgetId: WorkpieceId;
+  /** Current document content revision. */
+  documentRevision: number;
+  /** Current citation metadata revision. */
+  citationRevision: number;
+  /** Current citation presentation mode. */
+  mode: CitationMode;
+  /** Citation links with current validity states. */
+  links: DocumentCitationView[];
+  /** Unique evidence referenced by the links, in link order. */
+  evidence: AuthorizedEvidence[];
+};
+
+
+
+/**
+ * Durable record of an authorized MCP tool return captured in a chat session.
+ */
+export type ToolReturn = {
+  /** Workspace-unique local return ID. */
+  id: string;
+  /** ID of the ActionRecord documenting this tool call in the audit log. */
+  actionRecordId: number;
+  /** Chat ID when this tool call occurred within an agent or chat session. */
+  chatId?: number;
+  /** ID of the gatekeeper workpiece through which the call was made. */
+  gatekeeperId: number;
+  /** Credential/connection generation observed at the time of the call. */
+  connectionGeneration?: number;
+  /** Wire name of the executed tool. */
+  tool: string;
+  /** Timestamp when the tool call was made. */
+  calledAt: Date;
+  /** Lifecycle execution state of the call. */
+  executionState: "pending" | "applied" | "rejected" | "failed" | "unknown";
+  /** Storage capture state of the returned payload. */
+  captureState: "stored" | "partial" | "failed" | "deleted";
+  /** Storage reference identifying the retained payload. */
+  payloadRef: string;
+  /** Total byte count of the application payload. */
+  byteCount: number;
+  /** Normalization schema version. */
+  normalizationVersion: number;
+  /** Provider-reported coverage metadata. */
+  coverage: {
+    complete: boolean;
+    reasons: string[];
+  };
+  /** Whether sensitive connection secrets were redacted before storage. */
+  redacted: boolean;
+  /** Whether this return's payload has been authorized as an observation. */
+  observed: boolean;
+  /** Trusted provider adapter selected by connector configuration. */
+  sourceProvider?: "vault";
+  /** Human Vault URL frozen from trusted deployment configuration at capture time. */
+  vaultWebUrl?: string;
+  /** Sources normalized and retained inside this return. */
+  sources?: EvidenceSource[];
+  /** Evidence normalized and retained inside this return. */
+  evidence?: Evidence[];
+  /** Provider claim links rewritten to this return's local evidence IDs. */
+  answerLinks?: ReturnAnswerLink[];
+  /** Result of strict provider-envelope normalization. */
+  normalizationState?: "normalized" | "invalid" | "conflict" | "unsupported";
+  /** User-facing explanation when normalization is unavailable. */
+  normalizationReason?: string;
+  /** Bytes retained for normalized records and links. */
+  normalizationByteCount?: number;
+};
+
+/**
+ * Fields safe to disclose for every summarized return, including unobserved action results.
+ */
+type ToolReturnSummaryOperational = {
+  /** Workspace-unique local return ID. */
+  id: string;
+  /** ID of the ActionRecord documenting this tool call in the audit log. */
+  actionRecordId: number;
+  /** Chat ID when this tool call occurred within an agent or chat session. */
+  chatId?: number;
+  /** ID of the gatekeeper workpiece through which the call was made. */
+  gatekeeperId: number;
+  /** Wire name of the executed tool. */
+  tool: string;
+  /** Timestamp when the tool call was made. */
+  calledAt: Date;
+  /** Lifecycle execution state of the call. */
+  executionState: ToolReturn["executionState"];
+  /** Storage capture state of the returned payload. */
+  captureState: ToolReturn["captureState"];
+  /** Whether this return's payload has been authorized as an observation. */
+  observed: boolean;
+  /** Human-readable connector title captured from workspace metadata. */
+  connectorTitle?: string;
+};
+
+/**
+ * Summary of an authorized tool return for listing. Unobserved action results intentionally carry
+ * only operational identity and state; content-derived metadata is present only when observed.
+ */
+export type ToolReturnSummary =
+  | (ToolReturnSummaryOperational & {
+      /** This action result has not been authorized as an observation. */
+      observed: false;
+    })
+  | (ToolReturnSummaryOperational & {
+      /** This return's retained payload has been authorized as an observation. */
+      observed: true;
+      /** Total byte count of the application payload. */
+      byteCount: number;
+      /** Provider-reported coverage metadata. */
+      coverage: {
+        complete: boolean;
+        reasons: string[];
+      };
+      /** Whether sensitive connection secrets were redacted before storage. */
+      redacted: boolean;
+      /** Trusted provider adapter selected by connector configuration. */
+      sourceProvider?: "vault";
+      /** Source types represented by this return. */
+      sourceTypes: string[];
+      /** Number of normalized sources represented by this return. */
+      sourceCount: number;
+      /** Number of normalized evidence items represented by this return. */
+      evidenceCount: number;
+      /** Result of strict provider-envelope normalization. */
+      normalizationState: "normalized" | "invalid" | "conflict" | "unsupported";
+      /** User-facing explanation when normalization is unavailable. */
+      normalizationReason?: string;
+    });
+
+/**
+ * Page of summarized tool returns from listReturns().
+ */
+export type ReturnPage = {
+  /** Matching return summaries, descending by call time. */
+  entries: ToolReturnSummary[];
+  /** Pass as `beforeId` to fetch the next older page; undefined when exhausted. */
+  nextBeforeId?: string;
+};
+
+/**
+ * Query and pagination options for listReturns().
+ */
+export type ListReturnsOptions = {
+  /** Chat ID whose tool returns should be listed. */
+  chatId: number;
+  /** Return ID of the last entry from the previous page. */
+  beforeId?: string;
+  /** Maximum number of records to return (default 25, maximum 100). */
+  limit?: number;
+  /** Text search query (maximum 200 characters). */
+  query?: string;
+  /** Filter by connector gatekeeper ID. */
+  connectorId?: number;
+  /** Filter by source type. */
+  sourceType?: string;
+};
+
+/**
+ * Outcome of querying an authorized tool return.
+ */
+export type AuthorizedReturn =
+  | {
+      status: "available";
+      return: ToolReturn;
+      /** Application content blocks from the MCP server. */
+      content?: unknown[];
+      /** Structured JSON content returned by the tool. */
+      structuredContent?: unknown;
+      /** Combined text content. */
+      text?: string;
+      /** Sources normalized inside this return, empty for generic or invalid returns. */
+      sources: EvidenceSource[];
+      /** Evidence normalized inside this return, empty for generic or invalid returns. */
+      evidence: Evidence[];
+      /** Provider claim links rewritten to local evidence IDs. */
+      answerLinks: ReturnAnswerLink[];
+      /** Result of normalization for viewer disclosure. */
+      normalization: {
+        state: "normalized" | "invalid" | "conflict" | "unsupported";
+        reason?: string;
+      };
+      /** Whether the tool reported an execution error. */
+      isError?: boolean;
+    }
+  | {
+      status: "unavailable";
+      returnId: string;
+      reason: string;
+    };
+
 export type AiChatAuthorInfo = {
   /**
    * Is the author a human, AI, or Gadget?
@@ -3362,6 +3771,49 @@ export type AiToolCall = {
     bindingName?: string;
   };
   output?: string;
+} | {
+  /** Resolve retained evidence references from the current agent chat. */
+  toolName: "getEvidence";
+  /**
+   * Public transcript metadata only. The evidence references are retained in the server-private
+   * model snapshot and never exposed through the chat history API.
+   */
+  input: {
+    count: number;
+  };
+} | {
+  /** Read the current citation projection of a document-capable gadget. */
+  toolName: "getDocumentEvidence";
+  /** Public transcript metadata only; the private model snapshot retains the call arguments. */
+  input: {
+    /** Chat binding name of the document gadget. */
+    gadget: string;
+  };
+} | {
+  /** Replace a document's citation links with document and citation CAS checks. */
+  toolName: "setDocumentCitations";
+  /** Public transcript metadata only; evidence refs and expected revisions stay private. */
+  input: {
+    /** Chat binding name of the document gadget. */
+    gadget: string;
+    /** Number of citation links supplied to the mutation. */
+    linkCount: number;
+    /** Optional presentation mode applied with the replacement. */
+    mode?: CitationMode;
+  };
+  /** CAS metadata is safe to retain in the public transcript. */
+  output?: CitationMutationResult;
+} | {
+  /** Change a document's citation presentation mode with a citation CAS check. */
+  toolName: "setCitationMode";
+  /** Public transcript metadata only; the expected revision stays private. */
+  input: {
+    /** Chat binding name of the document gadget. */
+    gadget: string;
+    mode?: CitationMode;
+  };
+  /** CAS metadata is safe to retain in the public transcript. */
+  output?: CitationMutationResult;
 });
 
 // TODO: Extend AiToolCall for code-mode tool calls.

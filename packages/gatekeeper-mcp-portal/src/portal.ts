@@ -921,6 +921,15 @@ export class McpGatekeeperImpl
     return this.ctx.exports.McpAccount.get(
       this.ctx.exports.McpAccount.idFromString(this.ctx.props.accountObjectId));
   }
+  get sourceProvider(): "vault" | undefined {
+    return this.ctx.props.vaultIdentity ? "vault" : undefined;
+  }
+  get vaultWebUrl(): string | undefined {
+    const config = readPortalConfig(this.env);
+    return this.ctx.props.vaultIdentity && config?.auth === "vault-token"
+      ? config.vaultWebUrl
+      : undefined;
+  }
 
   protected get trust(): ServerTrust {
     return portalTrust(this.env);
