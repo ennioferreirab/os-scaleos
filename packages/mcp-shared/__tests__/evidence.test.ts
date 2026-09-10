@@ -12,11 +12,8 @@ const response = {
       ref: "reuniao-entrega",
       type: "reuniao",
       title: "Reunião de entrega",
-      observedAccess: {
-        type: "reuniao",
-        tags: ["projeto:alpha"],
-        sensitivity: "internal",
-      },
+      sensitivity: "internal",
+      note: { brain: "brain_1", slug: "reuniao-entrega" },
     }],
     items: [{
       id: "evidence_1",
@@ -44,6 +41,8 @@ describe("Vault evidence normalization", () => {
       id: "source_1",
       ref: "reuniao-entrega",
       type: "reuniao",
+      sensitivity: "internal",
+      note: { brain: "brain_1", slug: "reuniao-entrega" },
     });
     expect(result.envelope.items[0]).toMatchObject({
       id: "evidence_1",
@@ -68,6 +67,45 @@ describe("Vault evidence normalization", () => {
     expect(normalizeVaultEvidence(danglingEvidence, [])).toEqual({
       status: "invalid",
       reason: "Vault evidence envelope contains an invalid answer link.",
+    });
+  });
+
+  it("rejects duplicate provider IDs within one return", () => {
+    const duplicateSource = structuredClone(response);
+    duplicateSource.evidence.sources.push({
+      ...duplicateSource.evidence.sources[0],
+      id: "source_1",
+      ref: "another",
+    });
+    expect(normalizeVaultEvidence(duplicateSource, [])).toEqual({
+      status: "invalid",
+      reason: "Vault evidence envelope contains an invalid source.",
+    });
+
+    const duplicateEvidence = structuredClone(response);
+    duplicateEvidence.evidence.items.push({
+      ...duplicateEvidence.evidence.items[0],
+      text: "duplicated",
+    });
+    expect(normalizeVaultEvidence(duplicateEvidence, [])).toEqual({
+      status: "invalid",
+      reason: "Vault evidence envelope contains an invalid evidence item.",
+    });
+  });
+
+  it("rejects the old observedAccess source metadata", () => {
+    const legacySource = structuredClone(response);
+    const source = legacySource.evidence.sources[0] as Record<string, unknown>;
+    source.observedAccess = {
+      type: "reuniao",
+      tags: ["projeto:alpha"],
+      sensitivity: "internal",
+    };
+    delete source.sensitivity;
+    delete source.note;
+    expect(normalizeVaultEvidence(legacySource, [])).toEqual({
+      status: "invalid",
+      reason: "Vault evidence envelope contains an invalid source.",
     });
   });
 

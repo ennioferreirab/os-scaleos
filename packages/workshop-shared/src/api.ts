@@ -2796,29 +2796,29 @@ export type ActionHistoryPage = {
   nextBeforeId?: number;
 };
 
-/** Immutable metadata snapshot for one provider source observed by a captured return. */
-export type SourceSnapshot = {
+/** Provider source metadata retained inside one captured return. */
+export type EvidenceSource = {
+  /** Provider-local source identifier; only meaningful within its containing return. */
   id: string;
-  gatekeeperId: number;
-  connectionGeneration?: number;
-  provider: "vault";
+  /** Human-readable provider reference, not an authorization grant. */
   ref: string;
+  /** Provider-defined source type, retained for display and filtering only. */
   type: string;
   title?: string;
   occurredAt?: string;
-  observedAccess: {
-    type: string;
-    tags: string[];
-    sensitivity: string;
+  /** Provider classification for display; it never grants access. */
+  sensitivity?: string;
+  /** Human navigation identity for a Vault note, when supplied by Vault. */
+  note?: {
+    brain: string;
+    slug: string;
   };
-  /** SHA-256 of the evidence text observed for this source; not a truth certificate. */
-  contentHash: string;
 };
 
 /** Normalized evidence that can be cited without treating the whole return as one source. */
 export type Evidence = {
+  /** Provider-local evidence identifier; only meaningful within its containing return. */
   id: string;
-  gatekeeperId: number;
   sourceIds: string[];
   text: string;
   kind: "fact" | "excerpt" | "synthesis" | "unknown";
@@ -2830,6 +2830,7 @@ export type ReturnAnswerLink = {
   claimIndex: number;
   evidenceIds: string[];
 };
+
 
 /**
  * Durable record of an authorized MCP tool return captured in a chat session.
@@ -2870,11 +2871,13 @@ export type ToolReturn = {
   observed: boolean;
   /** Trusted provider adapter selected by connector configuration. */
   sourceProvider?: "vault";
-  /** Local normalized source snapshots referenced by this return. */
-  sourceIds?: string[];
-  /** Local normalized evidence referenced by this return. */
-  evidenceIds?: string[];
-  /** Provider claim links rewritten to local evidence IDs. */
+  /** Human Vault URL frozen from trusted deployment configuration at capture time. */
+  vaultWebUrl?: string;
+  /** Sources normalized and retained inside this return. */
+  sources?: EvidenceSource[];
+  /** Evidence normalized and retained inside this return. */
+  evidence?: Evidence[];
+  /** Provider claim links rewritten to this return's local evidence IDs. */
   answerLinks?: ReturnAnswerLink[];
   /** Result of strict provider-envelope normalization. */
   normalizationState?: "normalized" | "invalid" | "conflict" | "unsupported";
@@ -2972,9 +2975,9 @@ export type AuthorizedReturn =
       structuredContent?: unknown;
       /** Combined text content. */
       text?: string;
-      /** Strictly normalized source snapshots, empty for generic or invalid returns. */
-      sources: SourceSnapshot[];
-      /** Strictly normalized evidence, empty for generic or invalid returns. */
+      /** Sources normalized inside this return, empty for generic or invalid returns. */
+      sources: EvidenceSource[];
+      /** Evidence normalized inside this return, empty for generic or invalid returns. */
       evidence: Evidence[];
       /** Provider claim links rewritten to local evidence IDs. */
       answerLinks: ReturnAnswerLink[];

@@ -154,6 +154,7 @@ export class ActionStore {
     log: McpLog,
     capture?: RpcStub<ToolReturnCapture> | { captureResult(result: CapturedToolResult): Promise<ToolReturnCaptureOutcome> },
     sourceProvider?: "vault",
+    vaultWebUrl?: string,
   ): Promise<void> {
     const stored = this.get(id);
     if (!stored) throw new Error(`MCP action ${id} is unknown.`);
@@ -215,6 +216,7 @@ export class ActionStore {
           isError: result.isError,
           connectionGeneration: connection.generation,
           secrets: connection.secrets,
+          vaultWebUrl,
           sourceProvider,
         });
         if (outcome.status === "stored" || outcome.status === "partial") {

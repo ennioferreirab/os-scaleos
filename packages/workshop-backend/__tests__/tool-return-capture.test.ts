@@ -76,6 +76,7 @@ describe("Tool Return Capture (T01)", () => {
         expect(retrieved.text).toBe("A entrega foi acordada para 20 de outubro");
         expect(retrieved.structuredContent).toEqual({ agreementDate: "2026-10-20" });
         expect(retrieved.isError).toBe(false);
+        expect(retrieved.return.vaultWebUrl).toBeUndefined();
       }
 
       // List returns for the chat
@@ -410,6 +411,16 @@ describe("Tool Return Capture (T01)", () => {
       coverage: { complete: true, reasons: [] },
       redacted: false,
       observed: true,
+      sourceProvider: "vault",
+      vaultWebUrl: "https://vault.example/",
+      sources: [{ id: "source_1", ref: "note", type: "document" }],
+      evidence: [{
+        id: "evidence_1",
+        sourceIds: ["source_1"],
+        text: "retained",
+        kind: "excerpt",
+      }],
+      answerLinks: [{ claimIndex: 0, evidenceIds: ["evidence_1"] }],
     });
 
     expect(storage.chatPayloadBytes.get(chatId)?.bytes).toBe(200);
@@ -426,7 +437,12 @@ describe("Tool Return Capture (T01)", () => {
       await client.deleteReturn(returnId);
     }
     expect(storage.chatPayloadBytes.get(chatId)?.bytes).toBe(0);
-    expect(storage.toolReturns.get(returnId)?.captureState).toBe("deleted");
+    const tombstone = storage.toolReturns.get(returnId);
+    expect(tombstone?.captureState).toBe("deleted");
+    expect(tombstone?.sources).toEqual([]);
+    expect(tombstone?.evidence).toEqual([]);
+    expect(tombstone?.answerLinks).toEqual([]);
+    expect(tombstone?.vaultWebUrl).toBeUndefined();
     expect(clearedActionReturns).toEqual([returnId]);
   });
 
@@ -509,38 +525,6 @@ describe("Tool Return Capture (T01)", () => {
     };
     const serialized = JSON.stringify(payload);
 
-    storage.sourceSnapshots.put({
-      id: sourceId,
-      fingerprint: "source-fingerprint",
-      gatekeeperId: 7,
-      connectionGeneration: 3,
-      provider: "vault",
-      ref: "reuniao-entrega",
-      type: "reuniao",
-      title: "Reunião de entrega",
-      observedAccess: {
-        type: "reuniao",
-        tags: ["projeto:alpha"],
-        sensitivity: "internal",
-      },
-      contentHash: "content-hash",
-      occurrences: [{ returnId, executionId: "exec_1", externalId: "source_1" }],
-    });
-    storage.evidence.put({
-      id: evidenceId,
-      fingerprint: "evidence-fingerprint",
-      gatekeeperId: 7,
-      sourceIds: [sourceId],
-      text: "A entrega foi acordada para 20 de outubro.",
-      kind: "fact",
-      locator: "00:12:04",
-      occurrences: [{
-        returnId,
-        executionId: "exec_1",
-        externalId: "evidence_1",
-        payloadPath: "/structuredContent/evidence/items/0",
-      }],
-    });
     storage.toolReturnChunks.put({
       id: `${returnId}.0`,
       returnId,
@@ -565,8 +549,22 @@ describe("Tool Return Capture (T01)", () => {
       redacted: false,
       observed: true,
       sourceProvider: "vault",
-      sourceIds: [sourceId],
-      evidenceIds: [evidenceId],
+      vaultWebUrl: "https://vault.example/",
+      sources: [{
+        id: sourceId,
+        ref: "reuniao-entrega",
+        type: "reuniao",
+        title: "Reunião de entrega",
+        sensitivity: "internal",
+        note: { brain: "brain_1", slug: "reuniao-entrega" },
+      }],
+      evidence: [{
+        id: evidenceId,
+        sourceIds: [sourceId],
+        text: "A entrega foi acordada para 20 de outubro.",
+        kind: "fact",
+        locator: "00:12:04",
+      }],
       answerLinks: [{ claimIndex: 0, evidenceIds: [evidenceId] }],
       normalizationState: "normalized",
       normalizationByteCount: 300,
@@ -594,6 +592,8 @@ describe("Tool Return Capture (T01)", () => {
         id: sourceId,
         ref: "reuniao-entrega",
         type: "reuniao",
+        sensitivity: "internal",
+        note: { brain: "brain_1", slug: "reuniao-entrega" },
       })]);
       expect(detail.evidence).toEqual([expect.objectContaining({
         id: evidenceId,
@@ -601,6 +601,7 @@ describe("Tool Return Capture (T01)", () => {
         kind: "fact",
       })]);
       expect(detail.answerLinks).toEqual([{ claimIndex: 0, evidenceIds: [evidenceId] }]);
+      expect(detail.return.vaultWebUrl).toBe("https://vault.example/");
     }
   });
 

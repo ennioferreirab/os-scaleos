@@ -924,6 +924,12 @@ export class McpGatekeeperImpl
   get sourceProvider(): "vault" | undefined {
     return this.ctx.props.vaultIdentity ? "vault" : undefined;
   }
+  get vaultWebUrl(): string | undefined {
+    const config = readPortalConfig(this.env);
+    return this.ctx.props.vaultIdentity && config?.auth === "vault-token"
+      ? config.vaultWebUrl
+      : undefined;
+  }
 
   protected get trust(): ServerTrust {
     return portalTrust(this.env);

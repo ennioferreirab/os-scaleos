@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime, ToolReturn, ToolReturnSummary, ReturnPage, ListReturnsOptions, AuthorizedReturn } from '@gadgets/workshop-shared/api';
-import type { Evidence, ReturnAnswerLink, SourceSnapshot } from "@gadgets/workshop-shared/api";
+import type { Evidence, EvidenceSource, ReturnAnswerLink } from "@gadgets/workshop-shared/api";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -996,24 +996,9 @@ export type ToolReturnChunkRecord = {
   /** Chunk payload UTF-8 string. */
   data: string;
 };
-type SourceSnapshotRecord = SourceSnapshot & {
-  fingerprint: string;
-  occurrences: Array<{ returnId: string; executionId: string; externalId: string }>;
-};
-
-type EvidenceRecord = Evidence & {
-  fingerprint: string;
-  occurrences: Array<{
-    returnId: string;
-    executionId: string;
-    externalId: string;
-    payloadPath: string;
-  }>;
-};
-
 type PreparedEvidenceNormalization = {
-  sources: SourceSnapshotRecord[];
-  evidence: EvidenceRecord[];
+  sources: EvidenceSource[];
+  evidence: Evidence[];
   answerLinks: ReturnAnswerLink[];
   coverage: { complete: boolean; reasons: string[] };
   state: "normalized" | "conflict";
@@ -1119,89 +1104,30 @@ export function sanitizeCapturedPayload(
   };
 }
 
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function prepareEvidenceNormalization(
+function prepareEvidenceNormalization(
   envelope: NormalizedVaultEnvelope,
-  gatekeeperId: number,
-  connectionGeneration: number | undefined,
-  returnId: string,
-): Promise<PreparedEvidenceNormalization> {
-  const localSourceIds = new Map<string, string>();
-  const sources = await Promise.all(envelope.sources.map(async source => {
-    const observedTexts = envelope.items
-      .filter(item => item.sourceIds.includes(source.id))
-      .map(item => ({ kind: item.kind, text: item.text, locator: item.locator }));
-    const contentHash = await sha256Hex(JSON.stringify(observedTexts));
-    const identity = JSON.stringify({
-      gatekeeperId,
-      connectionGeneration,
-      ref: source.ref,
-      type: source.type,
-      title: source.title,
-      occurredAt: source.occurredAt,
-      observedAccess: source.observedAccess,
-      contentHash,
-    });
-    const fingerprint = await sha256Hex(identity);
-    const id = `src_${fingerprint}`;
-    localSourceIds.set(source.id, id);
-    return {
-      id,
-      fingerprint,
-      gatekeeperId,
-      connectionGeneration,
-      provider: "vault" as const,
-      ref: source.ref,
-      type: source.type,
-      ...(source.title !== undefined ? { title: source.title } : {}),
-      ...(source.occurredAt !== undefined ? { occurredAt: source.occurredAt } : {}),
-      observedAccess: source.observedAccess,
-      contentHash,
-      occurrences: [{
-        returnId,
-        executionId: envelope.executionId,
-        externalId: source.id,
-      }],
-    };
+): PreparedEvidenceNormalization {
+  const sources: EvidenceSource[] = envelope.sources.map(source => ({
+    id: source.id,
+    ref: source.ref,
+    type: source.type,
+    ...(source.title !== undefined ? { title: source.title } : {}),
+    ...(source.occurredAt !== undefined ? { occurredAt: source.occurredAt } : {}),
+    ...(source.sensitivity !== undefined ? { sensitivity: source.sensitivity } : {}),
+    ...(source.note !== undefined
+      ? { note: { brain: source.note.brain, slug: source.note.slug } }
+      : {}),
   }));
-
-  const localEvidenceIds = new Map<string, string>();
-  const evidence = await Promise.all(envelope.items.map(async (item, index) => {
-    const sourceIds = item.sourceIds.map(sourceId => localSourceIds.get(sourceId)!);
-    const fingerprint = await sha256Hex(JSON.stringify({
-      gatekeeperId,
-      connectionGeneration,
-      sourceIds,
-      kind: item.kind,
-      text: item.text,
-      locator: item.locator,
-    }));
-    const id = `ev_${fingerprint}`;
-    localEvidenceIds.set(item.id, id);
-    return {
-      id,
-      fingerprint,
-      gatekeeperId,
-      sourceIds,
-      text: item.text,
-      kind: item.kind,
-      ...(item.locator !== undefined ? { locator: item.locator } : {}),
-      occurrences: [{
-        returnId,
-        executionId: envelope.executionId,
-        externalId: item.id,
-        payloadPath: `/structuredContent/evidence/items/${index}`,
-      }],
-    };
+  const evidence: Evidence[] = envelope.items.map(item => ({
+    id: item.id,
+    sourceIds: [...item.sourceIds],
+    text: item.text,
+    kind: item.kind,
+    ...(item.locator !== undefined ? { locator: item.locator } : {}),
   }));
-
   const answerLinks = envelope.answerLinks.map(link => ({
     claimIndex: link.claimIndex,
-    evidenceIds: link.evidenceIds.map(evidenceId => localEvidenceIds.get(evidenceId)!),
+    evidenceIds: [...link.evidenceIds],
   }));
   const reason = envelope.textConflict
     ? "Vault text and structured evidence disagree; both are shown without merging."
@@ -1407,15 +1333,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           },
         },
       }),
-      // Provider sources and evidence are de-duplicated by deterministic content fingerprints.
-      sourceSnapshots: collection<SourceSnapshotRecord>()({
-        primaryKey: "id",
-      }),
-
-      evidence: collection<EvidenceRecord>()({
-        primaryKey: "id",
-      }),
-
 
       // Chunks of UTF-8 payload for captured tool returns (at most 64 KiB per chunk).
       toolReturnChunks: collection<ToolReturnChunkRecord>()({
@@ -1610,58 +1527,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
 
-function storeEvidenceNormalization(
-  storage: OverseerStorage,
-  prepared: PreparedEvidenceNormalization,
-): void {
-  for (const source of prepared.sources) {
-    const existing = storage.sourceSnapshots.get(source.id);
-    if (existing) {
-      if (existing.fingerprint !== source.fingerprint) {
-        throw new Error("Source fingerprint collision.");
-      }
-      if (!existing.occurrences.some(occurrence =>
-        occurrence.returnId === source.occurrences[0].returnId)) {
-        existing.occurrences.push(source.occurrences[0]);
-        storage.sourceSnapshots.put(existing);
-      }
-    } else {
-      storage.sourceSnapshots.put(source);
-    }
-  }
-  for (const item of prepared.evidence) {
-    const existing = storage.evidence.get(item.id);
-    if (existing) {
-      if (existing.fingerprint !== item.fingerprint) {
-        throw new Error("Evidence fingerprint collision.");
-      }
-      if (!existing.occurrences.some(occurrence =>
-        occurrence.returnId === item.occurrences[0].returnId)) {
-        existing.occurrences.push(item.occurrences[0]);
-        storage.evidence.put(existing);
-      }
-    } else {
-      storage.evidence.put(item);
-    }
-  }
-}
-
-function removeReturnEvidence(storage: OverseerStorage, record: ToolReturnRecord): void {
-  for (const sourceId of record.sourceIds ?? []) {
-    const source = storage.sourceSnapshots.get(sourceId);
-    if (!source) continue;
-    source.occurrences = source.occurrences.filter(occurrence => occurrence.returnId !== record.id);
-    if (source.occurrences.length === 0) storage.sourceSnapshots.delete(sourceId);
-    else storage.sourceSnapshots.put(source);
-  }
-  for (const evidenceId of record.evidenceIds ?? []) {
-    const item = storage.evidence.get(evidenceId);
-    if (!item) continue;
-    item.occurrences = item.occurrences.filter(occurrence => occurrence.returnId !== record.id);
-    if (item.occurrences.length === 0) storage.evidence.delete(evidenceId);
-    else storage.evidence.put(item);
-  }
-}
 
 export function listReturnsFromStorage(
   storage: OverseerStorage,
@@ -1681,20 +1546,23 @@ export function listReturnsFromStorage(
     entries = entries.filter(entry => entry.gatekeeperId === connectorId);
   }
   if (sourceType !== undefined) {
-    entries = entries.filter(entry => (entry.sourceIds ?? []).some(sourceId =>
-      storage.sourceSnapshots.get(sourceId)?.type === sourceType));
+    entries = entries.filter(entry => (entry.sources ?? []).some(source =>
+      source.type === sourceType));
   }
   if (normalizedQuery) {
     const needle = normalizedQuery.toLocaleLowerCase();
     entries = entries.filter(entry => {
-      const sourceText = (entry.sourceIds ?? []).flatMap(sourceId => {
-        const source = storage.sourceSnapshots.get(sourceId);
-        return source ? [source.ref, source.type, source.title ?? ""] : [];
-      });
-      const evidenceText = (entry.evidenceIds ?? []).flatMap(evidenceId => {
-        const item = storage.evidence.get(evidenceId);
-        return item ? [item.text, item.kind, item.locator ?? ""] : [];
-      });
+      const sourceText = (entry.sources ?? []).flatMap(source => [
+        source.ref,
+        source.type,
+        source.title ?? "",
+        source.occurredAt ?? "",
+        source.sensitivity ?? "",
+        source.note?.brain ?? "",
+        source.note?.slug ?? "",
+      ]);
+      const evidenceText = (entry.evidence ?? []).flatMap(item =>
+        [item.text, item.kind, item.locator ?? ""]);
       return [entry.tool, ...sourceText, ...evidenceText]
         .some(value => value.toLocaleLowerCase().includes(needle));
     });
@@ -1713,10 +1581,7 @@ export function listReturnsFromStorage(
 
   return {
     entries: paged.map(entry => {
-      const sourceTypes = [...new Set((entry.sourceIds ?? []).flatMap(sourceId => {
-        const source = storage.sourceSnapshots.get(sourceId);
-        return source ? [source.type] : [];
-      }))];
+      const sourceTypes = [...new Set((entry.sources ?? []).map(source => source.type))];
       return {
         id: entry.id,
         actionRecordId: entry.actionRecordId,
@@ -1732,8 +1597,8 @@ export function listReturnsFromStorage(
         observed: entry.observed ?? true,
         sourceProvider: entry.sourceProvider,
         sourceTypes,
-        sourceCount: entry.sourceIds?.length ?? 0,
-        evidenceCount: entry.evidenceIds?.length ?? 0,
+        sourceCount: entry.sources?.length ?? 0,
+        evidenceCount: entry.evidence?.length ?? 0,
         normalizationState: entry.normalizationState ?? "unsupported",
         normalizationReason: entry.normalizationReason,
         connectorTitle: storage.gatekeepers.get(entry.gatekeeperId)?.resourceTitle,
@@ -1806,34 +1671,8 @@ export function getReturnFromStorage(
       textBlocks.push(block.text);
     }
   }
-  const sources = (record.sourceIds ?? []).flatMap(sourceId => {
-    const source = storage.sourceSnapshots.get(sourceId);
-    if (!source) return [];
-    return [{
-      id: source.id,
-      gatekeeperId: source.gatekeeperId,
-      connectionGeneration: source.connectionGeneration,
-      provider: source.provider,
-      ref: source.ref,
-      type: source.type,
-      title: source.title,
-      occurredAt: source.occurredAt,
-      observedAccess: source.observedAccess,
-      contentHash: source.contentHash,
-    }];
-  });
-  const evidence = (record.evidenceIds ?? []).flatMap(evidenceId => {
-    const item = storage.evidence.get(evidenceId);
-    if (!item) return [];
-    return [{
-      id: item.id,
-      gatekeeperId: item.gatekeeperId,
-      sourceIds: item.sourceIds,
-      text: item.text,
-      kind: item.kind,
-      locator: item.locator,
-    }];
-  });
+  const sources = record.sources ?? [];
+  const evidence = record.evidence ?? [];
 
   return {
     status: "available",
@@ -1862,7 +1701,6 @@ export function deleteReturnFromStorage(
 
   storage.transaction(() => {
     storage.toolReturnChunks.byReturnId.delete(returnId);
-    removeReturnEvidence(storage, record);
     if (record.captureState === "stored" && record.chatId !== undefined) {
       const currentBytes = storage.chatPayloadBytes.get(record.chatId)?.bytes ?? 0;
       const retainedBytes = record.byteCount + (record.normalizationByteCount ?? 0);
@@ -1871,6 +1709,13 @@ export function deleteReturnFromStorage(
         bytes: Math.max(0, currentBytes - retainedBytes),
       });
     }
+    // Keep only the tombstone needed for idempotent deletion; normalized source/evidence arrays
+    // and the frozen human URL are live retained data and must not survive the delete.
+    record.sources = [];
+    record.evidence = [];
+    record.answerLinks = [];
+    record.vaultWebUrl = undefined;
+    record.normalizationByteCount = 0;
     record.captureState = "deleted";
     storage.toolReturns.put(record);
   });
@@ -5333,18 +5178,28 @@ class OverseerImpl implements AgentHooks {
     request: ToolObservationRequest,
     caller: GatekeeperCaller,
   ): Promise<NativeRpcStub<ToolReturnCapture> | undefined> {
-    if (request.description.prohibitAllSharing) {
-      if ((await this.getSharingManager()).hasAnyShares()) {
-        throw new Error(
-            "This observation was blocked because it contains sensitive data that must only be " +
-            "shown to the account owner, but this workspace is shared with other users. Try again " +
-            "from a workspace that is not shared.");
-      }
-      this.storage.prohibitAllSharing.put(true);
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (request.description.prohibitAllSharing &&
+        (await this.getSharingManager()).hasAnyShares()) {
+      throw new Error(
+          "This observation was blocked because it contains sensitive data that must only be " +
+          "shown to the account owner, but this workspace is shared with other users. Try again " +
+          "from a workspace that is not shared.");
     }
 
-    if (request.description.excludeObservers && request.description.excludeObservers.length > 0) {
-      await this.#enforceExcludeObservers(request.description.excludeObservers);
+    const excludedObservers = request.description.excludeObservers?.length
+        ? await this.#checkExcludeObservers(request.description.excludeObservers)
+        : [];
+
+    await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
+    if (request.description.prohibitAllSharing) this.storage.prohibitAllSharing.put(true);
+    if (excludedObservers.length > 0) {
+      const gatekeeperIds = [...this.storage.gatekeepers.list()].map(gatekeeper => gatekeeper.id);
+      for (const observer of excludedObservers) {
+        this.storage.observers.delete(observer.profileId);
+        await this.#removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
+      }
+      await this.assertGatekeeperCallerAccess(gatekeeperId, caller);
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -5422,7 +5277,7 @@ class OverseerImpl implements AgentHooks {
     const connectionGeneration = result.connectionGeneration ?? params.connectionGeneration;
     const observed = params.observed ?? true;
     const sourceProvider = result.sourceProvider;
-
+    const vaultWebUrl = sourceProvider === "vault" ? result.vaultWebUrl : undefined;
     if (this.storage.chatMeta.get(params.chatId) === undefined) {
       return {
         status: "failed",
@@ -5456,8 +5311,9 @@ class OverseerImpl implements AgentHooks {
           redacted: sanitized.redacted,
           observed,
           sourceProvider,
-          sourceIds: [],
-          evidenceIds: [],
+          ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+          sources: [],
+          evidence: [],
           answerLinks: [],
           normalizationState: sourceProvider === "vault" ? "invalid" : "unsupported",
           normalizationReason: sourceProvider === "vault"
@@ -5480,12 +5336,7 @@ class OverseerImpl implements AgentHooks {
     if (sourceProvider === "vault") {
       const normalized = normalizeVaultEvidence(sanitized.structuredContent, sanitized.content);
       if (normalized.status === "normalized") {
-        prepared = await prepareEvidenceNormalization(
-          normalized.envelope,
-          params.gatekeeperId,
-          connectionGeneration,
-          params.returnId,
-        );
+        prepared = prepareEvidenceNormalization(normalized.envelope);
         normalizationState = prepared.state;
         normalizationReason = prepared.reason;
       } else {
@@ -5529,8 +5380,9 @@ class OverseerImpl implements AgentHooks {
           redacted: sanitized.redacted,
           observed,
           sourceProvider,
-          sourceIds: [],
-          evidenceIds: [],
+          ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+          sources: [],
+          evidence: [],
           answerLinks: [],
           normalizationState,
           normalizationReason,
@@ -5541,8 +5393,6 @@ class OverseerImpl implements AgentHooks {
           error: "Chat payload storage limit exceeded (50 MiB).",
         };
       }
-
-      if (prepared) storeEvidenceNormalization(this.storage, prepared);
       const chunks = chunkUtf8String(serialized, PAYLOAD_CHUNK_BYTES);
       for (let index = 0; index < chunks.length; index++) {
         this.storage.toolReturnChunks.put({
@@ -5575,8 +5425,9 @@ class OverseerImpl implements AgentHooks {
         redacted: sanitized.redacted,
         observed,
         sourceProvider,
-        sourceIds: prepared?.sources.map(source => source.id) ?? [],
-        evidenceIds: prepared?.evidence.map(item => item.id) ?? [],
+        ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
+        sources: prepared?.sources ?? [],
+        evidence: prepared?.evidence ?? [],
         answerLinks: prepared?.answerLinks ?? [],
         normalizationState,
         normalizationReason,
@@ -11570,7 +11421,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.storage.transaction(() => {
       for (const retained of retainedReturns) {
         this.impl.storage.toolReturnChunks.byReturnId.delete(retained.id);
-        removeReturnEvidence(this.impl.storage, retained);
         this.impl.storage.toolReturns.delete(retained.id);
       }
       this.impl.storage.toolReturnChunks.byChatId.delete(chatId);

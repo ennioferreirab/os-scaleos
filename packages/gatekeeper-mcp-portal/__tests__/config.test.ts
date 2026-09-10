@@ -59,10 +59,35 @@ describe("readPortalConfig", () => {
     expect(configured?.name).toBe("Cloudflare MCP Portal");
     expect(configured?.auth).toBe("token");
 
-    expect(readPortalConfig(env({
+    const vault = readPortalConfig(env({
       MCP_PORTAL_URL: "https://vault.example.com/mcp",
       MCP_PORTAL_AUTH: "VAULT-TOKEN",
-    }))?.auth).toBe("vault-token");
+      VAULT_PUBLIC_URL: "https://vault.example.com/#human",
+    }));
+    expect(vault?.auth).toBe("vault-token");
+    expect(vault?.vaultWebUrl).toBe("https://vault.example.com/");
+
+    expect(readPortalConfig(env({
+      MCP_PORTAL_URL: "https://gw.example.com/mcp",
+      MCP_PORTAL_AUTH: "token",
+      VAULT_PUBLIC_URL: "https://vault.example.com/",
+    }))?.vaultWebUrl).toBeUndefined();
+  });
+
+  it("ignores an invalid Vault public URL without weakening portal configuration", () => {
+    const base = { MCP_PORTAL_URL: "https://vault.example.com/mcp", MCP_PORTAL_AUTH: "vault-token" };
+    for (const value of [
+      "not a url",
+      "ftp://vault.example.com/",
+      "https://admin:secret@vault.example.com/",
+    ]) {
+      expect(readPortalConfig(env({ ...base, VAULT_PUBLIC_URL: value }))).toMatchObject({
+        endpoint: "https://vault.example.com/mcp",
+        auth: "vault-token",
+      });
+      expect(readPortalConfig(env({ ...base, VAULT_PUBLIC_URL: value }))
+        ?.vaultWebUrl).toBeUndefined();
+    }
   });
 
   it("falls back to oauth for an unrecognized auth kind", () => {

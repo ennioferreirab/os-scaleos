@@ -110,6 +110,10 @@ export abstract class McpFacetBase<
   get sourceProvider(): "vault" | undefined {
     return undefined;
   }
+  /** Trusted human Vault URL selected by connector configuration for this call. */
+  get vaultWebUrl(): string | undefined {
+    return undefined;
+  }
 
   /** Canonical resource URL for this facet's endpoint and scope. */
   protected get resourceUrl(): string {
@@ -280,6 +284,7 @@ export abstract class McpFacetBase<
       this.log,
       capture,
       this.sourceProvider,
+      this.vaultWebUrl,
     );
   }
 

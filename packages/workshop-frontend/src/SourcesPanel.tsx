@@ -73,7 +73,8 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
                         <p className="mt-0.5 break-all text-[11px] text-kumo-inactive">{source.ref}</p>
                       )}
                       <p className="mt-1 text-[11px] text-kumo-inactive">
-                        {source.occurredAt ?? t('workspace.sources.dateUnavailable')} · {source.observedAccess.sensitivity}
+                        {source.occurredAt ?? t('workspace.sources.dateUnavailable')}
+                        {source.sensitivity ? ` · ${source.sensitivity}` : ''}
                       </p>
                     </div>
                   ))}

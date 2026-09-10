@@ -76,6 +76,8 @@ export interface McpSessionHost {
   readonly scope: ToolScope;
   /** Trusted connector classification; never inferred from tool names or payloads. */
   readonly sourceProvider?: "vault";
+  /** Trusted human Vault URL selected by connector configuration for this call. */
+  readonly vaultWebUrl?: string;
 
   /** Returns the bounded described catalog. */
   tools(): Promise<ClassifiedTool[]>;
@@ -276,6 +278,7 @@ export class McpSessionBase extends RpcTarget {
               connectionGeneration: connection?.generation,
               secrets: connection?.secrets,
               sourceProvider: host.sourceProvider,
+              vaultWebUrl: host.vaultWebUrl,
             });
             if (outcome.status === "stored" || outcome.status === "partial") {
               returnId = outcome.returnId;

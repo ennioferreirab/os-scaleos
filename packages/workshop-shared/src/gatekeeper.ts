@@ -992,6 +992,8 @@ export type CapturedToolResult = {
   secrets?: string[];
   /** Trusted connector classification used to select a strict evidence normalizer. */
   sourceProvider?: "vault";
+  /** Trusted human Vault URL captured from deployment configuration, never from MCP payload. */
+  vaultWebUrl?: string;
 };
 
 /**

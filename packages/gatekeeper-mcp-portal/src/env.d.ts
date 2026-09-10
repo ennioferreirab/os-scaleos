@@ -4,6 +4,7 @@ declare namespace Cloudflare {
   interface Env {
     BASE_URL?: string;
     MCP_PORTAL_URL?: string;
+    VAULT_PUBLIC_URL?: string;
     MCP_PORTAL_NAME?: string;
     MCP_PORTAL_AUTH?: string;
     MCP_PORTAL_TOKEN?: string;

@@ -23,6 +23,8 @@ export type PortalConfig = {
   name: string;
   /** How to authenticate. `vault-token` means one user-entered token per connected account. */
   auth: ServerAuthKind | "vault-token";
+  /** Human-facing Vault base URL, captured only for Vault-token deployments. */
+  vaultWebUrl?: string;
 };
 
 /** Stable id used in binding names, action kinds, and generated type names. */
@@ -63,6 +65,23 @@ export function requirePortalServerVisible(env: Env, serverId: string): void {
   );
 }
 
+function normalizeVaultWebUrl(env: Env, auth: PortalConfig["auth"]): string | undefined {
+  if (auth !== "vault-token") return undefined;
+  const raw = env.VAULT_PUBLIC_URL?.trim();
+  if (!raw) return undefined;
+
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+  if (url.username || url.password) return undefined;
+  url.hash = "";
+  return url.toString();
+}
+
 /**
  * Reads the deployment's portal configuration, or null when it is not configured. A missing or
  * unusable `MCP_PORTAL_URL` returns null rather than throwing, so the connector advertises no
@@ -96,11 +115,13 @@ export function readPortalConfig(env: Env): PortalConfig | null {
     configured === "none" || configured === "token" || configured === "vault-token"
       ? configured
       : "oauth";
+  const vaultWebUrl = normalizeVaultWebUrl(env, auth);
 
   return {
     endpoint: url.toString(),
     name: env.MCP_PORTAL_NAME?.trim() || `MCP Server Portal (${url.host})`,
     auth,
+    ...(vaultWebUrl !== undefined ? { vaultWebUrl } : {}),
   };
 }
 

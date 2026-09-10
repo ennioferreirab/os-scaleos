@@ -378,7 +378,7 @@ describe("ActionStore", () => {
     await store.apply(staged.id, (fn, onConnection) => {
       onConnection({ generation: 7, secrets: ["connection-secret"] });
       return fn({ callTool: big } as never);
-    }, log, capture);
+    }, log, capture, "vault", "https://vault.example/");
     const stored = store.get(staged.id);
     expect(stored?.state).toBe("applied");
     expect(stored?.returnId).toBe("ret_123");
@@ -389,6 +389,10 @@ describe("ActionStore", () => {
       structuredContent: { large: true },
       connectionGeneration: 7,
       secrets: ["connection-secret"],
+    });
+    expect(capturedContent).toMatchObject({
+      sourceProvider: "vault",
+      vaultWebUrl: "https://vault.example/",
     });
   });
 

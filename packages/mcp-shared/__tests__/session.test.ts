@@ -273,6 +273,8 @@ it("allocates before I/O and captures read result before delivery when chat is a
     serverName: "Vault",
     endpoint: "https://vault.example.com",
     scope: {},
+    sourceProvider: "vault" as const,
+    vaultWebUrl: "https://vault.example/",
     findTool: async () => entry,
     call: async <T>(
       fn: (client: { callTool(): Promise<{ content: { type: "text"; text: string }[]; structuredContent: { facts: never[] } }> }) => Promise<T>,
@@ -290,6 +292,7 @@ it("allocates before I/O and captures read result before delivery when chat is a
   } as unknown as McpSessionHost;
 
   const queue = {
+    assertAppAccess() {},
     prepareToolObservation: async (req: any) => {
       prepareCalledBeforeIo = !ioCompleted;
       expect(req.tool).toBe("search");
@@ -300,6 +303,8 @@ it("allocates before I/O and captures read result before delivery when chat is a
           expect(res.connectionGeneration).toBe(2);
           expect(res.secrets).toEqual(["vault-secret"]);
           expect(res.content[0].text).toBe("knowledge");
+          expect(res.sourceProvider).toBe("vault");
+          expect(res.vaultWebUrl).toBe("https://vault.example/");
           return { status: "stored" as const, returnId: "ret_obs_1", byteCount: 50 };
         },
       };
@@ -338,6 +343,7 @@ it("surfaces capture failure without returnId when storage capture fails", async
   } as unknown as McpSessionHost;
 
   const queue = {
+    assertAppAccess() {},
     prepareToolObservation: async () => ({
       captureResult: async () => ({ status: "failed" as const, error: "Quota exceeded" }),
     }),
@@ -373,6 +379,7 @@ it("reuses the same returnId when getActionResult is called repeatedly", async (
     deleteActionReturn: () => {},
   } as unknown as McpSessionHost;
   const queue = {
+    assertAppAccess() {},
     authorizeActionReturn: (_returnId: string, desc: unknown) => {
       observations.push(desc);
       return JSON.stringify({
@@ -412,6 +419,7 @@ it("disposes observation capture handle when host.call fails (RAG-OS-008)", asyn
   } as unknown as McpSessionHost;
 
   const queue = {
+    assertAppAccess() {},
     prepareToolObservation: async () => ({
       captureResult: async () => ({ status: "stored" as const, returnId: "ret_1", byteCount: 10 }),
       [Symbol.dispose]: () => {
@@ -447,6 +455,7 @@ it("marks action result failed if its return was deleted before collection (RAG-
     },
   } as unknown as McpSessionHost;
   const queue = {
+    assertAppAccess() {},
     authorizeActionReturn: async (returnId: string) => {
       expect(returnId).toBe("ret_deleted_15");
       return null;
@@ -460,6 +469,8 @@ it("marks action result failed if its return was deleted before collection (RAG-
     expect(outcome.message).toContain("deleted");
   }
   expect(deletedId).toBe(15);
+});
+
 it("denies every retained MCP read before consulting the host", async () => {
   const appAccessError = new Error("app access denied");
   let catalogReads = 0;

@@ -4,10 +4,10 @@ export type VaultSourceEnvelope = {
   type: string;
   title?: string;
   occurredAt?: string;
-  observedAccess: {
-    type: string;
-    tags: string[];
-    sensitivity: string;
+  sensitivity?: string;
+  note?: {
+    brain: string;
+    slug: string;
   };
 };
 
@@ -43,6 +43,9 @@ function isStringArray(value: unknown): value is string[] {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+function isVaultNote(value: unknown): value is { brain: string; slug: string } {
+  return isObject(value) && nonEmptyString(value.brain) && nonEmptyString(value.slug);
 }
 
 function canonicalJson(value: unknown): string {
@@ -84,12 +87,11 @@ export function normalizeVaultEvidence(
   for (const candidate of raw.sources) {
     if (!isObject(candidate) || !nonEmptyString(candidate.id) || sourceIds.has(candidate.id)
         || !nonEmptyString(candidate.ref) || !nonEmptyString(candidate.type)
+        || "observedAccess" in candidate
         || (candidate.title !== undefined && typeof candidate.title !== "string")
         || (candidate.occurredAt !== undefined && typeof candidate.occurredAt !== "string")
-        || !isObject(candidate.observedAccess)
-        || !nonEmptyString(candidate.observedAccess.type)
-        || !isStringArray(candidate.observedAccess.tags)
-        || !nonEmptyString(candidate.observedAccess.sensitivity)) {
+        || (candidate.sensitivity !== undefined && typeof candidate.sensitivity !== "string")
+        || (candidate.note !== undefined && !isVaultNote(candidate.note))) {
       return { status: "invalid", reason: "Vault evidence envelope contains an invalid source." };
     }
     sourceIds.add(candidate.id);
@@ -99,11 +101,10 @@ export function normalizeVaultEvidence(
       type: candidate.type,
       ...(candidate.title !== undefined ? { title: candidate.title } : {}),
       ...(candidate.occurredAt !== undefined ? { occurredAt: candidate.occurredAt } : {}),
-      observedAccess: {
-        type: candidate.observedAccess.type,
-        tags: [...candidate.observedAccess.tags],
-        sensitivity: candidate.observedAccess.sensitivity,
-      },
+      ...(candidate.sensitivity !== undefined ? { sensitivity: candidate.sensitivity } : {}),
+      ...(isVaultNote(candidate.note)
+        ? { note: { brain: candidate.note.brain, slug: candidate.note.slug } }
+        : {}),
     });
   }
 
