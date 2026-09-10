@@ -12,6 +12,7 @@ import {
   ArrowsOutSimple,
   DotsThree,
   Pulse,
+  BookOpenText,
   type Icon,
 } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget } from 'capnweb'
@@ -35,6 +36,7 @@ import GadgetCodeInterface from './GadgetCodeInterface'
 import GadgetUI from './GadgetUI'
 import GadgetUseView from './GadgetUseView'
 import Connections from './Connections'
+import SourcesPanel from './SourcesPanel'
 import Activity, { type ActivityView } from './Activity'
 import { CountBadge } from './components/CountBadge'
 import ActivityNotifications from './ActivityNotifications'
@@ -156,13 +158,14 @@ function formatConsoleLogs(logs: BufferedLogEntry[], heading: string): string {
 
 // ─── right-panel tabs ─────────────────────────────────────────────────────────
 
-type RightTab = 'app' | 'code' | 'connections'
+type RightTab = 'app' | 'sources' | 'code' | 'connections'
 
 type WorkspaceView =
   | { mode: 'chat' }
   // `appId` is absent only while lazily migrating the legacy "open" value.
   | { mode: 'app'; appId?: WorkpieceId }
   | { mode: 'activity' }
+  | { mode: 'sources' }
 
 function formatHeaderCost(cost: number) {
   if (cost === 0) return '$0'
@@ -172,9 +175,15 @@ function formatHeaderCost(cost: number) {
 
 // The first tab is named after what the selected workpiece is ("Document" for a gadget built from
 // a document blueprint), falling back to "App" when it declares no format.
-function rightTabs(output: BlueprintOutput | undefined, t: WorkspaceT): { value: RightTab; label: string }[] {
+function rightTabs(
+  output: BlueprintOutput | undefined,
+  t: WorkspaceT,
+  hasGadget: boolean,
+): { value: RightTab; label: string }[] {
+  if (!hasGadget) return [{ value: 'sources', label: t('workspace.sources.title') }]
   return [
     { value: 'app', label: formatOf(output).noun },
+    { value: 'sources', label: t('workspace.sources.title') },
     { value: 'code', label: t('workspace.common.code') },
     { value: 'connections', label: t('workspace.editor.connections') },
   ]
@@ -816,8 +825,10 @@ export default function GadgetEditor() {
     && singleInitialChat && visibleGadgets.length <= 1
   const hasAnyApps = allGadgets.length > 0
   const showingActivity = workspaceView?.mode === 'activity'
+  const showingSources = workspaceView?.mode === 'sources'
   const showFullEditor = layoutModeReady && (
-    showingActivity || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
+    showingActivity || showingSources
+      || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
   )
   const showOutputRail = layoutModeReady && hasAnyApps && !showFullEditor
   const paneShowsActivity = showingActivity || activityClosing
@@ -921,6 +932,14 @@ export default function GadgetEditor() {
     setWorkspaceView({ mode: 'activity' })
   }, [workspaceView])
 
+  const openSources = useCallback(() => {
+    setWorkspaceTransitionEnabled(true)
+    setActivityClosing(false)
+    activityReturnViewRef.current = null
+    setActiveTab('sources')
+    setWorkspaceView({ mode: 'sources' })
+  }, [])
+
   const closeWorkspacePane = useCallback(() => {
     if (workspaceView?.mode !== 'activity') {
       setWorkspaceVisibility('closed')
@@ -928,7 +947,7 @@ export default function GadgetEditor() {
     }
     setWorkspaceTransitionEnabled(true)
     const returnView = activityReturnViewRef.current
-    const returnShowsPane = returnView?.mode === 'app'
+    const returnShowsPane = returnView?.mode === 'app' || returnView?.mode === 'sources'
       || (returnView === null && hasAnyApps && !simpleMode)
     setActivityClosing(!returnShowsPane)
     setWorkspaceView(returnView)
@@ -1024,7 +1043,15 @@ export default function GadgetEditor() {
     let output = turnOutputRef.current
     if (output?.chatId === selectedChatIdRef.current) output.userSelectedTab = true
     setActiveTab(tab)
-  }, [])
+    if (tab === 'sources') {
+      setWorkspaceTransitionEnabled(true)
+      setActivityClosing(false)
+      activityReturnViewRef.current = null
+      setWorkspaceView({ mode: 'sources' })
+    } else if (workspaceView?.mode === 'sources' && selectedGadgetId !== null) {
+      setWorkspaceVisibility('open', selectedGadgetId)
+    }
+  }, [selectedGadgetId, setWorkspaceVisibility, workspaceView?.mode])
 
   useEffect(() => {
     setChatChanges(undefined)
@@ -1380,12 +1407,18 @@ export default function GadgetEditor() {
   }
 
   const openMobilePane = (tab: RightTab) => {
+    if (tab === 'sources') {
+      openSources()
+      return
+    }
     handleTabSelect(tab)
     if (selectedGadgetId !== null) setWorkspaceVisibility('open', selectedGadgetId)
   }
 
   const mobilePreviewActive = showFullEditor && !paneShowsActivity && activeTab === 'app'
-  const mobileMoreActive = showFullEditor && !paneShowsActivity && activeTab !== 'app'
+  const mobileSourcesActive = showFullEditor && !paneShowsActivity && activeTab === 'sources'
+  const mobileMoreActive = showFullEditor && !paneShowsActivity
+    && (activeTab === 'code' || activeTab === 'connections')
 
   // ── always render the full two-pane edit layout; preview overlays on top ──────
   return (
@@ -1484,6 +1517,14 @@ export default function GadgetEditor() {
           {showReconnecting && <ReconnectingChip />}
 
           <WorkshopIconButton
+            onClick={openSources}
+            title={t('workspace.sources.title')}
+            aria-label={t('workspace.sources.title')}
+          >
+            <BookOpenText size={16} />
+          </WorkshopIconButton>
+
+          <WorkshopIconButton
             onClick={() => setShareModalOpen(true)}
             title={t('workspace.editor.shareWorkspace')}
             aria-label={t('workspace.editor.shareWorkspace')}
@@ -1547,6 +1588,16 @@ export default function GadgetEditor() {
           }`}
         >
           {t('workspace.editor.preview')}
+        </button>
+        <button
+          type="button"
+          onClick={openSources}
+          aria-current={mobileSourcesActive ? 'page' : undefined}
+          className={`flex h-9 min-w-0 flex-1 items-center justify-center rounded-lg px-3 text-[14px] font-medium ${
+            mobileSourcesActive ? 'bg-kumo-tint text-kumo-default' : 'text-kumo-subtle'
+          }`}
+        >
+          {t('workspace.sources.title')}
         </button>
         <button
           type="button"
@@ -1731,7 +1782,7 @@ export default function GadgetEditor() {
           <div className="absolute inset-y-0 -left-2 -right-2" />
         </div>
 
-        {/* ── RIGHT: App / Code / Connections tabs ───────────────────────────── */}
+        {/* ── RIGHT: Output / Sources / Code / Connections tabs ─────────────── */}
         <div
           className={`flex flex-shrink-0 min-w-0 overflow-hidden bg-kumo-base max-md:!w-full max-md:!opacity-100 ${!showFullEditor ? 'max-md:hidden' : ''} ${workspaceTransitionClass}`}
           style={{
@@ -1747,6 +1798,8 @@ export default function GadgetEditor() {
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
               {paneShowsActivity ? (
                 <PaneLabel icon={Pulse} title={t('workspace.editor.activity')} />
+              ) : activeTab === 'sources' ? (
+                <PaneLabel icon={BookOpenText} title={t('workspace.sources.title')} />
               ) : visibleGadgets.length > 1 ? (
                 <PaneWorkpieceTabs
                   gadgets={visibleGadgets}
@@ -1774,7 +1827,7 @@ export default function GadgetEditor() {
                       onClick={() => setActivityView(tab.value)}
                     />
                   ))
-                  : rightTabs(selectedGadgetSummary?.output, t).map(tab => (
+                  : rightTabs(selectedGadgetSummary?.output, t, selectedGadgetSummary !== undefined).map(tab => (
                     <PaneTab
                       key={tab.value}
                       active={activeTab === tab.value}
@@ -1784,7 +1837,7 @@ export default function GadgetEditor() {
                   ))}
               </div>
 
-              {!paneShowsActivity && (
+              {!paneShowsActivity && activeTab !== 'sources' && (
                 <GadgetExportMenu
                   gadget={selectedGadgetStub}
                   gadgetTitle={selectedGadgetSummary?.title ?? t('workspace.editor.defaultGadgetTitle')}
@@ -1880,6 +1933,15 @@ export default function GadgetEditor() {
                   </div>
                 </div>
               )}
+            </div>
+
+            <div className={activeTab === 'sources' ? 'h-full min-h-0' : 'hidden'}>
+              <SourcesPanel
+                overseer={overseer.stub}
+                chatId={effectiveSelectedChatId}
+                gadgetId={selectedGadgetSummary?.id}
+                isVisible={activeTab === 'sources' && !paneShowsActivity}
+              />
             </div>
 
             <div className={activeTab === 'code' ? 'h-full' : 'hidden'}>

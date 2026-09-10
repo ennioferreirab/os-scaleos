@@ -8,6 +8,7 @@ import type {
   Gatekeeper,
   GatekeeperUserVerifier,
   ResourceDescription,
+  ToolReturnCapture,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import { ActionStore, REVERT_UNSUPPORTED_MESSAGE } from "./action-store.js";
@@ -104,6 +105,10 @@ export abstract class McpFacetBase<
   /** The tool scope this facet is authorized to expose. */
   get scope(): ToolScope {
     return this.ctx.props.scope;
+  }
+  /** Trusted evidence adapter selected by connector-owned configuration. */
+  get sourceProvider(): "vault" | undefined {
+    return undefined;
   }
 
   /** Canonical resource URL for this facet's endpoint and scope. */
@@ -252,6 +257,11 @@ export abstract class McpFacetBase<
   discardStagedAction(id: number): void {
     this.#actions().discard(id);
   }
+  /** Clears a completed action payload while preserving its at-most-once tombstone. */
+  async deleteActionReturn(id: number): Promise<void> {
+    this.#actions().deleteActionReturn(id);
+  }
+
 
   /** Looks up a staged or completed action. */
   lookupAction(id: number): StoredAction | undefined {
@@ -259,9 +269,17 @@ export abstract class McpFacetBase<
   }
 
   /** Applies an approved action without retrying an outcome-unknown write. */
-  async applyAction(action: number): Promise<void> {
+  async applyAction(action: number, capture?: RpcStub<ToolReturnCapture>): Promise<void> {
     await this.#actions().apply(
-      action, fn => this.call(fn, { retryOnExpiry: false }), this.log);
+      action,
+      (fn, onConnection) => this.call(fn, {
+        retryOnExpiry: false,
+        onConnection,
+      }),
+      this.log,
+      capture,
+      this.sourceProvider,
+    );
   }
 
   /** Rejects a pending action. */
@@ -286,4 +304,6 @@ export abstract class McpFacetBase<
   actionKindFor(toolName: string): ActionKind {
     return actionKindFor(this.actionScopeTag, toolName);
   }
+
+
 }

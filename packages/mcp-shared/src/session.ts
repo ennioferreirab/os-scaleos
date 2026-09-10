@@ -5,14 +5,15 @@
 // supplies. The base never touches the Durable Object, the account, or the endpoint's credentials.
 
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
-import type { ActionDescription, ActionKind, ApprovalQueue }
-  from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ActionDescription, ActionKind, ApprovalQueue, CapturedToolResult, ToolReturnCapture,
+} from "@gadgets/workshop-shared/gatekeeper";
 
 import {
   MAX_TOOL_NAME_CHARS,
   type McpClient,
 } from "./client.js";
-import type { WithClientOptions } from "./connection.js";
+import type { McpExecutionConnection, WithClientOptions } from "./connection.js";
 import { isWholeEndpoint, type ToolScope } from "./scope.js";
 import { toolQueryTerms, MAX_QUERY_CHARS, MAX_SEARCH_RESULTS } from "./tool-search.js";
 import {
@@ -59,8 +60,11 @@ export type StoredAction = {
   result?: Extract<McpCallResult, { status: "ok" }>;
   /** Terminal failure reason retained for later collection. */
   error?: string;
+  /** Stable return ID when durable capture succeeded in a chat context. */
+  returnId?: string;
+  /** Present when durable return capture failed. */
+  captureError?: string;
 };
-
 /**
  * What a session needs from the gatekeeper facet that owns it. Narrow: the session is handed to a
  * Gadget, so anything reachable from here is one `followPath` away from untrusted code.
@@ -70,6 +74,8 @@ export interface McpSessionHost {
   readonly endpoint: string;
   /** How much of the endpoint this binding may call. Only used to word the "no such tool" error. */
   readonly scope: ToolScope;
+  /** Trusted connector classification; never inferred from tool names or payloads. */
+  readonly sourceProvider?: "vault";
 
   /** Returns the bounded described catalog. */
   tools(): Promise<ClassifiedTool[]>;
@@ -88,7 +94,27 @@ export interface McpSessionHost {
 
   stageAction(toolName: string, args: Record<string, unknown>): StoredAction;
   discardStagedAction(id: number): void;
+  /** Clears an applied action's retained payload while preserving its at-most-once tombstone. */
+  deleteActionReturn(id: number): void;
   lookupAction(id: number): StoredAction | undefined;
+}
+
+function parseCapturedToolResult(serialized: string): CapturedToolResult | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
+  const content = "content" in parsed ? parsed.content : undefined;
+  const structuredContent = "structuredContent" in parsed
+    ? parsed.structuredContent
+    : undefined;
+  const isError = "isError" in parsed ? parsed.isError : undefined;
+  if (content !== undefined && !Array.isArray(content)) return undefined;
+  if (isError !== undefined && typeof isError !== "boolean") return undefined;
+  return { content, structuredContent, isError };
 }
 
 function requireToolName(method: string, name: unknown): asserts name is string {
@@ -203,10 +229,62 @@ export class McpSessionBase extends RpcTarget {
     });
 
     if (entry.mode === "read") {
-      const result = await host.call(client => client.callTool(name, toolArgs));
-      // Authorize before the data is handed back, per the gatekeeper contract.
-      await this.#queue.authorizeObservation(described);
-      return toCallResult(result);
+      let captureHandle: RpcStub<ToolReturnCapture> | undefined;
+      let connection: McpExecutionConnection | undefined;
+      const candidate = this.#queue.prepareToolObservation;
+      const prepareToolObservation =
+        typeof candidate === "function"
+          ? candidate as NonNullable<ApprovalQueue["prepareToolObservation"]>
+          : undefined;
+      const canCapture = prepareToolObservation !== undefined;
+      if (!canCapture) {
+        // Authorize before the data is handed back, per the gatekeeper contract.
+        await this.#queue.authorizeObservation(described);
+      }
+
+      let returnId: string | undefined;
+      let captureError: string | undefined;
+
+      try {
+        const result = await host.call(client => client.callTool(name, toolArgs), {
+          onConnection: canCapture
+            ? async selected => {
+                connection = selected;
+                captureHandle = await prepareToolObservation!({
+                  tool: name,
+                  description: described,
+                  connectionGeneration: selected.generation,
+                });
+              }
+            : undefined,
+        });
+
+        if (captureHandle) {
+          try {
+            const outcome = await captureHandle.captureResult({
+              content: result.content,
+              structuredContent: result.structuredContent,
+              isError: result.isError,
+              connectionGeneration: connection?.generation,
+              secrets: connection?.secrets,
+              sourceProvider: host.sourceProvider,
+            });
+            if (outcome.status === "stored" || outcome.status === "partial") {
+              returnId = outcome.returnId;
+            } else if (outcome.status === "failed") {
+              captureError = outcome.error;
+            }
+          } catch (err) {
+            captureError = err instanceof Error ? err.message : String(err);
+          }
+        }
+
+        return toCallResult(result, { returnId, captureError });
+      } finally {
+        if (captureHandle && Symbol.dispose in captureHandle && typeof captureHandle[Symbol.dispose] === "function") {
+          captureHandle[Symbol.dispose]();
+        }
+      }
     }
 
     const staged = host.stageAction(name, toolArgs);
@@ -266,16 +344,41 @@ export class McpSessionBase extends RpcTarget {
             ?? `Calling "${stored.toolName}" on ${host.serverName} failed.`,
         };
       case "applied": {
-        const result = stored.result
-          ?? { status: "ok" as const, content: [], text: "", isError: false };
-        // The result was produced while the Gadget was not looking, so it becomes an observation at
-        // the moment it is handed over rather than when the call was applied.
-        await this.#queue.authorizeObservation({
+        const description = {
           title: `${host.serverName}: result of ${stored.toolName}`,
           description:
             `Read the response from the approved call to \`${stored.toolName}\` on ` +
             `**${host.serverName}**.`,
-        });
+        };
+        if (stored.returnId) {
+          const serialized = await this.#queue.authorizeActionReturn(
+            stored.returnId,
+            description,
+          );
+          const authorized = serialized === null
+            ? undefined
+            : parseCapturedToolResult(serialized);
+          if (authorized) {
+            return toCallResult(authorized, { returnId: stored.returnId });
+          }
+          host.deleteActionReturn(actionId);
+          return {
+            status: "failed",
+            message: `The return for "${stored.toolName}" was deleted and is no longer available.`,
+          };
+        }
+        if (stored.captureError) {
+          host.deleteActionReturn(actionId);
+          return {
+            status: "failed",
+            message:
+              `The call to "${stored.toolName}" succeeded, but its result could not be retained: ` +
+              stored.captureError,
+          };
+        }
+        const result = stored.result
+          ?? { status: "ok" as const, content: [], text: "", isError: false };
+        await this.#queue.authorizeObservation(description);
         return result;
       }
     }

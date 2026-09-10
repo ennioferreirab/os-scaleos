@@ -5,8 +5,8 @@
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type { Collection, Singleton } from "@gadgets/typed-storage";
-import type { Overseer } from "@gadgets/workshop-shared/api";
-import { OverseerDurableObject, makeOverseerStorage } from "../src/overseer.js";
+import type { Overseer, ListReturnsOptions, AuthorizedReturn, ReturnPage } from "@gadgets/workshop-shared/api";
+import { OverseerDurableObject, makeOverseerStorage, listReturnsFromStorage, getReturnFromStorage, deleteReturnFromStorage, type OverseerStorage } from "../src/overseer.js";
 import type { ActionRecord } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
 
@@ -72,7 +72,13 @@ export function putAction(
  */
 export async function openFakeOverseer(
     storage: object,
-    opts: { role?: "build" | "use", exports?: object } = {}): Promise<Overseer> {
+    opts: {
+      role?: "build" | "use";
+      exports?: object;
+      onClearRetainedActionPayload?: (
+        record: { id: string; actionRecordId: number },
+      ) => void | Promise<void>;
+    } = {}): Promise<Overseer> {
   let role = opts.role ?? "build";
   let ownerId = "owner-id";
   let userId = role === "build" ? ownerId : "viewer-id";
@@ -87,7 +93,13 @@ export async function openFakeOverseer(
       ensureObserver: async () => {},
       syncOutputsTo: async () => {},
       getSharingManager: async () => ({ getEffectiveRole: () => role }),
-      ctx: { id: { toString: () => "workspace-id" }, exports: opts.exports ?? {} },
+      ctx: {
+        id: { toString: () => "workspace-id" },
+        exports: opts.exports ?? {},
+        storage: {
+          transactionSync: <T>(fn: () => T): T => fn(),
+        },
+      },
       users: {
         idFromString: (id: string) => id,
         get: () => ({
@@ -99,7 +111,46 @@ export async function openFakeOverseer(
         prohibitAllSharing: { get: () => false },
         title: { get: () => "Test Workspace" },
       }),
+      listReturns: async (options: ListReturnsOptions): Promise<ReturnPage> =>
+        listReturnsFromStorage(storage as unknown as OverseerStorage, options),
+      getReturn: async (returnId: string): Promise<AuthorizedReturn> =>
+        getReturnFromStorage(storage as unknown as OverseerStorage, returnId),
+      deleteReturn: async (returnId: string): Promise<void> => {
+        const record = (storage as unknown as OverseerStorage).toolReturns.get(returnId);
+        if (record && record.captureState !== "deleted") {
+          await opts.onClearRetainedActionPayload?.(record);
+        }
+        const ctx = {
+          storage: {
+            transactionSync: <T>(fn: () => T): T => fn(),
+          },
+        } as unknown as DurableObjectState;
+        deleteReturnFromStorage(storage as unknown as OverseerStorage, ctx, returnId);
+      },
+      clearRetainedActionPayload: async (
+        record: { id: string; actionRecordId: number },
+      ) => {
+        await opts.onClearRetainedActionPayload?.(record);
+      },
+      logger: {
+        debug() {},
+        info() {},
+        warn() {},
+        error() {},
+        with() { return this; },
+      },
+      listPendingGadgets: () => [],
+      removeGadget: async () => {},
+      deleteAllChatChanges: () => {},
+      destroyLiveChat: () => {},
+      deliverExternalMessageResponse: () => {},
+      bumpVersion: () => {},
     },
   } satisfies Pick<OverseerDurableObject, "open"> & { impl: object };
-  return overseer.open(userId, `${userId}-profile`, new NativeRpcStub<() => void>(() => {}));
+  const notifyClosed = new NativeRpcStub<() => void>(() => {});
+  try {
+    return await overseer.open(userId, `${userId}-profile`, notifyClosed);
+  } finally {
+    notifyClosed[Symbol.dispose]();
+  }
 }

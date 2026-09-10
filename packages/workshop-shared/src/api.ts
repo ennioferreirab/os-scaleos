@@ -1851,6 +1851,21 @@ export interface Overseer extends RpcTarget {
       : Promise<ActionHistoryPage>;
 
   /**
+   * Fetch one page of summarized tool returns captured for a chat session.
+   */
+  listReturns(options: ListReturnsOptions): Promise<ReturnPage>;
+
+  /**
+   * Retrieve an authorized tool return and its application payload by return ID.
+   */
+  getReturn(returnId: string): Promise<AuthorizedReturn>;
+
+  /**
+   * Delete an authorized tool return and its stored application payload.
+   */
+  deleteReturn(returnId: string): Promise<void>;
+
+  /**
    * Approve an action that is currently in the "pending" state. The action will be performed on
    * approval.
    */
@@ -2598,6 +2613,202 @@ export type ActionHistoryPage = {
    */
   nextBeforeId?: number;
 };
+
+/** Immutable metadata snapshot for one provider source observed by a captured return. */
+export type SourceSnapshot = {
+  id: string;
+  gatekeeperId: number;
+  connectionGeneration?: number;
+  provider: "vault";
+  ref: string;
+  type: string;
+  title?: string;
+  occurredAt?: string;
+  observedAccess: {
+    type: string;
+    tags: string[];
+    sensitivity: string;
+  };
+  /** SHA-256 of the evidence text observed for this source; not a truth certificate. */
+  contentHash: string;
+};
+
+/** Normalized evidence that can be cited without treating the whole return as one source. */
+export type Evidence = {
+  id: string;
+  gatekeeperId: number;
+  sourceIds: string[];
+  text: string;
+  kind: "fact" | "excerpt" | "synthesis" | "unknown";
+  locator?: string;
+};
+
+/** Claim-to-evidence association supplied by the provider for this execution. */
+export type ReturnAnswerLink = {
+  claimIndex: number;
+  evidenceIds: string[];
+};
+
+/**
+ * Durable record of an authorized MCP tool return captured in a chat session.
+ */
+export type ToolReturn = {
+  /** Workspace-unique local return ID. */
+  id: string;
+  /** ID of the ActionRecord documenting this tool call in the audit log. */
+  actionRecordId: number;
+  /** Chat ID when this tool call occurred within an agent or chat session. */
+  chatId?: number;
+  /** ID of the gatekeeper workpiece through which the call was made. */
+  gatekeeperId: number;
+  /** Credential/connection generation observed at the time of the call. */
+  connectionGeneration?: number;
+  /** Wire name of the executed tool. */
+  tool: string;
+  /** Timestamp when the tool call was made. */
+  calledAt: Date;
+  /** Lifecycle execution state of the call. */
+  executionState: "pending" | "applied" | "rejected" | "failed" | "unknown";
+  /** Storage capture state of the returned payload. */
+  captureState: "stored" | "partial" | "failed" | "deleted";
+  /** Storage reference identifying the retained payload. */
+  payloadRef: string;
+  /** Total byte count of the application payload. */
+  byteCount: number;
+  /** Normalization schema version. */
+  normalizationVersion: number;
+  /** Provider-reported coverage metadata. */
+  coverage: {
+    complete: boolean;
+    reasons: string[];
+  };
+  /** Whether sensitive connection secrets were redacted before storage. */
+  redacted: boolean;
+  /** Whether this return's payload has been authorized as an observation. */
+  observed: boolean;
+  /** Trusted provider adapter selected by connector configuration. */
+  sourceProvider?: "vault";
+  /** Local normalized source snapshots referenced by this return. */
+  sourceIds?: string[];
+  /** Local normalized evidence referenced by this return. */
+  evidenceIds?: string[];
+  /** Provider claim links rewritten to local evidence IDs. */
+  answerLinks?: ReturnAnswerLink[];
+  /** Result of strict provider-envelope normalization. */
+  normalizationState?: "normalized" | "invalid" | "conflict" | "unsupported";
+  /** User-facing explanation when normalization is unavailable. */
+  normalizationReason?: string;
+  /** Bytes retained for normalized records and links. */
+  normalizationByteCount?: number;
+};
+
+/**
+ * Summary of an authorized tool return for listing.
+ */
+export type ToolReturnSummary = {
+  /** Workspace-unique local return ID. */
+  id: string;
+  /** ID of the ActionRecord documenting this tool call in the audit log. */
+  actionRecordId: number;
+  /** Chat ID when this tool call occurred within an agent or chat session. */
+  chatId?: number;
+  /** ID of the gatekeeper workpiece through which the call was made. */
+  gatekeeperId: number;
+  /** Wire name of the executed tool. */
+  tool: string;
+  /** Timestamp when the tool call was made. */
+  calledAt: Date;
+  /** Lifecycle execution state of the call. */
+  executionState: ToolReturn["executionState"];
+  /** Storage capture state of the returned payload. */
+  captureState: ToolReturn["captureState"];
+  /** Total byte count of the application payload. */
+  byteCount: number;
+  /** Provider-reported coverage metadata. */
+  coverage: {
+    complete: boolean;
+    reasons: string[];
+  };
+  /** Whether sensitive connection secrets were redacted before storage. */
+  redacted: boolean;
+  /** Whether this return's payload has been authorized as an observation. */
+  observed: boolean;
+  /** Trusted provider adapter selected by connector configuration. */
+  sourceProvider?: "vault";
+  /** Source types represented by this return. */
+  sourceTypes: string[];
+  /** Number of normalized sources represented by this return. */
+  sourceCount: number;
+  /** Number of normalized evidence items represented by this return. */
+  evidenceCount: number;
+  /** Result of strict provider-envelope normalization. */
+  normalizationState: "normalized" | "invalid" | "conflict" | "unsupported";
+  /** User-facing explanation when normalization is unavailable. */
+  normalizationReason?: string;
+  /** Human-readable connector title captured from workspace metadata. */
+  connectorTitle?: string;
+};
+
+/**
+ * Page of summarized tool returns from listReturns().
+ */
+export type ReturnPage = {
+  /** Matching return summaries, descending by call time. */
+  entries: ToolReturnSummary[];
+  /** Pass as `beforeId` to fetch the next older page; undefined when exhausted. */
+  nextBeforeId?: string;
+};
+
+/**
+ * Query and pagination options for listReturns().
+ */
+export type ListReturnsOptions = {
+  /** Chat ID whose tool returns should be listed. */
+  chatId: number;
+  /** Return ID of the last entry from the previous page. */
+  beforeId?: string;
+  /** Maximum number of records to return (default 25, maximum 100). */
+  limit?: number;
+  /** Text search query (maximum 200 characters). */
+  query?: string;
+  /** Filter by connector gatekeeper ID. */
+  connectorId?: number;
+  /** Filter by source type. */
+  sourceType?: string;
+};
+
+/**
+ * Outcome of querying an authorized tool return.
+ */
+export type AuthorizedReturn =
+  | {
+      status: "available";
+      return: ToolReturn;
+      /** Application content blocks from the MCP server. */
+      content?: unknown[];
+      /** Structured JSON content returned by the tool. */
+      structuredContent?: unknown;
+      /** Combined text content. */
+      text?: string;
+      /** Strictly normalized source snapshots, empty for generic or invalid returns. */
+      sources: SourceSnapshot[];
+      /** Strictly normalized evidence, empty for generic or invalid returns. */
+      evidence: Evidence[];
+      /** Provider claim links rewritten to local evidence IDs. */
+      answerLinks: ReturnAnswerLink[];
+      /** Result of normalization for viewer disclosure. */
+      normalization: {
+        state: "normalized" | "invalid" | "conflict" | "unsupported";
+        reason?: string;
+      };
+      /** Whether the tool reported an execution error. */
+      isError?: boolean;
+    }
+  | {
+      status: "unavailable";
+      returnId: string;
+      reason: string;
+    };
 
 export type AiChatAuthorInfo = {
   /**

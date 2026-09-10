@@ -1,12 +1,11 @@
 // The trust boundary: what an MCP server says about its own tools becomes what a Gadget may do.
 // Nothing outside this file reads a tool's `annotations`.
 
-import type { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import type { ActionKind, CapturedToolResult } from "@gadgets/workshop-shared/gatekeeper";
 import {
   clampToolSummary,
   type McpContentBlock,
   type McpTool,
-  type McpToolCallResult,
 } from "./client.js";
 import type { McpCallResult, McpToolInfo, McpToolSummary } from "./types";
 import { hexEncode } from "./util.js";
@@ -152,7 +151,8 @@ export async function catalogRevision(tools: McpTool[]): Promise<string> {
 
 /** Flattens tool content into the shape a Gadget sees. */
 export function toCallResult(
-  result: McpToolCallResult,
+  result: CapturedToolResult,
+  options?: { returnId?: string; captureError?: string },
 ): Extract<McpCallResult, { status: "ok" }> {
   const content = (result.content ?? []) as McpContentBlock[];
   const text = content
@@ -165,6 +165,8 @@ export function toCallResult(
     text,
     structuredContent: result.structuredContent,
     isError: result.isError,
+    ...(options?.returnId !== undefined ? { returnId: options.returnId } : {}),
+    ...(options?.captureError !== undefined ? { captureError: options.captureError } : {}),
   };
 }
 

@@ -3,6 +3,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import { ActionStore } from "../src/action-store.js";
 import { McpProtocolError, McpSessionExpiredError } from "../src/client.js";
+import type { CapturedToolResult } from "@gadgets/workshop-shared/gatekeeper";
 
 type TestSql = ConstructorParameters<typeof ActionStore>[0];
 
@@ -357,5 +358,68 @@ describe("ActionStore", () => {
     await store.apply(staged.id, fn => fn({ callTool: counting } as never), log);
     await store.apply(staged.id, fn => fn({ callTool: counting } as never), log);
     expect(calls).toBe(1);
+  });
+
+  it("captures full untruncated result before 128 KiB truncation", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    const largeText = "x".repeat(150_000);
+    const big = async () => ({
+      content: [{ type: "text" as const, text: largeText }],
+      structuredContent: { large: true },
+    });
+    let capturedContent: unknown;
+    const capture = {
+      captureResult: async (res: CapturedToolResult) => {
+        capturedContent = res;
+        return { status: "stored" as const, returnId: "ret_123", byteCount: 150_000 };
+      },
+    };
+    await store.apply(staged.id, (fn, onConnection) => {
+      onConnection({ generation: 7, secrets: ["connection-secret"] });
+      return fn({ callTool: big } as never);
+    }, log, capture);
+    const stored = store.get(staged.id);
+    expect(stored?.state).toBe("applied");
+    expect(stored?.returnId).toBe("ret_123");
+    // Chat-bound payload has one deletion-aware durable copy, not a second SQLite copy.
+    expect(stored?.result).toBeUndefined();
+    expect(capturedContent).toMatchObject({
+      content: [{ text: largeText }],
+      structuredContent: { large: true },
+      connectionGeneration: 7,
+      secrets: ["connection-secret"],
+    });
+  });
+
+  it("does not call write twice when capture persistence fails, and keeps action applied", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    let writeCalls = 0;
+    const write = async () => {
+      writeCalls++;
+      return { content: [{ type: "text" as const, text: "action output" }] };
+    };
+    const failingCapture = {
+      captureResult: async () => {
+        throw new Error("Persistence error");
+      },
+    };
+    // Applying with a failing capture should not throw from apply or fail the write
+    await store.apply(staged.id, (fn, onConnection) => {
+      onConnection({ generation: 8, secrets: ["connection-secret"] });
+      return fn({ callTool: write } as never);
+    }, log, failingCapture);
+    expect(writeCalls).toBe(1);
+    const stored = store.get(staged.id);
+    expect(stored?.state).toBe("applied");
+    expect(stored?.captureError).toBe("Persistence error");
+
+    // Calling apply a second time must NOT re-call the write
+    await store.apply(staged.id, (fn, onConnection) => {
+      onConnection({ generation: 8, secrets: ["connection-secret"] });
+      return fn({ callTool: write } as never);
+    }, log, failingCapture);
+    expect(writeCalls).toBe(1);
   });
 });
