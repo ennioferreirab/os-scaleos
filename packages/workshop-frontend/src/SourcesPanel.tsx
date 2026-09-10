@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from 'react'
-import { BookOpenText, CaretRight, MagnifyingGlass, Trash } from '@phosphor-icons/react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowSquareOut, BookOpenText, CaretRight, MagnifyingGlass, Trash } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import type {
   AuthorizedReturn,
+  EvidenceSource,
   Overseer,
   ToolReturnSummary,
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton, WorkshopInput } from './components/WorkshopControls'
 import { reportIssue } from './errorReporting'
 import { formatDate, useLocale } from './i18n'
+import { safeExternalUrl } from './utils/safeExternalUrl'
 
 type SourcesPanelProps = {
   overseer: RpcStub<Overseer>
@@ -29,6 +31,35 @@ function returnStatus(entry: ToolReturnSummary): string {
   return entry.normalizationState
 }
 
+export function buildVaultNoteUrl(
+  vaultWebUrl: string | undefined,
+  note: EvidenceSource['note'],
+): string | undefined {
+  if (!vaultWebUrl || !note || typeof note !== 'object'
+      || typeof note.brain !== 'string' || typeof note.slug !== 'string') {
+    return undefined
+  }
+  const brain = note.brain.trim()
+  const slug = note.slug.trim()
+  if (!brain || !slug) return undefined
+
+  const safeBase = safeExternalUrl(vaultWebUrl)
+  if (!safeBase) return undefined
+
+  try {
+    const url = new URL(safeBase)
+    if (url.username || url.password) return undefined
+    url.pathname = '/app/notas'
+    url.search = ''
+    url.searchParams.set('brain', brain)
+    url.searchParams.set('slug', slug)
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return undefined
+  }
+}
+
 function ReturnDetail({ value }: { value: AuthorizedReturn }) {
   const { t } = useLocale()
   if (value.status === 'unavailable') {
@@ -45,9 +76,18 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
     if (group) group.push(source)
     else byType.set(source.type, [source])
   }
+  const evidenceById = new Map(value.evidence.map(item => [item.id, item]))
 
   return (
     <div className="space-y-5">
+      <p className="m-0 text-[11px] text-kumo-inactive">
+        {t('workspace.sources.returnedAt', {
+          date: formatDate(new Date(value.return.calledAt), {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          }),
+        })}
+      </p>
       {value.normalization.state !== 'normalized' && (
         <div className="rounded-lg border border-kumo-line bg-kumo-tint p-3 text-[12px] leading-[18px] text-kumo-subtle">
           {value.normalization.reason ?? t('workspace.sources.unstructured')}
@@ -64,20 +104,34 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
               <div key={type}>
                 <p className="mb-1 text-[12px] font-medium text-kumo-subtle">{type}</p>
                 <div className="space-y-1.5">
-                  {sources.map(source => (
-                    <div key={source.id} className="rounded-lg border border-kumo-line px-3 py-2">
-                      <p className="m-0 text-[13px] font-medium text-kumo-default">
-                        {source.title || source.ref}
-                      </p>
-                      {source.title && (
-                        <p className="mt-0.5 break-all text-[11px] text-kumo-inactive">{source.ref}</p>
-                      )}
-                      <p className="mt-1 text-[11px] text-kumo-inactive">
-                        {source.occurredAt ?? t('workspace.sources.dateUnavailable')}
-                        {source.sensitivity ? ` · ${source.sensitivity}` : ''}
-                      </p>
-                    </div>
-                  ))}
+                  {sources.map(source => {
+                    const noteUrl = buildVaultNoteUrl(value.return.vaultWebUrl, source.note)
+                    return (
+                      <div key={source.id} className="rounded-lg border border-kumo-line px-3 py-2">
+                        <p className="m-0 text-[13px] font-medium text-kumo-default">
+                          {source.title || source.ref}
+                        </p>
+                        {source.title && (
+                          <p className="mt-0.5 break-all text-[11px] text-kumo-inactive">{source.ref}</p>
+                        )}
+                        <p className="mt-1 text-[11px] text-kumo-inactive">
+                          {source.occurredAt ?? t('workspace.sources.dateUnavailable')}
+                          {source.sensitivity ? ` · ${source.sensitivity}` : ''}
+                        </p>
+                        {noteUrl && (
+                          <a
+                            href={noteUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="mt-2 inline-flex items-center gap-1 text-[12px] font-medium text-kumo-default hover:underline"
+                          >
+                            {t('workspace.sources.openVaultNote')}
+                            <ArrowSquareOut size={13} aria-hidden="true" />
+                          </a>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             ))}
@@ -105,14 +159,72 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
           </div>
         </section>
       )}
+      {value.answerLinks.length > 0 && (
+        <section>
+          <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-kumo-inactive">
+            {t('workspace.sources.answerLinks')}
+          </h3>
+          <div className="space-y-2">
+            {value.answerLinks.map((link, index) => (
+              <article key={`${link.claimIndex}-${index}`} className="rounded-lg border border-kumo-line p-3">
+                <p className="m-0 text-[12px] font-medium text-kumo-subtle">
+                  {t('workspace.sources.claim', { number: link.claimIndex + 1 })}
+                </p>
+                {link.evidenceIds.length > 0 && (
+                  <ul className="mt-2 space-y-1.5 pl-4">
+                    {link.evidenceIds.map(evidenceId => {
+                      const item = evidenceById.get(evidenceId)
+                      return (
+                        <li key={evidenceId} className="text-[12px] leading-[18px] text-kumo-default">
+                          <span className="font-mono text-[11px] text-kumo-inactive">{evidenceId}</span>
+                          {item && <span className="ml-2">{item.text}</span>}
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
 
       <details className="rounded-lg border border-kumo-line">
         <summary className="cursor-pointer px-3 py-2 text-[12px] font-medium text-kumo-subtle">
           {t('workspace.sources.returnedContent')}
         </summary>
-        <pre className="m-0 max-h-80 overflow-auto whitespace-pre-wrap break-words border-t border-kumo-line p-3 text-[11px] leading-[17px] text-kumo-subtle">
-          {value.text || JSON.stringify(value.structuredContent, null, 2)}
-        </pre>
+        <div className="space-y-3 border-t border-kumo-line p-3">
+          {value.text !== undefined && (
+            <div>
+              <p className="mb-1 text-[11px] font-medium text-kumo-inactive">
+                {t('workspace.sources.returnedText')}
+              </p>
+              <pre className="m-0 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-[17px] text-kumo-subtle">
+                {value.text}
+              </pre>
+            </div>
+          )}
+          {value.structuredContent !== undefined && (
+            <div>
+              <p className="mb-1 text-[11px] font-medium text-kumo-inactive">
+                {t('workspace.sources.structuredContent')}
+              </p>
+              <pre className="m-0 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-[17px] text-kumo-subtle">
+                {JSON.stringify(value.structuredContent, null, 2)}
+              </pre>
+            </div>
+          )}
+          {value.content !== undefined && (
+            <div>
+              <p className="mb-1 text-[11px] font-medium text-kumo-inactive">
+                {t('workspace.sources.contentBlocks')}
+              </p>
+              <pre className="m-0 max-h-80 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-[17px] text-kumo-subtle">
+                {JSON.stringify(value.content, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
       </details>
     </div>
   )
@@ -132,40 +244,50 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string>()
   const [reload, setReload] = useState(0)
+  const listGenerationRef = useRef(0)
+
 
   useEffect(() => {
+    const generation = ++listGenerationRef.current
+    const isCurrent = () => listGenerationRef.current === generation
+    setEntries([])
+    setNextBeforeId(undefined)
+    setLoadingMore(false)
+    setError(undefined)
     setSelectedId(undefined)
     setDetail(undefined)
-  }, [chatId])
 
-  useEffect(() => {
-    if (!isVisible || view !== 'conversation' || chatId === null) return
+    if (!isVisible || view !== 'conversation' || chatId === null) {
+      setLoading(false)
+      return
+    }
+
     let cancelled = false
+    setLoading(true)
     const timeout = window.setTimeout(() => {
-      setLoading(true)
-      setError(undefined)
       overseer.listReturns({
         chatId,
         ...(query.trim() ? { query: query.trim() } : {}),
         ...(sourceType ? { sourceType } : {}),
         ...(connectorId ? { connectorId: Number(connectorId) } : {}),
       }).then(page => {
-        if (cancelled) return
+        if (cancelled || !isCurrent()) return
         setEntries(page.entries)
         setNextBeforeId(page.nextBeforeId)
       }).catch(cause => {
-        if (cancelled) return
+        if (cancelled || !isCurrent()) return
         reportIssue('sources.list', cause)
         setError(cause instanceof Error ? cause.message : String(cause))
         setEntries([])
         setNextBeforeId(undefined)
       }).finally(() => {
-        if (!cancelled) setLoading(false)
+        if (!cancelled && isCurrent()) setLoading(false)
       })
     }, 200)
     return () => {
       cancelled = true
       window.clearTimeout(timeout)
+      if (isCurrent()) listGenerationRef.current += 1
     }
   }, [chatId, connectorId, isVisible, overseer, query, reload, sourceType, view])
 
@@ -195,6 +317,8 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
 
   const loadMore = async () => {
     if (chatId === null || !nextBeforeId || loadingMore) return
+    const generation = listGenerationRef.current
+    const isCurrent = () => listGenerationRef.current === generation
     setLoadingMore(true)
     try {
       const page = await overseer.listReturns({
@@ -204,13 +328,15 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
         ...(sourceType ? { sourceType } : {}),
         ...(connectorId ? { connectorId: Number(connectorId) } : {}),
       })
+      if (!isCurrent()) return
       setEntries(current => [...current, ...page.entries])
       setNextBeforeId(page.nextBeforeId)
     } catch (cause) {
+      if (!isCurrent()) return
       reportIssue('sources.list-more', cause)
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
-      setLoadingMore(false)
+      if (isCurrent()) setLoadingMore(false)
     }
   }
 
@@ -226,7 +352,6 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
       setError(cause instanceof Error ? cause.message : String(cause))
     }
   }
-
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
       <div className="flex h-11 shrink-0 items-center gap-1 border-b border-kumo-line px-3">
