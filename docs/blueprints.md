@@ -27,6 +27,7 @@ A blueprint does **not** capture:
 - The gadget's SQLite storage contents.
 - AI chat history or edit history.
 - Live connections or credentials. Only the *shape* of each binding (its type, gatekeeper name, URL pattern, etc.) is recorded.
+- Private retained tool returns and document citation sets (`ToolReturn` and `CitationSet`). See [Sources and document citations](sources-and-citations.md) for the separate export projection and retention boundaries.
 
 ## Binding Annotations
 
@@ -127,6 +128,8 @@ A deployment can also ship blueprints as data. `packages/workshop-backend/format
 - Their `output` lives in the sidecar rather than the archive, so the deployment's presentation has a single source of truth.
 
 The first `/api` request a deployment serves installs any whose manifest fingerprint has changed. The fingerprint covers its title, description, author, revision, and output presentation; `revision` represents changes to the archive bytes. Each bundled blueprint is promoted only once ever -- an upgrade never undoes an admin's later removal or overrides.
+
+The bundled Workspace Docs format renders citation-aware Markdown, HTML, and PDF exports from one frozen, owner-authorized projection. That projection is transient export input, not blueprint content; publication and `.gadget` transfer never add retained evidence or citation records to the code snapshot.
 
 ## Creating and Managing Blueprints
 
