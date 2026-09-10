@@ -5,7 +5,7 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { newMessagePortRpcSession, RpcStub, RpcTarget } from 'capnweb'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { GadgetClient, UiBundle } from '@gadgets/workshop-shared/api'
+import type { DocumentEvidenceView, GadgetClient, UiBundle } from '@gadgets/workshop-shared/api'
 
 const testGlobal = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
 const previousActEnvironment = testGlobal.IS_REACT_ACT_ENVIRONMENT
@@ -24,7 +24,10 @@ vi.mock('@cloudflare/kumo', () => ({
   Text: ({ children }: { children: ReactNode }) => children,
 }))
 
-import GadgetUI from './GadgetUI'
+import GadgetUI, {
+  toGadgetCitationProjection,
+  validateCitationOpenMessage,
+} from './GadgetUI'
 
 interface TestGadget {
   read(): string
@@ -141,6 +144,90 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
+const citationView: DocumentEvidenceView = {
+  gadgetId: 9,
+  documentRevision: 4,
+  citationRevision: 2,
+  mode: 'inline',
+  links: [
+    {
+      id: 'citation-1',
+      blockId: 'block-1',
+      blockVersion: 1,
+      blockHash: 'hash-1',
+      state: 'valid',
+      evidence: [{ returnId: 'return-1', evidenceId: 'evidence-1' }],
+    },
+    {
+      id: 'citation-2',
+      blockId: 'block-2',
+      blockVersion: 1,
+      blockHash: 'hash-2',
+      state: 'needs_review',
+      evidence: [{ returnId: 'return-2', evidenceId: 'evidence-2' }],
+    },
+  ],
+  evidence: [
+    {
+      status: 'available',
+      ref: { returnId: 'return-1', evidenceId: 'evidence-1' },
+      returnId: 'return-1',
+      evidence: {
+        id: 'evidence-1',
+        sourceIds: [],
+        text: 'A retained passage',
+        kind: 'excerpt',
+      },
+      sources: [],
+    },
+    {
+      status: 'unavailable',
+      ref: { returnId: 'return-2', evidenceId: 'evidence-2' },
+      reason: 'Evidence is unavailable.',
+    },
+    {
+      status: 'available',
+      ref: { returnId: 'return-extra', evidenceId: 'evidence-extra' },
+      returnId: 'return-extra',
+      evidence: {
+        id: 'evidence-extra',
+        sourceIds: [],
+        text: 'Not linked to this document',
+        kind: 'fact',
+      },
+      sources: [],
+    },
+  ],
+}
+
+describe('GadgetUI citation projection', () => {
+  it('keeps linked evidence and rejects stale or cross-gadget open intents', () => {
+    const projection = toGadgetCitationProjection(citationView)
+    expect(projection?.evidence.map(item => `${item.returnId}/${item.evidenceId}`)).toEqual([
+      'return-1/evidence-1',
+      'return-2/evidence-2',
+    ])
+    expect(validateCitationOpenMessage({
+      type: 'open-citation',
+      gadgetId: 9,
+      blockId: 'block-1',
+      citationId: 'citation-1',
+    }, projection)).toEqual({ citationId: 'citation-1', blockId: 'block-1' })
+    expect(validateCitationOpenMessage({
+      type: 'open-citation',
+      gadgetId: 10,
+      blockId: 'block-1',
+      citationId: 'citation-1',
+    }, projection)).toBeNull()
+    expect(validateCitationOpenMessage({
+      type: 'open-citation',
+      gadgetId: 9,
+      blockId: 'block-1',
+      citationId: 'citation-stale',
+    }, projection)).toBeNull()
+  })
+})
+
 function dispatchIframeHandshake(iframe: HTMLIFrameElement, port: MessagePort) {
   window.dispatchEvent(new MessageEvent('message', {
     data: 'handshake',
@@ -186,6 +273,70 @@ describe('GadgetUI RPC recovery', () => {
     expect(container.querySelector('iframe')!.srcdoc).toContain(
       '<meta name="viewport" content="width=device-width, initial-scale=1">',
     )
+  })
+
+  it('accepts citation intents only from the current opaque iframe and projection', async () => {
+    const gadget = fakeGadget('citations', 'document.body.textContent = "citations"')
+    const onOpenCitation = vi.fn()
+    const projection = toGadgetCitationProjection(citationView)
+    await act(async () => {
+      root.render(
+        <GadgetUI
+          gadget={gadget.stub}
+          height="100px"
+          citationProjection={projection}
+          onOpenCitation={onOpenCitation}
+        />,
+      )
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    const iframe = container.querySelector('iframe')!
+    const intent = {
+      type: 'open-citation',
+      gadgetId: 9,
+      blockId: 'block-1',
+      citationId: 'citation-1',
+    }
+
+    window.dispatchEvent(new MessageEvent('message', {
+      data: intent,
+      origin: 'https://attacker.example',
+      source: iframe.contentWindow,
+    }))
+    window.dispatchEvent(new MessageEvent('message', {
+      data: intent,
+      origin: 'null',
+      source: window,
+    }))
+    window.dispatchEvent(new MessageEvent('message', {
+      data: {...intent, citationId: 'citation-stale'},
+      origin: 'null',
+      source: iframe.contentWindow,
+    }))
+    window.dispatchEvent(new MessageEvent('message', {
+      data: intent,
+      origin: 'null',
+      source: iframe.contentWindow,
+    }))
+    expect(onOpenCitation).toHaveBeenCalledOnce()
+    expect(onOpenCitation).toHaveBeenCalledWith('citation-1')
+
+    await act(async () => {
+      root.render(
+        <GadgetUI
+          gadget={gadget.stub}
+          height="100px"
+          citationProjection={null}
+          onOpenCitation={onOpenCitation}
+        />,
+      )
+    })
+    window.dispatchEvent(new MessageEvent('message', {
+      data: intent,
+      origin: 'null',
+      source: iframe.contentWindow,
+    }))
+    expect(onOpenCitation).toHaveBeenCalledOnce()
   })
 
   it('keeps the iframe while redirecting calls to the replacement gadget client', async () => {

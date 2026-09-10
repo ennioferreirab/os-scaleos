@@ -152,6 +152,40 @@ describe("document citation storage", () => {
     expect(unavailable.evidence[0]).toMatchObject({status: "unavailable"});
   });
 
+  it("projects links and evidence in the document's current block order", async () => {
+    const storage = makeActionStorage();
+    putChat(storage, CHAT_ID);
+    putEvidenceReturn(storage, "return-a", CHAT_ID, "evidence-a", "First evidence");
+    putEvidenceReturn(storage, "return-b", CHAT_ID, "evidence-b", "Second evidence");
+    const initial = documentSnapshot(1);
+
+    await setDocumentCitationsInStorage(storage, {
+      gadgetId: DOCUMENT_ID,
+      expectedDocumentRevision: 1,
+      expectedCitationRevision: 0,
+      links: [
+        {
+          id: "citation-a",
+          blockId: "block-a",
+          evidence: [{returnId: "return-a", evidenceId: "evidence-a"}],
+        },
+        {
+          id: "citation-b",
+          blockId: "block-b",
+          evidence: [{returnId: "return-b", evidenceId: "evidence-b"}],
+        },
+      ],
+    }, initial);
+
+    const moved = documentSnapshot(2, [initial.blocks[1], initial.blocks[0]]);
+    const view = await getDocumentEvidenceFromStorage(storage, moved);
+    expect(view.links.map(link => link.id)).toEqual(["citation-b", "citation-a"]);
+    expect(view.evidence.map(item => item.ref)).toEqual([
+      {returnId: "return-b", evidenceId: "evidence-b"},
+      {returnId: "return-a", evidenceId: "evidence-a"},
+    ]);
+  });
+
   it("rejects cross-chat references and protects citation mode with CAS", async () => {
     const storage = makeActionStorage();
     putChat(storage, CHAT_ID);

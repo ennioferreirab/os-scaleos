@@ -14,6 +14,16 @@ const MAX_EVIDENCE_REFS = 5_000;
 const MAX_EVIDENCE_REFS_PER_LINK = 100;
 const MAX_REFERENCE_ID_LENGTH = 256;
 
+
+/** Stable RPC error used when a gadget does not publish the document-citation capability. */
+export const DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE =
+  "This gadget does not support document citations.";
+
+/** Identify the explicit unsupported-capability result after it crosses an RPC boundary. */
+export function isDocumentCitationsUnsupportedError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "message" in error
+    && error.message === DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE;
+}
 /** A document block snapshot used to resolve citation anchors. */
 export type CitationDocumentBlock = {
   /** Stable document block ID. */
@@ -113,9 +123,16 @@ export async function resolveCitationSet(
   set: CitationSet | undefined,
   evidence: readonly AuthorizedEvidence[],
 ): Promise<DocumentEvidenceView> {
+  const blockOrder = new Map(document.blocks.map((block, index) => [block.id, index]));
   const currentBlocks = new Map(document.blocks.map(block => [block.id, block]));
   const evidenceByRef = new Map(evidence.map(item => [evidenceRefKey(item.ref), item]));
-  const links = set?.links ?? [];
+  const links = [...(set?.links ?? [])]
+    .map((link, index) => ({link, index}))
+    .sort((a, b) =>
+      (blockOrder.get(a.link.blockId) ?? Number.MAX_SAFE_INTEGER)
+        - (blockOrder.get(b.link.blockId) ?? Number.MAX_SAFE_INTEGER)
+      || a.index - b.index)
+    .map(({link}) => link);
   const resolvedLinks = [];
   const resolvedEvidence: AuthorizedEvidence[] = [];
   const seenEvidence = new Set<string>();

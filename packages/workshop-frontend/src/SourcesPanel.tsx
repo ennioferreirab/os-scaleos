@@ -3,25 +3,37 @@ import { ArrowSquareOut, BookOpenText, CaretRight, MagnifyingGlass, Trash } from
 import type { RpcStub } from 'capnweb'
 import type {
   AuthorizedReturn,
+  CitationMode,
+  DocumentCitationView,
+  DocumentEvidenceView,
+  EvidenceRef,
   EvidenceSource,
   Overseer,
   ToolReturnSummary,
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton, WorkshopInput } from './components/WorkshopControls'
 import { reportIssue } from './errorReporting'
-import { formatDate, useLocale } from './i18n'
 import { safeExternalUrl } from './utils/safeExternalUrl'
+import { formatDate, useLocale } from './i18n'
 
 type SourcesPanelProps = {
   overseer: RpcStub<Overseer>
   chatId: number | null
   gadgetId?: number
   isVisible: boolean
+  documentSupported?: boolean | null
+  documentEvidence?: DocumentEvidenceView | null
+  documentEvidenceLoading?: boolean
+  documentEvidenceError?: boolean
+  onRefreshDocumentEvidence?: () => Promise<DocumentEvidenceView | null>
+  focusCitationId?: string
+  onNavigateToDocument?: (blockId: string, citationId: string) => void
 }
 
 type SourcesView = 'conversation' | 'document'
 
 function returnStatus(
+
   entry: ToolReturnSummary,
   labels: {
     deleted: string
@@ -40,6 +52,30 @@ function returnStatus(
   if (entry.captureState === 'failed' || entry.executionState === 'failed') return labels.failed
   if (entry.executionState === 'unknown') return labels.unknown
   return entry.observed ? labels[entry.normalizationState] : labels.awaiting
+}
+function evidenceRefKey(ref: Pick<EvidenceRef, 'returnId' | 'evidenceId'>): string {
+  return `${ref.returnId}\u0000${ref.evidenceId}`
+}
+
+function citationStateLabel(
+  state: DocumentCitationView['state'],
+  t: ReturnType<typeof useLocale>['t'],
+): string {
+  switch (state) {
+    case 'valid': return t('workspace.sources.citationValid')
+    case 'needs_review': return t('workspace.sources.citationNeedsReview')
+    case 'orphaned': return t('workspace.sources.citationOrphaned')
+    case 'unavailable': return t('workspace.sources.citationUnavailable')
+  }
+}
+
+function citationStateClass(state: DocumentCitationView['state']): string {
+  switch (state) {
+    case 'valid': return 'text-kumo-success'
+    case 'needs_review': return 'text-kumo-warning'
+    case 'orphaned':
+    case 'unavailable': return 'text-kumo-danger'
+  }
 }
 
 export function buildVaultNoteUrl(
@@ -241,7 +277,226 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
   )
 }
 
-export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: SourcesPanelProps) {
+type DocumentSourcesProps = {
+  documentSupported?: boolean | null
+  documentEvidence?: DocumentEvidenceView | null
+  documentEvidenceLoading: boolean
+  documentEvidenceError: boolean
+  modeError?: string
+  selectedCitationId?: string
+  citationRefs: { current: Map<string, HTMLElement> }
+  modeBusy: boolean
+  onModeChange: (mode: CitationMode) => void
+  onNavigateToDocument?: (blockId: string, citationId: string) => void
+}
+
+function DocumentSources({
+  documentSupported,
+  documentEvidence,
+  documentEvidenceLoading,
+  documentEvidenceError,
+  modeError,
+  selectedCitationId,
+  citationRefs,
+  modeBusy,
+  onModeChange,
+  onNavigateToDocument,
+}: DocumentSourcesProps) {
+  const { t } = useLocale()
+
+  if (documentEvidenceLoading || documentSupported === null) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-subtle">
+        {t('workspace.sources.documentLoading')}
+      </div>
+    )
+  }
+
+  if (documentSupported === undefined) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-subtle">
+        {t('workspace.sources.noDocument')}
+      </div>
+    )
+  }
+
+  if (documentEvidenceError) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-danger">
+        {t('workspace.sources.documentLoadFailed')}
+      </div>
+    )
+  }
+
+  if (!documentSupported) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+        <BookOpenText size={24} className="mb-3 text-kumo-inactive" />
+        <p className="m-0 text-[13px] font-medium text-kumo-default">
+          {t('workspace.sources.documentUnsupported')}
+        </p>
+        <p className="mt-1 max-w-xs text-[12px] leading-[18px] text-kumo-subtle">
+          {t('workspace.sources.documentUnsupportedDescription')}
+        </p>
+      </div>
+    )
+  }
+
+  if (!documentEvidence) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-subtle">
+        {t('workspace.sources.documentLoadFailed')}
+      </div>
+    )
+  }
+
+  const evidenceByRef = new Map(
+    documentEvidence.evidence.map(item => [evidenceRefKey(item.ref), item]),
+  )
+  const evidenceNumbers = new Map<string, number>()
+  let nextEvidenceNumber = 1
+  for (const link of documentEvidence.links) {
+    if (link.state !== 'valid') continue
+    for (const ref of link.evidence) {
+      const key = evidenceRefKey(ref)
+      if (!evidenceNumbers.has(key)) evidenceNumbers.set(key, nextEvidenceNumber++)
+    }
+  }
+
+  return (
+    <div className="min-h-0 flex-1 overflow-auto p-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="m-0 text-[14px] font-semibold text-kumo-default">
+            {t('workspace.sources.documentCitations')}
+          </h2>
+          <p className="mt-1 text-[12px] text-kumo-subtle">
+            {t('workspace.sources.documentCitationCount', { count: documentEvidence.links.length })}
+          </p>
+        </div>
+        <label className="flex shrink-0 items-center gap-2 text-[11px] text-kumo-subtle">
+          <span>{t('workspace.sources.citationMode')}</span>
+          <select
+            value={documentEvidence.mode}
+            disabled={modeBusy}
+            onChange={event => onModeChange(event.target.value as CitationMode)}
+            className="h-8 rounded-md border border-kumo-line bg-kumo-base px-2 text-[12px] text-kumo-default"
+          >
+            <option value="inline">{t('workspace.sources.modeInline')}</option>
+            <option value="endnotes">{t('workspace.sources.modeEndnotes')}</option>
+            <option value="none">{t('workspace.sources.modeNone')}</option>
+          </select>
+        </label>
+      </div>
+      {modeError && (
+        <p className="mt-2 text-[12px] text-kumo-danger">{modeError}</p>
+      )}
+
+      {documentEvidence.links.length === 0 ? (
+        <div className="rounded-lg border border-kumo-line bg-kumo-tint p-4 text-[13px] text-kumo-subtle">
+          {t('workspace.sources.noDocumentLinks')}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {documentEvidence.links.map((link, index) => {
+            const selected = selectedCitationId === link.id
+            return (
+              <article
+                key={link.id}
+                ref={node => {
+                  if (node) citationRefs.current.set(link.id, node)
+                  else citationRefs.current.delete(link.id)
+                }}
+                className={`rounded-lg border p-3 ${
+                  selected ? 'border-kumo-default bg-kumo-tint' : 'border-kumo-line'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="m-0 text-[13px] font-medium text-kumo-default">
+                      {t('workspace.sources.citationLink', { number: index + 1 })}
+                    </p>
+                    <p className={`mt-1 text-[11px] ${citationStateClass(link.state)}`}>
+                      {citationStateLabel(link.state, t)}
+                    </p>
+                  </div>
+                  {onNavigateToDocument && (
+                    <button
+                      type="button"
+                      onClick={event => {
+                        event.stopPropagation()
+                        onNavigateToDocument(link.blockId, link.id)
+                      }}
+                      className="shrink-0 rounded-md border border-kumo-line px-2 py-1 text-[11px] text-kumo-subtle hover:bg-kumo-base"
+                    >
+                      {t('workspace.sources.openInDocument')}
+                    </button>
+                  )}
+                </div>
+
+                {link.evidence.length > 0 ? (
+                  <div className="mt-3 space-y-2">
+                    {link.evidence.map(ref => {
+                      const item = evidenceByRef.get(evidenceRefKey(ref))
+                      const number = evidenceNumbers.get(evidenceRefKey(ref))
+                      return (
+                        <div key={evidenceRefKey(ref)} className="rounded-md bg-kumo-tint px-2.5 py-2">
+                          {number ? (
+                            <p className="m-0 text-[11px] text-kumo-inactive">[{number}]</p>
+                          ) : item?.status === 'unavailable' ? (
+                            <p className="m-0 text-[11px] text-kumo-inactive">
+                              {t('workspace.sources.citationUnavailable')}
+                            </p>
+                          ) : null}
+                          {item?.status === 'available' ? (
+                            <>
+                              <p className="mt-1 whitespace-pre-wrap text-[12px] leading-[18px] text-kumo-default">
+                                {item.evidence.text}
+                              </p>
+                              {(item.evidence.kind || item.evidence.locator) && (
+                                <p className="mt-1 text-[11px] text-kumo-inactive">
+                                  {[item.evidence.kind, item.evidence.locator].filter(Boolean).join(' · ')}
+                                </p>
+                              )}
+                            </>
+                          ) : (
+                            <p className="mt-1 text-[12px] leading-[18px] text-kumo-danger">
+                              {item?.status === 'unavailable'
+                                ? item.reason
+                                : t('workspace.sources.citationUnavailableDescription')}
+                            </p>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <p className="mt-3 text-[12px] text-kumo-subtle">
+                    {t('workspace.sources.noCitationEvidence')}
+                  </p>
+                )}
+              </article>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function SourcesPanel({
+  overseer,
+  chatId,
+  gadgetId,
+  isVisible,
+  documentSupported,
+  documentEvidence,
+  documentEvidenceLoading = false,
+  documentEvidenceError = false,
+  onRefreshDocumentEvidence,
+  focusCitationId,
+  onNavigateToDocument,
+}: SourcesPanelProps) {
   const { t } = useLocale()
   const [view, setView] = useState<SourcesView>('conversation')
   const [entries, setEntries] = useState<ToolReturnSummary[]>([])
@@ -257,6 +512,11 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
   const [reload, setReload] = useState(0)
   const listGenerationRef = useRef(0)
 
+
+  const [selectedCitationId, setSelectedCitationId] = useState<string>()
+  const [modeBusy, setModeBusy] = useState(false)
+  const [modeError, setModeError] = useState<string>()
+  const citationRefs = useRef(new Map<string, HTMLElement>())
 
   useEffect(() => {
     const generation = ++listGenerationRef.current
@@ -315,6 +575,35 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
     })
     return () => { cancelled = true }
   }, [isVisible, overseer, selectedId, reload])
+  useEffect(() => {
+    if (!focusCitationId || !isVisible) return
+    setView('document')
+    setSelectedCitationId(focusCitationId)
+  }, [focusCitationId, isVisible])
+
+  useEffect(() => {
+    if (!focusCitationId || !isVisible || view !== 'document' ||
+        !documentEvidence?.links.some(link => link.id === focusCitationId)) return
+    const frame = window.requestAnimationFrame(() => {
+      citationRefs.current.get(focusCitationId)?.scrollIntoView({block: 'nearest'})
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [documentEvidence, focusCitationId, isVisible, view])
+
+  useEffect(() => {
+    if (!documentEvidence) {
+      setSelectedCitationId(undefined)
+      return
+    }
+    if (selectedCitationId &&
+        !documentEvidence.links.some(link => link.id === selectedCitationId)) {
+      setSelectedCitationId(undefined)
+    }
+  }, [documentEvidence, selectedCitationId])
+  useEffect(() => {
+    setModeError(undefined)
+  }, [chatId, gadgetId])
+
 
   const connectorOptions = useMemo(() => {
     const options = new Map<number, string>()
@@ -374,6 +663,42 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
       setError(cause instanceof Error ? cause.message : String(cause))
     }
   }
+  const changeCitationMode = async (mode: CitationMode) => {
+    const current = documentEvidence
+    if (!current || gadgetId === undefined || chatId === null ||
+        mode === current.mode || modeBusy) return
+    setModeBusy(true)
+    setModeError(undefined)
+    try {
+      let result = await overseer.setCitationMode({
+        gadgetId: current.gadgetId,
+        expectedCitationRevision: current.citationRevision,
+        mode,
+      }, chatId)
+      if (result.status === 'conflict') {
+        // One fresh projection is enough to recover a stale citation CAS. A second conflict is
+        // reported rather than spinning or applying a mode change against a newer revision.
+        const refreshed = await onRefreshDocumentEvidence?.()
+        if (!refreshed) throw new Error('Unable to refresh document citations.')
+        result = await overseer.setCitationMode({
+          gadgetId: refreshed.gadgetId,
+          expectedCitationRevision: refreshed.citationRevision,
+          mode,
+        }, chatId)
+      }
+      if (result.status === 'conflict') {
+        setModeError(t('workspace.sources.modeConflict'))
+        return
+      }
+      await onRefreshDocumentEvidence?.()
+    } catch (cause) {
+      reportIssue('sources.mode', cause)
+      setModeError(t('workspace.sources.modeUpdateFailed'))
+    } finally {
+      setModeBusy(false)
+    }
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
       <div className="flex h-11 shrink-0 items-center gap-1 border-b border-kumo-line px-3">
@@ -388,17 +713,18 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
       </div>
 
       {view === 'document' ? (
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <BookOpenText size={24} className="mb-3 text-kumo-inactive" />
-          <p className="m-0 text-[13px] font-medium text-kumo-default">
-            {gadgetId === undefined
-              ? t('workspace.sources.noDocument')
-              : t('workspace.sources.noDocumentLinks')}
-          </p>
-          <p className="mt-1 max-w-xs text-[12px] leading-[18px] text-kumo-subtle">
-            {t('workspace.sources.documentLinksExplanation')}
-          </p>
-        </div>
+        <DocumentSources
+          documentSupported={documentSupported}
+          documentEvidence={documentEvidence}
+          documentEvidenceLoading={documentEvidenceLoading}
+          documentEvidenceError={documentEvidenceError}
+          modeError={modeError}
+          selectedCitationId={selectedCitationId}
+          citationRefs={citationRefs}
+          modeBusy={modeBusy}
+          onModeChange={changeCitationMode}
+          onNavigateToDocument={onNavigateToDocument}
+        />
       ) : chatId === null ? (
         <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-subtle">
           {t('workspace.sources.selectConversation')}

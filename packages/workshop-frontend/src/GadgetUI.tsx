@@ -2,8 +2,121 @@ import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
-import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
+import type {
+  CitationMode,
+  DocumentEvidenceView,
+  EvidenceRef,
+  GadgetClient,
+  ConsoleLogEvent,
+  WorkpieceId,
+} from '@gadgets/workshop-shared/api'
 import { useLocale } from './i18n'
+
+export type GadgetCitationProjection = {
+  gadgetId: WorkpieceId
+  documentRevision: number
+  citationRevision: number
+  mode: CitationMode
+  links: {
+    id: string
+    blockId: string
+    blockVersion: number
+    blockHash: string
+    state: 'valid' | 'needs_review' | 'orphaned' | 'unavailable'
+    evidence: EvidenceRef[]
+  }[]
+  /** Only evidence linked by this document is sent to the sandbox for endnotes. */
+  evidence: {
+    returnId: string
+    evidenceId: string
+    status: 'available' | 'unavailable'
+    text?: string
+    kind?: string
+    locator?: string
+  }[]
+}
+
+export type GadgetCitationFocus = {
+  gadgetId: WorkpieceId
+  blockId: string
+  citationId: string
+}
+
+
+export function toGadgetCitationProjection(
+  view: DocumentEvidenceView | null | undefined,
+): GadgetCitationProjection | null {
+  if (!view) return null
+  const linkedEvidence = new Set<string>()
+  for (const link of view.links) {
+    for (const ref of link.evidence) linkedEvidence.add(`${ref.returnId}\u0000${ref.evidenceId}`)
+  }
+  return {
+    gadgetId: view.gadgetId,
+    documentRevision: view.documentRevision,
+    citationRevision: view.citationRevision,
+    mode: view.mode,
+    links: view.links.map(link => ({
+      id: link.id,
+      blockId: link.blockId,
+      blockVersion: link.blockVersion,
+      blockHash: link.blockHash,
+      state: link.state,
+      evidence: link.evidence.map(ref => ({...ref})),
+    })),
+    evidence: view.evidence
+      .filter(item => linkedEvidence.has(`${item.ref.returnId}\u0000${item.ref.evidenceId}`))
+      .map(item => item.status === 'available'
+        ? {
+            returnId: item.ref.returnId,
+            evidenceId: item.ref.evidenceId,
+            status: 'available' as const,
+            text: item.evidence.text,
+            kind: item.evidence.kind,
+            ...(item.evidence.locator === undefined ? {} : {locator: item.evidence.locator}),
+          }
+        : {
+            returnId: item.ref.returnId,
+            evidenceId: item.ref.evidenceId,
+            status: 'unavailable' as const,
+          }),
+  }
+}
+
+export function findGadgetCitationLink(
+  projection: GadgetCitationProjection | null | undefined,
+  citationId: unknown,
+) {
+  if (!projection || typeof citationId !== 'string' || !citationId) return undefined
+  return projection.links.find(link => link.id === citationId)
+}
+
+/**
+ * Validates an iframe-to-host citation intent against the current host projection. The caller is
+ * still responsible for checking MessageEvent.source and MessageEvent.origin before calling this.
+ */
+export function validateCitationOpenMessage(
+  data: unknown,
+  projection: GadgetCitationProjection | null | undefined,
+): { citationId: string; blockId: string } | null {
+  if (!projection || typeof data !== 'object' || data === null) return null
+  const candidate = data as Record<string, unknown>
+  if (candidate.type !== 'open-citation' ||
+      candidate.gadgetId !== projection.gadgetId) return null
+  const link = findGadgetCitationLink(projection, candidate.citationId)
+  if (!link || candidate.blockId !== link.blockId) return null
+  return { citationId: link.id, blockId: link.blockId }
+}
+
+export function validateCitationFocus(
+  focus: GadgetCitationFocus | null | undefined,
+  projection: GadgetCitationProjection | null | undefined,
+): GadgetCitationFocus | null {
+  if (!focus || !projection || focus.gadgetId !== projection.gadgetId) return null
+  const link = findGadgetCitationLink(projection, focus.citationId)
+  if (!link || link.blockId !== focus.blockId) return null
+  return {gadgetId: projection.gadgetId, blockId: link.blockId, citationId: link.id}
+}
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -32,6 +145,40 @@ let gadget;  // RPC stub to the gadget's server-side Durable Object.
   window.parent.postMessage("handshake", "*", [port2]);
   gadget = newMessagePortRpcSession(port1);
 }
+// Citation projections and focus requests are accepted only from the embedding host. The opaque
+// sandbox origin is not an authentication boundary, so checking window.parent is essential.
+const validCitationStates = new Set(['valid', 'needs_review', 'orphaned', 'unavailable']);
+const validCitationModes = new Set(['inline', 'endnotes', 'none']);
+function validCitationProjection(value) {
+  if (value === null) return true;
+  if (!value || typeof value !== 'object' || !Number.isInteger(value.gadgetId) ||
+      !Number.isInteger(value.documentRevision) || !Number.isInteger(value.citationRevision) ||
+      !validCitationModes.has(value.mode) || !Array.isArray(value.links) ||
+      !Array.isArray(value.evidence)) return false;
+  return value.links.every((link) => link && typeof link.id === 'string' &&
+    typeof link.blockId === 'string' && Number.isInteger(link.blockVersion) &&
+    typeof link.blockHash === 'string' && validCitationStates.has(link.state) &&
+    Array.isArray(link.evidence) && link.evidence.every((ref) =>
+      ref && typeof ref.returnId === 'string' && typeof ref.evidenceId === 'string'));
+}
+function validFocusRequest(value) {
+  return value && typeof value === 'object' && Number.isInteger(value.gadgetId) &&
+    typeof value.blockId === 'string' && typeof value.citationId === 'string';
+}
+window.addEventListener('message', (event) => {
+  if (event.source !== window.parent) return;
+  const data = event.data;
+  if (data?.type === 'workshop-document-citation-projection') {
+    if (!validCitationProjection(data.projection)) return;
+    globalThis.__workshopDocumentCitationProjection = data.projection;
+    globalThis.dispatchEvent(new CustomEvent('workshop-document-citation-projection', {
+      detail: data.projection,
+    }));
+  } else if (data?.type === 'workshop-focus-citation' && validFocusRequest(data)) {
+    globalThis.dispatchEvent(new CustomEvent('workshop-focus-citation', {detail: data}));
+  }
+});
+
 
 // Monkey-patch console to forward logs to the parent frame.
 for (let level of ['debug', 'info', 'log', 'warn', 'error']) {
@@ -100,7 +247,6 @@ window.addEventListener('unhandledrejection', (event) => {
     message: ['Unhandled promise rejection:', reason?.stack || String(reason)],
   }, '*');
 });
-
 `);
 
 const createSandboxedHtml = (jsCode: string): string => {
@@ -122,6 +268,9 @@ interface GadgetUIProps {
   reloadTrigger?: number
   isVisible?: boolean
   chatId?: number
+  citationProjection?: GadgetCitationProjection | null
+  focusCitation?: GadgetCitationFocus | null
+  onOpenCitation?: (citationId: string) => void
   onConsoleLog?: (log: ConsoleLogEvent) => void
   // Fires when the user presses Escape while the gadget iframe has focus. Sandboxed iframes
   // capture keydown events, so we forward Escape explicitly from inside the iframe.
@@ -137,7 +286,18 @@ export default function GadgetUI(props: GadgetUIProps) {
   return <GadgetUISession key={props.chatId} {...props} />
 }
 
-function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chatId, onConsoleLog, onIframeEscape }: GadgetUIProps) {
+function GadgetUISession({
+  gadget,
+  height,
+  reloadTrigger,
+  isVisible = true,
+  chatId,
+  citationProjection,
+  focusCitation,
+  onOpenCitation,
+  onConsoleLog,
+  onIframeEscape,
+}: GadgetUIProps) {
   const { t } = useLocale()
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -168,6 +328,31 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
   const onConsoleLogRef = useRef(onConsoleLog)
   const translateRef = useRef(t)
   onIframeEscapeRef.current = onIframeEscape
+  const citationProjectionRef = useRef<GadgetCitationProjection | null>(citationProjection ?? null)
+  const focusCitationRef = useRef<GadgetCitationFocus | null>(focusCitation ?? null)
+  const onOpenCitationRef = useRef(onOpenCitation)
+  citationProjectionRef.current = citationProjection ?? null
+  focusCitationRef.current = focusCitation ?? null
+  onOpenCitationRef.current = onOpenCitation
+
+  const sendCitationProjection = () => {
+    if (!rpcSessionRef.current) return
+    const frame = iframeRef.current?.contentWindow
+    if (!frame) return
+    frame.postMessage({
+      type: 'workshop-document-citation-projection',
+      projection: citationProjectionRef.current,
+    }, '*')
+  }
+
+  const sendCitationFocus = () => {
+    if (!rpcSessionRef.current) return
+    const frame = iframeRef.current?.contentWindow
+    const focus = validateCitationFocus(focusCitationRef.current, citationProjectionRef.current)
+    if (!frame || !focus) return
+    frame.postMessage({type: 'workshop-focus-citation', ...focus}, '*')
+  }
+
   onConsoleLogRef.current = onConsoleLog
   translateRef.current = t
 
@@ -247,6 +432,13 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     }
     void reconnect()
   }, [gadget, chatId])
+  // A projection may change while the iframe stays connected. The message handler below also
+  // sends both values after every fresh handshake, so a message cannot target an old iframe.
+  useEffect(() => {
+    sendCitationProjection()
+    sendCitationFocus()
+  }, [citationProjection, focusCitation, isVisible, iframeGeneration])
+
 
   // Effect to handle reloadTrigger changes (code changes)
   useEffect(() => {
@@ -372,6 +564,8 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
             },
           })
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
+          sendCitationProjection()
+          sendCitationFocus()
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
@@ -381,6 +575,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         } finally {
           if (handshakePendingRef.current === generation) handshakePendingRef.current = null
         }
+      } else if (event.data?.type === 'open-citation') {
+        const intent = validateCitationOpenMessage(event.data, citationProjectionRef.current)
+        if (intent) onOpenCitationRef.current?.(intent.citationId)
       } else if (event.data?.type === 'console' && onConsoleLogRef.current) {
         onConsoleLogRef.current({
           timestamp: new Date(),

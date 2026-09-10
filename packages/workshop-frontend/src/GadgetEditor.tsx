@@ -30,10 +30,15 @@ import {
   WorkpieceSummary,
   BlueprintOutput,
   WorkpiecesSubscriber,
+  DocumentEvidenceView,
 } from '@gadgets/workshop-shared/api'
+import { isDocumentCitationsUnsupportedError } from '@gadgets/workshop-shared/citations'
 import ObserverConfigModal from './ObserverConfigModal'
 import GadgetCodeInterface from './GadgetCodeInterface'
-import GadgetUI from './GadgetUI'
+import GadgetUI, {
+  toGadgetCitationProjection,
+  type GadgetCitationFocus,
+} from './GadgetUI'
 import GadgetUseView from './GadgetUseView'
 import Connections from './Connections'
 import SourcesPanel from './SourcesPanel'
@@ -510,7 +515,7 @@ export default function GadgetEditor() {
   // telemetry subscriptions this component opens, so no client-side gating is needed here.
   const isUseOnly = metadata?.role === 'use'
 
-  // ── layout ───────────────────────────────────────────────────────────────────
+  const [citationFocus, setCitationFocus] = useState<GadgetCitationFocus | null>(null)
   const [chatWidth, setChatWidth] = useState(getInitialChatWidth)
   const chatWidthRef = useRef(chatWidth)
   const [isResizing, setIsResizing] = useState(false)
@@ -722,6 +727,137 @@ export default function GadgetEditor() {
   const selectedGadgetSummary = selectedGadgetId !== null
     ? visibleGadgets.find(g => g.id === selectedGadgetId)
     : undefined
+  const [documentEvidenceCapability, setDocumentEvidenceCapability] = useState<{
+    gadgetId: WorkpieceId
+    chatId: number
+    supported: boolean
+  } | null>(null)
+  const [documentEvidence, setDocumentEvidence] = useState<DocumentEvidenceView | null>(null)
+  const [documentEvidenceLoading, setDocumentEvidenceLoading] = useState(false)
+  const [documentEvidenceError, setDocumentEvidenceError] = useState(false)
+  const documentEvidenceGenerationRef = useRef(0)
+  const documentEvidenceContextRef = useRef({
+    overseer,
+    gadgetId: selectedGadgetId,
+    chatId: effectiveSelectedChatId,
+  })
+  documentEvidenceContextRef.current = {
+    overseer,
+    gadgetId: selectedGadgetId,
+    chatId: effectiveSelectedChatId,
+  }
+  const documentEvidenceSupported =
+    selectedGadgetId !== null &&
+    effectiveSelectedChatId !== null &&
+    documentEvidenceCapability?.gadgetId === selectedGadgetId &&
+    documentEvidenceCapability.chatId === effectiveSelectedChatId
+      ? documentEvidenceCapability.supported
+      : null
+
+  const refreshDocumentEvidence = useCallback(async (): Promise<DocumentEvidenceView | null> => {
+    const requestContext = {
+      overseer,
+      gadgetId: selectedGadgetId,
+      chatId: effectiveSelectedChatId,
+    }
+    const liveContext = documentEvidenceContextRef.current
+    if (liveContext.overseer !== requestContext.overseer ||
+        liveContext.gadgetId !== requestContext.gadgetId ||
+        liveContext.chatId !== requestContext.chatId) return null
+
+    const generation = ++documentEvidenceGenerationRef.current
+    const currentOverseer = requestContext.overseer?.stub
+    const currentGadgetId = requestContext.gadgetId
+    const currentChatId = requestContext.chatId
+    const isCurrent = () => {
+      const current = documentEvidenceContextRef.current
+      return documentEvidenceGenerationRef.current === generation &&
+        current.overseer === requestContext.overseer &&
+        current.gadgetId === requestContext.gadgetId &&
+        current.chatId === requestContext.chatId
+    }
+
+    if (!currentOverseer || currentGadgetId === null || currentChatId === null) {
+      if (isCurrent()) {
+        setDocumentEvidenceCapability(null)
+        setDocumentEvidence(null)
+        setDocumentEvidenceLoading(false)
+        setDocumentEvidenceError(false)
+      }
+      return null
+    }
+
+    if (isCurrent()) {
+      setDocumentEvidenceCapability(null)
+      setDocumentEvidence(null)
+      setDocumentEvidenceLoading(true)
+      setDocumentEvidenceError(false)
+    }
+    try {
+      const view = await currentOverseer.getDocumentEvidence(currentGadgetId, currentChatId)
+      if (!isCurrent()) return null
+      if (view.gadgetId !== currentGadgetId) {
+        throw new Error('Document evidence returned for the wrong gadget.')
+      }
+      setDocumentEvidenceCapability({
+        gadgetId: currentGadgetId,
+        chatId: currentChatId,
+        supported: true,
+      })
+      setDocumentEvidence(view)
+      setDocumentEvidenceError(false)
+      return view
+    } catch (cause) {
+      if (!isCurrent()) return null
+      const unsupported = isDocumentCitationsUnsupportedError(cause)
+      if (!unsupported) {
+        reportIssue('document-evidence.load', cause, {
+          gadgetId: String(currentGadgetId),
+        })
+      }
+      setDocumentEvidenceCapability({
+        gadgetId: currentGadgetId,
+        chatId: currentChatId,
+        supported: false,
+      })
+      setDocumentEvidence(null)
+      setDocumentEvidenceError(!unsupported)
+      return null
+    } finally {
+      if (isCurrent()) setDocumentEvidenceLoading(false)
+    }
+  }, [
+    effectiveSelectedChatId,
+    overseer,
+    selectedGadgetId,
+  ])
+
+  useEffect(() => {
+    documentEvidenceGenerationRef.current += 1
+    setDocumentEvidenceCapability(null)
+    setDocumentEvidence(null)
+    setDocumentEvidenceLoading(false)
+    setDocumentEvidenceError(false)
+  }, [effectiveSelectedChatId, overseer, selectedGadgetId])
+
+  useEffect(() => {
+    if (activeTab !== 'app' && activeTab !== 'sources') return
+    void refreshDocumentEvidence()
+  }, [activeTab, refreshDocumentEvidence])
+
+  const gadgetCitationProjection = useMemo(() => {
+    if (documentEvidenceSupported !== true || selectedGadgetId === null ||
+        documentEvidence?.gadgetId !== selectedGadgetId) return null
+    return toGadgetCitationProjection(documentEvidence)
+  }, [documentEvidence, documentEvidenceSupported, selectedGadgetId])
+  const selectedDocumentEvidence = documentEvidenceSupported === true &&
+      documentEvidence?.gadgetId === selectedGadgetId
+    ? documentEvidence
+    : null
+
+  useEffect(() => {
+    setCitationFocus(null)
+  }, [selectedGadgetId, effectiveSelectedChatId])
 
   // Lazily normalize legacy "open" preferences once the accepted app list is known. Draft apps
   // remain session-only until accepted; at that point this effect persists them automatically.
@@ -939,6 +1075,32 @@ export default function GadgetEditor() {
     setActiveTab('sources')
     setWorkspaceView({ mode: 'sources' })
   }, [])
+  const handleOpenCitation = useCallback((citationId: string) => {
+    if (selectedGadgetId === null) return
+    const link = selectedDocumentEvidence?.links.find(candidate => candidate.id === citationId)
+    if (!link) return
+    setCitationFocus({
+      gadgetId: selectedGadgetId,
+      blockId: link.blockId,
+      citationId: link.id,
+    })
+    openSources()
+  }, [openSources, selectedDocumentEvidence, selectedGadgetId])
+
+  const handleNavigateToDocumentBlock = useCallback((blockId: string, citationId: string) => {
+    if (selectedGadgetId === null) return
+    const link = selectedDocumentEvidence?.links.find(candidate =>
+      candidate.id === citationId && candidate.blockId === blockId)
+    if (!link) return
+    setCitationFocus({
+      gadgetId: selectedGadgetId,
+      blockId: link.blockId,
+      citationId: link.id,
+    })
+    setActiveTab('app')
+    setWorkspaceVisibility('open', selectedGadgetId)
+  }, [selectedDocumentEvidence, selectedGadgetId, setWorkspaceVisibility])
+
 
   const closeWorkspacePane = useCallback(() => {
     if (workspaceView?.mode !== 'activity') {
@@ -1916,6 +2078,9 @@ export default function GadgetEditor() {
                   reloadTrigger={uiReloadTrigger}
                   isVisible={activeTab === 'app' && !previewMode}
                   chatId={previewChatId}
+                  citationProjection={gadgetCitationProjection}
+                  focusCitation={citationFocus}
+                  onOpenCitation={handleOpenCitation}
                   onConsoleLog={handleClientConsoleLog}
                   onIframeEscape={isGadgetFullscreen ? exitGadgetFullscreen : undefined}
                 />
@@ -1938,6 +2103,17 @@ export default function GadgetEditor() {
             <div className={activeTab === 'sources' ? 'h-full min-h-0' : 'hidden'}>
               <SourcesPanel
                 overseer={overseer.stub}
+                documentEvidence={selectedDocumentEvidence}
+                documentEvidenceLoading={documentEvidenceLoading}
+                documentEvidenceError={documentEvidenceError}
+                documentSupported={
+                  selectedGadgetId === null || effectiveSelectedChatId === null
+                    ? undefined
+                    : documentEvidenceSupported
+                }
+                onRefreshDocumentEvidence={refreshDocumentEvidence}
+                focusCitationId={citationFocus?.citationId}
+                onNavigateToDocument={handleNavigateToDocumentBlock}
                 chatId={effectiveSelectedChatId}
                 gadgetId={selectedGadgetSummary?.id}
                 isVisible={activeTab === 'sources' && !paneShowsActivity}
@@ -2017,6 +2193,9 @@ export default function GadgetEditor() {
               reloadTrigger={uiReloadTrigger}
               isVisible={true}
               chatId={previewChatId}
+              citationProjection={gadgetCitationProjection}
+              focusCitation={citationFocus}
+              onOpenCitation={handleOpenCitation}
               onConsoleLog={handleClientConsoleLog}
             />
           )}

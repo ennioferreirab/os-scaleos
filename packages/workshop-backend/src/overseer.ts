@@ -17,6 +17,7 @@ import type {
   CitationMode,
 } from "@gadgets/workshop-shared/api";
 import {
+  DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE,
   evidenceRefKey,
   resolveCitationSet,
   sha256Hex,
@@ -6016,13 +6017,13 @@ class OverseerImpl implements AgentHooks {
     try {
       if (typeof facet.getDocumentCapabilities !== "function"
           || typeof facet.getDocument !== "function") {
-        throw new Error("This gadget does not support document citations.");
+        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
       }
       const capabilities = await facet.getDocumentCapabilities();
       if (capabilities === null || typeof capabilities !== "object"
           || !("documentVersion" in capabilities) || !("citationsVersion" in capabilities)
           || capabilities.documentVersion !== 2 || capabilities.citationsVersion !== 1) {
-        throw new Error("This gadget does not support document citations.");
+        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
       }
       const document = await facet.getDocument();
       if (document === null || typeof document !== "object"
