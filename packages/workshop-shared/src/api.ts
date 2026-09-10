@@ -2967,6 +2967,8 @@ export type AuthorizedEvidence =
       ref: EvidenceRef;
       /** Return containing this evidence. */
       returnId: string;
+      /** Human Vault URL frozen with the captured return, when available. */
+      vaultWebUrl?: string;
       /** Normalized evidence item. */
       evidence: Evidence;
       /** Sources retained alongside the return. */

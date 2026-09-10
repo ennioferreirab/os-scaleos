@@ -24,10 +24,8 @@ vi.mock('@cloudflare/kumo', () => ({
   Text: ({ children }: { children: ReactNode }) => children,
 }))
 
-import GadgetUI, {
-  toGadgetCitationProjection,
-  validateCitationOpenMessage,
-} from './GadgetUI'
+import GadgetUI, { validateCitationOpenMessage } from "./GadgetUI";
+import { toDocumentCitationProjection } from "@gadgets/workshop-shared/citations";
 
 interface TestGadget {
   read(): string
@@ -169,16 +167,26 @@ const citationView: DocumentEvidenceView = {
   ],
   evidence: [
     {
-      status: 'available',
-      ref: { returnId: 'return-1', evidenceId: 'evidence-1' },
-      returnId: 'return-1',
+      status: "available",
+      ref: { returnId: "return-1", evidenceId: "evidence-1" },
+      returnId: "return-1",
+      vaultWebUrl: "https://vault.example.test/old",
       evidence: {
-        id: 'evidence-1',
-        sourceIds: [],
-        text: 'A retained passage',
-        kind: 'excerpt',
+        id: "evidence-1",
+        sourceIds: ["source-1"],
+        text: "A retained passage",
+        kind: "excerpt",
       },
-      sources: [],
+      sources: [
+        {
+          id: "source-1",
+          ref: "vault://team/note-1",
+          type: "note",
+          title: "Source note",
+          sensitivity: "internal-secret-classification",
+          note: { brain: "team", slug: "note-1" },
+        },
+      ],
     },
     {
       status: 'unavailable',
@@ -198,35 +206,62 @@ const citationView: DocumentEvidenceView = {
       sources: [],
     },
   ],
-}
+};
 
-describe('GadgetUI citation projection', () => {
-  it('keeps linked evidence and rejects stale or cross-gadget open intents', () => {
-    const projection = toGadgetCitationProjection(citationView)
-    expect(projection?.evidence.map(item => `${item.returnId}/${item.evidenceId}`)).toEqual([
-      'return-1/evidence-1',
-      'return-2/evidence-2',
-    ])
-    expect(validateCitationOpenMessage({
-      type: 'open-citation',
-      gadgetId: 9,
-      blockId: 'block-1',
-      citationId: 'citation-1',
-    }, projection)).toEqual({ citationId: 'citation-1', blockId: 'block-1' })
-    expect(validateCitationOpenMessage({
-      type: 'open-citation',
-      gadgetId: 10,
-      blockId: 'block-1',
-      citationId: 'citation-1',
-    }, projection)).toBeNull()
-    expect(validateCitationOpenMessage({
-      type: 'open-citation',
-      gadgetId: 9,
-      blockId: 'block-1',
-      citationId: 'citation-stale',
-    }, projection)).toBeNull()
-  })
-})
+describe("GadgetUI citation projection", () => {
+  it("keeps only valid linked evidence and rejects stale or cross-gadget open intents", () => {
+    const projection = toDocumentCitationProjection(citationView);
+    expect(projection?.evidence.map((item) => `${item.returnId}/${item.evidenceId}`)).toEqual([
+      "return-1/evidence-1",
+    ]);
+    expect(projection?.evidence[0]).toMatchObject({
+      status: "available",
+      sources: [
+        {
+          ref: "vault://team/note-1",
+          type: "note",
+          title: "Source note",
+          href: "https://vault.example.test/app/notas?brain=team&slug=note-1",
+        },
+      ],
+    });
+    expect(JSON.stringify(projection)).not.toContain("internal-secret-classification");
+    expect(JSON.stringify(projection)).not.toContain("Not linked to this document");
+    expect(
+      validateCitationOpenMessage(
+        {
+          type: "open-citation",
+          gadgetId: 9,
+          blockId: "block-1",
+          citationId: "citation-1",
+        },
+        projection,
+      ),
+    ).toEqual({ citationId: "citation-1", blockId: "block-1" });
+    expect(
+      validateCitationOpenMessage(
+        {
+          type: "open-citation",
+          gadgetId: 10,
+          blockId: "block-1",
+          citationId: "citation-1",
+        },
+        projection,
+      ),
+    ).toBeNull();
+    expect(
+      validateCitationOpenMessage(
+        {
+          type: "open-citation",
+          gadgetId: 9,
+          blockId: "block-1",
+          citationId: "citation-stale",
+        },
+        projection,
+      ),
+    ).toBeNull();
+  });
+});
 
 function dispatchIframeHandshake(iframe: HTMLIFrameElement, port: MessagePort) {
   window.dispatchEvent(new MessageEvent('message', {
@@ -275,10 +310,10 @@ describe('GadgetUI RPC recovery', () => {
     )
   })
 
-  it('accepts citation intents only from the current opaque iframe and projection', async () => {
-    const gadget = fakeGadget('citations', 'document.body.textContent = "citations"')
-    const onOpenCitation = vi.fn()
-    const projection = toGadgetCitationProjection(citationView)
+  it("accepts citation intents only from the current opaque iframe and projection", async () => {
+    const gadget = fakeGadget("citations", 'document.body.textContent = "citations"');
+    const onOpenCitation = vi.fn();
+    const projection = toDocumentCitationProjection(citationView);
     await act(async () => {
       root.render(
         <GadgetUI

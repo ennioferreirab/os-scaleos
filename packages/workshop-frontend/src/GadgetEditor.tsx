@@ -31,20 +31,20 @@ import {
   BlueprintOutput,
   WorkpiecesSubscriber,
   DocumentEvidenceView,
-} from '@gadgets/workshop-shared/api'
-import { isDocumentCitationsUnsupportedError } from '@gadgets/workshop-shared/citations'
-import ObserverConfigModal from './ObserverConfigModal'
-import GadgetCodeInterface from './GadgetCodeInterface'
-import GadgetUI, {
-  toGadgetCitationProjection,
-  type GadgetCitationFocus,
-} from './GadgetUI'
-import GadgetUseView from './GadgetUseView'
-import Connections from './Connections'
-import SourcesPanel from './SourcesPanel'
-import Activity, { type ActivityView } from './Activity'
-import { CountBadge } from './components/CountBadge'
-import ActivityNotifications from './ActivityNotifications'
+} from "@gadgets/workshop-shared/api";
+import {
+  isDocumentCitationsUnsupportedError,
+  toDocumentCitationProjection,
+} from "@gadgets/workshop-shared/citations";
+import ObserverConfigModal from "./ObserverConfigModal";
+import GadgetCodeInterface from "./GadgetCodeInterface";
+import GadgetUI, { type GadgetCitationFocus } from "./GadgetUI";
+import GadgetUseView from "./GadgetUseView";
+import Connections from "./Connections";
+import SourcesPanel from "./SourcesPanel";
+import Activity, { type ActivityView } from "./Activity";
+import { CountBadge } from "./components/CountBadge";
+import ActivityNotifications from "./ActivityNotifications";
 import WorkpiecePicker, {
   WORKPIECE_RAIL_COLLAPSED_WIDTH,
   WORKPIECE_RAIL_EXPANDED_WIDTH,
@@ -846,14 +846,18 @@ export default function GadgetEditor() {
   }, [activeTab, refreshDocumentEvidence])
 
   const gadgetCitationProjection = useMemo(() => {
-    if (documentEvidenceSupported !== true || selectedGadgetId === null ||
-        documentEvidence?.gadgetId !== selectedGadgetId) return null
-    return toGadgetCitationProjection(documentEvidence)
-  }, [documentEvidence, documentEvidenceSupported, selectedGadgetId])
-  const selectedDocumentEvidence = documentEvidenceSupported === true &&
-      documentEvidence?.gadgetId === selectedGadgetId
-    ? documentEvidence
-    : null
+    if (
+      documentEvidenceSupported !== true ||
+      selectedGadgetId === null ||
+      documentEvidence?.gadgetId !== selectedGadgetId
+    )
+      return null;
+    return toDocumentCitationProjection(documentEvidence);
+  }, [documentEvidence, documentEvidenceSupported, selectedGadgetId]);
+  const selectedDocumentEvidence =
+    documentEvidenceSupported === true && documentEvidence?.gadgetId === selectedGadgetId
+      ? documentEvidence
+      : null;
 
   useEffect(() => {
     setCitationFocus(null)

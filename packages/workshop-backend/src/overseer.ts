@@ -19,11 +19,14 @@ import type {
 import {
   DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE,
   evidenceRefKey,
+  isDocumentCitationsUnsupportedError,
   resolveCitationSet,
   sha256Hex,
+  toDocumentExportProjection,
   validateCitationLinks,
   validateEvidenceRefs,
   type CitationDocumentSnapshot,
+  type DocumentExportProjection,
 } from "@gadgets/workshop-shared/citations";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
@@ -98,8 +101,120 @@ import {
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 
-let CODE_MODE_HARNESS =
-`import { WorkerEntrypoint, restore } from "cloudflare:workers";
+type CitationDocumentFacet = {
+  getDocumentCapabilities?: () => Promise<unknown>;
+  getDocument?: () => Promise<unknown>;
+  [Symbol.dispose]?: () => void;
+};
+
+const MISSING_DOCUMENT_CAPABILITY_RPC_MESSAGE =
+  'The RPC receiver does not implement the method "getDocumentCapabilities"';
+
+function isMissingDocumentCapabilityRpcError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.replace(/\.$/, "") === MISSING_DOCUMENT_CAPABILITY_RPC_MESSAGE
+  );
+}
+
+/** Read and validate the citation document contract published by a gadget facet. */
+export async function readCitationDocumentFromFacet(
+  facet: CitationDocumentFacet,
+  gadgetId: WorkpieceId,
+): Promise<CitationDocumentSnapshot | undefined> {
+  try {
+    if (
+      typeof facet.getDocumentCapabilities !== "function" ||
+      typeof facet.getDocument !== "function"
+    ) {
+      throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+    }
+    let capabilities: unknown;
+    try {
+      capabilities = await facet.getDocumentCapabilities();
+    } catch (error) {
+      if (isMissingDocumentCapabilityRpcError(error)) {
+        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+      }
+      throw error;
+    }
+    if (
+      capabilities === null ||
+      typeof capabilities !== "object" ||
+      !("documentVersion" in capabilities) ||
+      !("citationsVersion" in capabilities) ||
+      capabilities.documentVersion !== 2 ||
+      capabilities.citationsVersion !== 1
+    ) {
+      throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
+    }
+    const document = await facet.getDocument();
+    if (
+      document !== null &&
+      typeof document === "object" &&
+      "revision" in document &&
+      document.revision === 0 &&
+      "title" in document &&
+      typeof document.title === "string" &&
+      document.title.length <= 10_000 &&
+      "blocks" in document &&
+      document.blocks === null &&
+      "legacyContent" in document &&
+      typeof document.legacyContent === "string"
+    ) {
+      return undefined;
+    }
+    if (
+      document === null ||
+      typeof document !== "object" ||
+      !("revision" in document) ||
+      typeof document.revision !== "number" ||
+      !Number.isInteger(document.revision) ||
+      document.revision < 0 ||
+      !("title" in document) ||
+      typeof document.title !== "string" ||
+      document.title.length > 10_000 ||
+      !("blocks" in document) ||
+      !Array.isArray(document.blocks) ||
+      document.blocks.length > 10_000
+    ) {
+      throw new Error("The document gadget returned an invalid document.");
+    }
+    const blockIds = new Set<string>();
+    let htmlLength = 0;
+    const blocks = document.blocks.map((block) => {
+      if (
+        block === null ||
+        typeof block !== "object" ||
+        !("id" in block) ||
+        typeof block.id !== "string" ||
+        block.id.length === 0 ||
+        block.id.length > 256 ||
+        blockIds.has(block.id) ||
+        !("html" in block) ||
+        typeof block.html !== "string" ||
+        block.html.length > 1_000_000 ||
+        !("version" in block) ||
+        typeof block.version !== "number" ||
+        !Number.isInteger(block.version) ||
+        block.version < 0
+      ) {
+        throw new Error("The document gadget returned an invalid block.");
+      }
+      blockIds.add(block.id);
+      htmlLength += block.html.length;
+      if (htmlLength > 10_000_000) {
+        throw new Error("The document gadget returned an oversized document.");
+      }
+      return { id: block.id, html: block.html, version: block.version };
+    });
+    return { gadgetId, revision: document.revision, title: document.title, blocks };
+  } finally {
+    facet[Symbol.dispose]?.();
+  }
+}
+
+let CODE_MODE_HARNESS = `import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
@@ -1966,7 +2081,8 @@ export function getEvidenceFromStorage(
       status: "available",
       ref: {...ref},
       returnId: record.id,
-      evidence: {...item, sourceIds: [...item.sourceIds]},
+      ...(record.vaultWebUrl === undefined ? {} : { vaultWebUrl: record.vaultWebUrl }),
+      evidence: { ...item, sourceIds: [...item.sourceIds] },
       sources,
     });
   }
@@ -5085,26 +5201,41 @@ class OverseerImpl implements AgentHooks {
     return resolved.formats;
   }
 
-  async exportGadget(gadgetId: WorkpieceId, formatId: string, chatId?: number)
-      : Promise<ReadableStream<Uint8Array>> {
+  async exportGadget(
+    gadgetId: WorkpieceId,
+    formatId: string,
+    chatId?: number,
+    includePrivateEvidence = false,
+  ): Promise<ReadableStream<Uint8Array>> {
     this.checkChatExistsAndMaterializeChanges(chatId);
     let {formats, handler, gadget} = await this.#resolveGadgetExportFormats(gadgetId, chatId);
     if (!gadget) throw new Error("The Gadget server stub is unavailable.");
     using exportGadget = gadget;
     let format = formats.find(candidate => candidate.id === formatId);
     if (!format) throw new Error(`This Gadget does not support export format: ${formatId}`);
+    let documentProjection = includePrivateEvidence
+      ? await this.#readDocumentExportProjection(gadgetId, chatId)
+      : undefined;
 
     if (format.mode === "server") {
       if (!handler) throw new Error("The Gadget export handler is unavailable.");
       return await exportServerFormat(() =>
-        handler.export(exportGadget, format.id));
+        handler.export(exportGadget, format.id, documentProjection),
+      );
     } else {
       let browser = this.env.BROWSER;
       if (!browser) throw new Error("Gadget export is not configured for this deployment.");
       let bundle = await this.getGadgetUiBundle(gadgetId, chatId);
       if (!bundle) throw new Error("This Gadget does not have a UI to export.");
       let title = this.getGadgetRecord(gadgetId).title;
-      return renderGadgetInBrowser(browser, bundle.jsCode, title, exportGadget.dup(), format);
+      return renderGadgetInBrowser(
+        browser,
+        bundle.jsCode,
+        title,
+        exportGadget.dup(),
+        format,
+        documentProjection,
+      );
     }
   }
 
@@ -6001,61 +6132,49 @@ class OverseerImpl implements AgentHooks {
     return setCitationModeInStorage(this.storage, input, document.revision);
   }
 
+  async #readDocumentExportProjection(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+  ): Promise<DocumentExportProjection | undefined> {
+    try {
+      const document = await this.#readCitationDocument(gadgetId, chatId, true);
+      if (!document) return undefined;
+      const evidence = await getDocumentEvidenceFromStorage(this.storage, document);
+      return toDocumentExportProjection(document, evidence);
+    } catch (error) {
+      if (isDocumentCitationsUnsupportedError(error)) return undefined;
+      throw error;
+    }
+  }
 
   async #readCitationDocument(
-      gadgetId: WorkpieceId, chatId?: number): Promise<CitationDocumentSnapshot> {
+    gadgetId: WorkpieceId,
+    chatId?: number,
+  ): Promise<CitationDocumentSnapshot>;
+  async #readCitationDocument(
+    gadgetId: WorkpieceId,
+    chatId: number | undefined,
+    allowLegacy: true,
+  ): Promise<CitationDocumentSnapshot | undefined>;
+  async #readCitationDocument(
+    gadgetId: WorkpieceId,
+    chatId?: number,
+    allowLegacy = false,
+  ): Promise<CitationDocumentSnapshot | undefined> {
     if (chatId === undefined) {
       this.getGadgetRecord(gadgetId);
     } else {
       this.resolveWorkpieceRoot(gadgetId, true, chatId);
     }
-    const facet = await this.getGadgetFacet(gadgetId, chatId) as unknown as {
-      getDocumentCapabilities?: () => Promise<unknown>;
-      getDocument?: () => Promise<unknown>;
-      [Symbol.dispose]?: () => void;
-    };
-    try {
-      if (typeof facet.getDocumentCapabilities !== "function"
-          || typeof facet.getDocument !== "function") {
-        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
-      }
-      const capabilities = await facet.getDocumentCapabilities();
-      if (capabilities === null || typeof capabilities !== "object"
-          || !("documentVersion" in capabilities) || !("citationsVersion" in capabilities)
-          || capabilities.documentVersion !== 2 || capabilities.citationsVersion !== 1) {
-        throw new Error(DOCUMENT_CITATIONS_UNSUPPORTED_MESSAGE);
-      }
-      const document = await facet.getDocument();
-      if (document === null || typeof document !== "object"
-          || !("revision" in document) || typeof document.revision !== "number"
-          || !Number.isInteger(document.revision) || document.revision < 0
-          || !("blocks" in document) || !Array.isArray(document.blocks)
-          || document.blocks.length > 10_000) {
-        throw new Error("The document gadget returned an invalid document.");
-      }
-      const blockIds = new Set<string>();
-      let htmlLength = 0;
-      const blocks = document.blocks.map(block => {
-        if (block === null || typeof block !== "object"
-            || !("id" in block) || typeof block.id !== "string"
-            || block.id.length === 0 || block.id.length > 256 || blockIds.has(block.id)
-            || !("html" in block) || typeof block.html !== "string"
-            || block.html.length > 1_000_000
-            || !("version" in block) || typeof block.version !== "number"
-            || !Number.isInteger(block.version) || block.version < 0) {
-          throw new Error("The document gadget returned an invalid block.");
-        }
-        blockIds.add(block.id);
-        htmlLength += block.html.length;
-        if (htmlLength > 10_000_000) {
-          throw new Error("The document gadget returned an oversized document.");
-        }
-        return {id: block.id, html: block.html, version: block.version};
-      });
-      return {gadgetId, revision: document.revision, blocks};
-    } finally {
-      facet[Symbol.dispose]?.();
+    const facet = (await this.getGadgetFacet(
+      gadgetId,
+      chatId,
+    )) as unknown as CitationDocumentFacet;
+    const document = await readCitationDocumentFromFacet(facet, gadgetId);
+    if (!document && !allowLegacy) {
+      throw new Error("The document gadget must initialize blocks before using citations.");
     }
+    return document;
   }
 
   async getDocumentEvidence(
@@ -11030,14 +11149,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUserId, this.sessionGuard);
+    return new GadgetClientImpl(
+      this.impl,
+      record.id,
+      this.clientUserId,
+      this.isOwner,
+      this.sessionGuard,
+    );
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.sessionGuard);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.isOwner, this.sessionGuard);
   }
 
   async deleteSelf(): Promise<void> {
@@ -12673,8 +12798,13 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
   private implementation: OverseerImpl;
 
-  constructor(impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string, private sessionGuard?: HumanSessionGuard) {
+  constructor(
+    impl: OverseerImpl,
+    private id: WorkpieceId,
+    private clientUserId: string,
+    private includePrivateEvidence: boolean,
+    private sessionGuard?: HumanSessionGuard,
+  ) {
     super();
     this.implementation = impl;
   }
@@ -12729,7 +12859,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async export(formatId: string, chatId?: number): Promise<ReadableStream<Uint8Array>> {
-    return this.impl.exportGadget(this.id, formatId, chatId);
+    return this.impl.exportGadget(this.id, formatId, chatId, this.includePrivateEvidence);
   }
 
   async listBindings(chatId?: number): Promise<GadgetBindingInfo[]> {

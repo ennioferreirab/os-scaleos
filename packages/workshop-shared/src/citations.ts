@@ -6,6 +6,7 @@ import type {
   DocumentCitationInput,
   DocumentEvidenceView,
   EvidenceRef,
+  EvidenceSource,
   WorkpieceId,
 } from "./api";
 
@@ -40,13 +41,227 @@ export type CitationDocumentSnapshot = {
   gadgetId: WorkpieceId;
   /** Current document content revision. */
   revision: number;
+  /** Current document title. */
+  title: string;
   /** Current document blocks. */
   blocks: readonly CitationDocumentBlock[];
+};
+
+/** Source details safe to expose for one explicitly linked evidence item. */
+export type DocumentCitationProjectionSource = {
+  ref: string;
+  type: string;
+  title?: string;
+  href?: string;
+};
+
+/** Citation data sent to a document renderer, stripped to explicitly linked visible fields. */
+export type DocumentCitationProjection = {
+  gadgetId: WorkpieceId;
+  documentRevision: number;
+  citationRevision: number;
+  mode: CitationMode;
+  links: {
+    id: string;
+    blockId: string;
+    blockVersion: number;
+    blockHash: string;
+    state: CitationState;
+    evidence: EvidenceRef[];
+  }[];
+  evidence: (
+    | {
+        returnId: string;
+        evidenceId: string;
+        status: "available";
+        text: string;
+        kind: "fact" | "excerpt" | "synthesis" | "unknown";
+        locator?: string;
+        sources: DocumentCitationProjectionSource[];
+      }
+    | {
+        returnId: string;
+        evidenceId: string;
+        status: "unavailable";
+      }
+  )[];
+};
+
+/** One immutable document-and-citation view consumed by a single export. */
+export type DocumentExportProjection = {
+  document: {
+    revision: number;
+    title: string;
+    blocks: CitationDocumentBlock[];
+  };
+  citations: {
+    documentRevision: number;
+    citationRevision: number;
+    mode: CitationMode;
+    links: (
+      | { blockId: string; state: "valid"; evidence: number[] }
+      | { blockId: string; state: "unavailable" }
+    )[];
+    evidence: {
+      text: string;
+      kind: "fact" | "excerpt" | "synthesis" | "unknown";
+      locator?: string;
+      sources: DocumentCitationProjectionSource[];
+    }[];
+  };
 };
 
 /** Return a stable key for an evidence reference without conflating either component. */
 export function evidenceRefKey(ref: EvidenceRef): string {
   return JSON.stringify([ref.returnId, ref.evidenceId]);
+}
+
+/** Build the authenticated human-navigation URL for a retained Vault note identity. */
+export function buildVaultNoteUrl(
+  vaultWebUrl: string | undefined,
+  note: EvidenceSource["note"],
+): string | undefined {
+  if (
+    !vaultWebUrl ||
+    !note ||
+    typeof note !== "object" ||
+    typeof note.brain !== "string" ||
+    typeof note.slug !== "string"
+  ) {
+    return undefined;
+  }
+  const brain = note.brain.trim();
+  const slug = note.slug.trim();
+  if (!brain || !slug) return undefined;
+
+  try {
+    const url = new URL(vaultWebUrl);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password)
+      return undefined;
+    url.pathname = "/app/notas";
+    url.search = "";
+    url.searchParams.set("brain", brain);
+    url.searchParams.set("slug", slug);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Strip a resolved view to the fields a document renderer is allowed to observe. */
+export function toDocumentCitationProjection(
+  view: DocumentEvidenceView | null | undefined,
+): DocumentCitationProjection | null {
+  if (!view) return null;
+  const linkedEvidence = new Set<string>();
+  for (const link of view.links) {
+    if (link.state !== "valid") continue;
+    for (const ref of link.evidence) linkedEvidence.add(evidenceRefKey(ref));
+  }
+  return {
+    gadgetId: view.gadgetId,
+    documentRevision: view.documentRevision,
+    citationRevision: view.citationRevision,
+    mode: view.mode,
+    links: view.links.map((link) => ({
+      id: link.id,
+      blockId: link.blockId,
+      blockVersion: link.blockVersion,
+      blockHash: link.blockHash,
+      state: link.state,
+      evidence: link.evidence.map((ref) => ({ ...ref })),
+    })),
+    evidence: view.evidence
+      .filter((item) => linkedEvidence.has(evidenceRefKey(item.ref)))
+      .map((item) =>
+        item.status === "available"
+          ? {
+              returnId: item.ref.returnId,
+              evidenceId: item.ref.evidenceId,
+              status: "available" as const,
+              text: item.evidence.text,
+              kind: item.evidence.kind,
+              ...(item.evidence.locator === undefined ? {} : { locator: item.evidence.locator }),
+              sources: item.sources.map((source) => {
+                const href = buildVaultNoteUrl(item.vaultWebUrl, source.note);
+                return {
+                  ref: source.ref,
+                  type: source.type,
+                  ...(source.title === undefined ? {} : { title: source.title }),
+                  ...(href === undefined ? {} : { href }),
+                };
+              }),
+            }
+          : {
+              returnId: item.ref.returnId,
+              evidenceId: item.ref.evidenceId,
+              status: "unavailable" as const,
+            },
+      ),
+  };
+}
+
+/** Freeze the current document and its minimized citation projection for one export. */
+export function toDocumentExportProjection(
+  document: CitationDocumentSnapshot,
+  view: DocumentEvidenceView,
+): DocumentExportProjection {
+  if (view.gadgetId !== document.gadgetId || view.documentRevision !== document.revision) {
+    throw new Error("Document export projection revisions do not match.");
+  }
+  const evidenceByRef = new Map(view.evidence.map((item) => [evidenceRefKey(item.ref), item]));
+  const evidenceIndexes = new Map<string, number>();
+  const evidence: DocumentExportProjection["citations"]["evidence"] = [];
+  const links: DocumentExportProjection["citations"]["links"] = [];
+  for (const link of view.links) {
+    if (link.state === "unavailable") {
+      links.push({ blockId: link.blockId, state: "unavailable" });
+      continue;
+    }
+    if (link.state !== "valid") continue;
+    const indexes = link.evidence.map((ref) => {
+      const key = evidenceRefKey(ref);
+      const existing = evidenceIndexes.get(key);
+      if (existing !== undefined) return existing;
+      const item = evidenceByRef.get(key);
+      if (item?.status !== "available") {
+        throw new Error("A valid document citation has no available evidence.");
+      }
+      const index = evidence.length;
+      evidenceIndexes.set(key, index);
+      evidence.push({
+        text: item.evidence.text,
+        kind: item.evidence.kind,
+        ...(item.evidence.locator === undefined ? {} : { locator: item.evidence.locator }),
+        sources: item.sources.map((source) => {
+          const href = buildVaultNoteUrl(item.vaultWebUrl, source.note);
+          return {
+            ref: source.ref,
+            type: source.type,
+            ...(source.title === undefined ? {} : { title: source.title }),
+            ...(href === undefined ? {} : { href }),
+          };
+        }),
+      });
+      return index;
+    });
+    links.push({ blockId: link.blockId, state: "valid", evidence: indexes });
+  }
+  return {
+    document: {
+      revision: document.revision,
+      title: document.title,
+      blocks: document.blocks.map((block) => ({ ...block })),
+    },
+    citations: {
+      documentRevision: view.documentRevision,
+      citationRevision: view.citationRevision,
+      mode: view.mode,
+      links,
+      evidence,
+    },
+  };
 }
 
 /** Validate bounded evidence references before storage lookup or persistence. */

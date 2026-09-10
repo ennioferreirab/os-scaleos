@@ -7,14 +7,13 @@ import type {
   DocumentCitationView,
   DocumentEvidenceView,
   EvidenceRef,
-  EvidenceSource,
   Overseer,
   ToolReturnSummary,
-} from '@gadgets/workshop-shared/api'
-import { WorkshopButton, WorkshopInput } from './components/WorkshopControls'
-import { reportIssue } from './errorReporting'
-import { safeExternalUrl } from './utils/safeExternalUrl'
-import { formatDate, useLocale } from './i18n'
+} from "@gadgets/workshop-shared/api";
+import { buildVaultNoteUrl } from "@gadgets/workshop-shared/citations";
+import { WorkshopButton, WorkshopInput } from "./components/WorkshopControls";
+import { reportIssue } from "./errorReporting";
+import { formatDate, useLocale } from "./i18n";
 
 type SourcesPanelProps = {
   overseer: RpcStub<Overseer>
@@ -78,34 +77,6 @@ function citationStateClass(state: DocumentCitationView['state']): string {
   }
 }
 
-export function buildVaultNoteUrl(
-  vaultWebUrl: string | undefined,
-  note: EvidenceSource['note'],
-): string | undefined {
-  if (!vaultWebUrl || !note || typeof note !== 'object'
-      || typeof note.brain !== 'string' || typeof note.slug !== 'string') {
-    return undefined
-  }
-  const brain = note.brain.trim()
-  const slug = note.slug.trim()
-  if (!brain || !slug) return undefined
-
-  const safeBase = safeExternalUrl(vaultWebUrl)
-  if (!safeBase) return undefined
-
-  try {
-    const url = new URL(safeBase)
-    if (url.username || url.password) return undefined
-    url.pathname = '/app/notas'
-    url.search = ''
-    url.searchParams.set('brain', brain)
-    url.searchParams.set('slug', slug)
-    url.hash = ''
-    return url.toString()
-  } catch {
-    return undefined
-  }
-}
 
 function ReturnDetail({ value }: { value: AuthorizedReturn }) {
   const { t } = useLocale()
@@ -457,6 +428,37 @@ function DocumentSources({
                                 <p className="mt-1 text-[11px] text-kumo-inactive">
                                   {[item.evidence.kind, item.evidence.locator].filter(Boolean).join(' · ')}
                                 </p>
+                              )}
+                              {item.sources.length > 0 && (
+                                <div className="mt-2 space-y-1.5">
+                                  {item.sources.map((source) => {
+                                    const noteUrl = buildVaultNoteUrl(
+                                      item.vaultWebUrl,
+                                      source.note,
+                                    );
+                                    return (
+                                      <div
+                                        key={source.id}
+                                        className="rounded-md border border-kumo-line bg-kumo-base px-2 py-1.5"
+                                      >
+                                        <p className="m-0 text-[11px] font-medium text-kumo-default">
+                                          {source.title || source.ref}
+                                        </p>
+                                        {noteUrl && (
+                                          <a
+                                            href={noteUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-kumo-default hover:underline"
+                                          >
+                                            {t("workspace.sources.openVaultNote")}
+                                            <ArrowSquareOut size={12} aria-hidden="true" />
+                                          </a>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
                               )}
                             </>
                           ) : (

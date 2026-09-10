@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { buildVaultNoteUrl } from './SourcesPanel'
+import { describe, expect, it } from "vitest";
+import { buildVaultNoteUrl } from "@gadgets/workshop-shared/citations";
 
 describe('buildVaultNoteUrl', () => {
   it('uses the frozen Vault base and encodes note identity', () => {

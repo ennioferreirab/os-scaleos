@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type {
-  Evidence,
-  EvidenceSource,
-  ToolReturn,
-} from "@gadgets/workshop-shared/api";
-import type { CitationDocumentSnapshot } from "@gadgets/workshop-shared/citations";
+import type { Evidence, EvidenceSource, ToolReturn } from "@gadgets/workshop-shared/api";
+import {
+  toDocumentExportProjection,
+  type CitationDocumentSnapshot,
+} from "@gadgets/workshop-shared/citations";
 import {
   deleteReturnFromStorage,
   getDocumentEvidenceFromStorage,
+  readCitationDocumentFromFacet,
   setCitationModeInStorage,
   setDocumentCitationsInStorage,
   type OverseerStorage,
@@ -80,7 +80,7 @@ function documentSnapshot(
       {id: "block-b", html: "<p>Other text</p>", version: 2},
     ],
 ): CitationDocumentSnapshot {
-  return {gadgetId: DOCUMENT_ID, revision, blocks};
+  return { gadgetId: DOCUMENT_ID, revision, title: "Cited document", blocks };
 }
 
 function citationInput(expectedDocumentRevision: number, expectedCitationRevision: number) {
@@ -95,6 +95,65 @@ function citationInput(expectedDocumentRevision: number, expectedCitationRevisio
     }],
   };
 }
+
+describe("document citation capability", () => {
+  it("normalizes a missing capability RPC while preserving real capability failures", async () => {
+    const disposeMissing = vi.fn();
+    await expect(
+      readCitationDocumentFromFacet(
+        {
+          getDocumentCapabilities: async () => {
+            throw new Error(
+              'The RPC receiver does not implement the method "getDocumentCapabilities".',
+            );
+          },
+          getDocument: async () => null,
+          [Symbol.dispose]: disposeMissing,
+        },
+        DOCUMENT_ID,
+      ),
+    ).rejects.toThrow("This gadget does not support document citations.");
+    expect(disposeMissing).toHaveBeenCalledOnce();
+
+    const disposeBroken = vi.fn();
+    await expect(
+      readCitationDocumentFromFacet(
+        {
+          getDocumentCapabilities: async () => {
+            throw new Error("capability storage failed");
+          },
+          getDocument: async () => null,
+          [Symbol.dispose]: disposeBroken,
+        },
+        DOCUMENT_ID,
+      ),
+    ).rejects.toThrow("capability storage failed");
+    expect(disposeBroken).toHaveBeenCalledOnce();
+  });
+
+  it("recognizes the explicit legacy state as citation-free until blocks initialize", async () => {
+    const dispose = vi.fn();
+    await expect(
+      readCitationDocumentFromFacet(
+        {
+          getDocumentCapabilities: async () => ({
+            documentVersion: 2,
+            citationsVersion: 1,
+          }),
+          getDocument: async () => ({
+            revision: 0,
+            title: "Legacy document",
+            blocks: null,
+            legacyContent: "<p>Legacy content</p>",
+          }),
+          [Symbol.dispose]: dispose,
+        },
+        DOCUMENT_ID,
+      ),
+    ).resolves.toBeUndefined();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+});
 
 describe("document citation storage", () => {
   it("keeps CAS-protected links and derives validity across document changes", async () => {
@@ -184,6 +243,16 @@ describe("document citation storage", () => {
       {returnId: "return-b", evidenceId: "evidence-b"},
       {returnId: "return-a", evidenceId: "evidence-a"},
     ]);
+    const exportProjection = toDocumentExportProjection(moved, view);
+    expect(exportProjection.citations.links).toEqual([
+      { blockId: "block-b", state: "valid", evidence: [0] },
+      { blockId: "block-a", state: "valid", evidence: [1] },
+    ]);
+    const serialized = JSON.stringify(exportProjection);
+    expect(serialized).not.toContain('"returnId"');
+    expect(serialized).not.toContain('"evidenceId"');
+    expect(serialized).not.toContain('"blockHash"');
+    expect(serialized).not.toContain('"citation-a"');
   });
 
   it("rejects cross-chat references and protects citation mode with CAS", async () => {

@@ -1,4 +1,5 @@
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import type { DocumentExportProjection } from "@gadgets/workshop-shared/citations";
 import type { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { z } from "zod";
 import { createExportDeadline, limitExportStream } from "./export-limits";
@@ -15,8 +16,12 @@ export interface GadgetExportEntrypoint<Gadget extends DurableObject = DurableOb
   /** Lists all export formats supported by the Gadget. */
   getExportFormats(gadget: GadgetExportCapability<Gadget>): Promise<GadgetExportFormat[]>;
 
-  /** Produces a server-mode export without retaining `gadget` after this call returns. */
-  export(gadget: GadgetExportCapability<Gadget>, id: string): Promise<ReadableStream<Uint8Array>>;
+  /** Produces a server-mode export from one frozen visible document projection when supported. */
+  export(
+    gadget: GadgetExportCapability<Gadget>,
+    id: string,
+    document?: DocumentExportProjection,
+  ): Promise<ReadableStream<Uint8Array>>;
 }
 
 const MAX_EXPORT_FORMATS = 32;

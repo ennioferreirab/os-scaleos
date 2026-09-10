@@ -1,41 +1,10 @@
-import { useState, useEffect, useRef } from 'react'
-import { Text, Loader, Banner } from '@cloudflare/kumo'
-import { Sparkle } from '@phosphor-icons/react'
-import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
-import type {
-  CitationMode,
-  DocumentEvidenceView,
-  EvidenceRef,
-  GadgetClient,
-  ConsoleLogEvent,
-  WorkpieceId,
-} from '@gadgets/workshop-shared/api'
-import { useLocale } from './i18n'
-
-export type GadgetCitationProjection = {
-  gadgetId: WorkpieceId
-  documentRevision: number
-  citationRevision: number
-  mode: CitationMode
-  links: {
-    id: string
-    blockId: string
-    blockVersion: number
-    blockHash: string
-    state: 'valid' | 'needs_review' | 'orphaned' | 'unavailable'
-    evidence: EvidenceRef[]
-  }[]
-  /** Only evidence linked by this document is sent to the sandbox for endnotes. */
-  evidence: {
-    returnId: string
-    evidenceId: string
-    status: 'available' | 'unavailable'
-    text?: string
-    kind?: string
-    locator?: string
-  }[]
-}
-
+import { useState, useEffect, useRef } from "react";
+import { Text, Loader, Banner } from "@cloudflare/kumo";
+import { Sparkle } from "@phosphor-icons/react";
+import { RpcStub, RpcTarget, newMessagePortRpcSession } from "capnweb";
+import type { GadgetClient, ConsoleLogEvent, WorkpieceId } from "@gadgets/workshop-shared/api";
+import type { DocumentCitationProjection } from "@gadgets/workshop-shared/citations";
+import { useLocale } from "./i18n";
 export type GadgetCitationFocus = {
   gadgetId: WorkpieceId
   blockId: string
@@ -43,48 +12,9 @@ export type GadgetCitationFocus = {
 }
 
 
-export function toGadgetCitationProjection(
-  view: DocumentEvidenceView | null | undefined,
-): GadgetCitationProjection | null {
-  if (!view) return null
-  const linkedEvidence = new Set<string>()
-  for (const link of view.links) {
-    for (const ref of link.evidence) linkedEvidence.add(`${ref.returnId}\u0000${ref.evidenceId}`)
-  }
-  return {
-    gadgetId: view.gadgetId,
-    documentRevision: view.documentRevision,
-    citationRevision: view.citationRevision,
-    mode: view.mode,
-    links: view.links.map(link => ({
-      id: link.id,
-      blockId: link.blockId,
-      blockVersion: link.blockVersion,
-      blockHash: link.blockHash,
-      state: link.state,
-      evidence: link.evidence.map(ref => ({...ref})),
-    })),
-    evidence: view.evidence
-      .filter(item => linkedEvidence.has(`${item.ref.returnId}\u0000${item.ref.evidenceId}`))
-      .map(item => item.status === 'available'
-        ? {
-            returnId: item.ref.returnId,
-            evidenceId: item.ref.evidenceId,
-            status: 'available' as const,
-            text: item.evidence.text,
-            kind: item.evidence.kind,
-            ...(item.evidence.locator === undefined ? {} : {locator: item.evidence.locator}),
-          }
-        : {
-            returnId: item.ref.returnId,
-            evidenceId: item.ref.evidenceId,
-            status: 'unavailable' as const,
-          }),
-  }
-}
 
 export function findGadgetCitationLink(
-  projection: GadgetCitationProjection | null | undefined,
+  projection: DocumentCitationProjection | null | undefined,
   citationId: unknown,
 ) {
   if (!projection || typeof citationId !== 'string' || !citationId) return undefined
@@ -97,7 +27,7 @@ export function findGadgetCitationLink(
  */
 export function validateCitationOpenMessage(
   data: unknown,
-  projection: GadgetCitationProjection | null | undefined,
+  projection: DocumentCitationProjection | null | undefined,
 ): { citationId: string; blockId: string } | null {
   if (!projection || typeof data !== 'object' || data === null) return null
   const candidate = data as Record<string, unknown>
@@ -110,7 +40,7 @@ export function validateCitationOpenMessage(
 
 export function validateCitationFocus(
   focus: GadgetCitationFocus | null | undefined,
-  projection: GadgetCitationProjection | null | undefined,
+  projection: DocumentCitationProjection | null | undefined,
 ): GadgetCitationFocus | null {
   if (!focus || !projection || focus.gadgetId !== projection.gadgetId) return null
   const link = findGadgetCitationLink(projection, focus.citationId)
@@ -263,15 +193,15 @@ const createSandboxedHtml = (jsCode: string): string => {
 }
 
 interface GadgetUIProps {
-  gadget: RpcStub<GadgetClient>
-  height: string
-  reloadTrigger?: number
-  isVisible?: boolean
-  chatId?: number
-  citationProjection?: GadgetCitationProjection | null
-  focusCitation?: GadgetCitationFocus | null
-  onOpenCitation?: (citationId: string) => void
-  onConsoleLog?: (log: ConsoleLogEvent) => void
+  gadget: RpcStub<GadgetClient>;
+  height: string;
+  reloadTrigger?: number;
+  isVisible?: boolean;
+  chatId?: number;
+  citationProjection?: DocumentCitationProjection | null;
+  focusCitation?: GadgetCitationFocus | null;
+  onOpenCitation?: (citationId: string) => void;
+  onConsoleLog?: (log: ConsoleLogEvent) => void;
   // Fires when the user presses Escape while the gadget iframe has focus. Sandboxed iframes
   // capture keydown events, so we forward Escape explicitly from inside the iframe.
   onIframeEscape?: () => void
@@ -324,16 +254,18 @@ function GadgetUISession({
   } | null>(null)
   const rpcSessionRef = useRef<any>(null)
   // Keep latest callbacks in refs so the message-handler effect never tears down the RPC session.
-  const onIframeEscapeRef = useRef(onIframeEscape)
-  const onConsoleLogRef = useRef(onConsoleLog)
-  const translateRef = useRef(t)
-  onIframeEscapeRef.current = onIframeEscape
-  const citationProjectionRef = useRef<GadgetCitationProjection | null>(citationProjection ?? null)
-  const focusCitationRef = useRef<GadgetCitationFocus | null>(focusCitation ?? null)
-  const onOpenCitationRef = useRef(onOpenCitation)
-  citationProjectionRef.current = citationProjection ?? null
-  focusCitationRef.current = focusCitation ?? null
-  onOpenCitationRef.current = onOpenCitation
+  const onIframeEscapeRef = useRef(onIframeEscape);
+  const onConsoleLogRef = useRef(onConsoleLog);
+  const translateRef = useRef(t);
+  onIframeEscapeRef.current = onIframeEscape;
+  const citationProjectionRef = useRef<DocumentCitationProjection | null>(
+    citationProjection ?? null,
+  );
+  const focusCitationRef = useRef<GadgetCitationFocus | null>(focusCitation ?? null);
+  const onOpenCitationRef = useRef(onOpenCitation);
+  citationProjectionRef.current = citationProjection ?? null;
+  focusCitationRef.current = focusCitation ?? null;
+  onOpenCitationRef.current = onOpenCitation;
 
   const sendCitationProjection = () => {
     if (!rpcSessionRef.current) return

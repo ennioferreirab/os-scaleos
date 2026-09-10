@@ -758,6 +758,12 @@ document.body.append(renderReport(report));
 
 To add, replace, or disable export formats, server.js may export a class named \`ExportHandler\`, which must extend \`WorkerEntrypoint\`. Its \`getExportFormats(gadget)\` method returns the complete list of formats, and its \`export(gadget, id)\` method returns a \`ReadableStream<Uint8Array>\` for formats whose mode is \`"server"\`. Read any needed Gadget state before \`export()\` returns; do not capture the borrowed \`gadget\` parameter in the returned stream. If \`getExportFormats(gadget)\` returns only browser-mode formats, do not implement \`export(gadget, id)\`. \`export\` is valid as a JavaScript class method name; write it directly as \`async export(gadget, id)\`, without quoting it or using a computed property. Browser mode supports \`text/html\`, \`application/pdf\`, \`image/png\`, and \`image/jpeg\`; server mode supports any media type. Each format must contain a unique non-empty \`id\`, a \`label\`, a \`mode\`, a \`contentType\`, and a \`fileExtension\` beginning with a dot. Returning an empty list disables export. The Workshop supplies default HTML and PDF formats only when server.js does not export \`ExportHandler\` at all.
 
+When a Gadget publishes the supported document-citation capability, server-mode \`export\` also
+receives a third \`documentProjection\` argument. It contains one frozen document revision and only
+the citation text, markers, source references, and credential-free links authorized for that
+document. Prefer this snapshot over another \`gadget.getDocument()\` call so document content and
+citations cannot come from different revisions. The argument is absent for other Gadgets.
+
 For example, this replaces the defaults with one browser-mode PDF variant and one server-generated CSV format:
 
 \`\`\`

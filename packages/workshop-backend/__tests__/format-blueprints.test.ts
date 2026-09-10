@@ -96,6 +96,59 @@ describe("bundled format blueprints", () => {
     expect(client).toContain("app.replaceChildren(canvas)");
   });
 
+  it("exports current citation modes and retains legacy Markdown content", async () => {
+    let entry = FORMAT_BLUEPRINTS.find(blueprint => blueprint.blueprintId === "format.document")!;
+    let server = await readBlueprintFile(entry, "server.js");
+    let helpers = server.slice(server.indexOf("function htmlToMarkdown"));
+    let documentToMarkdown = new Function(`${helpers}\nreturn documentToMarkdown;`)() as (
+      document: unknown,
+      citations: unknown,
+    ) => string;
+    let document = {
+      blocks: [
+        { id: "a", html: "<p>Alpha</p>" },
+        { id: "b", html: "<p>Beta</p>" },
+      ],
+    };
+    let citations = {
+      mode: "endnotes",
+      links: [
+        { blockId: "a", state: "valid", evidence: [0, 1] },
+        { blockId: "b", state: "valid", evidence: [1] },
+        { blockId: "b", state: "unavailable" },
+      ],
+      evidence: [
+        {
+          text: "Visible A",
+          sources: [
+            {
+              ref: "vault://note-a",
+              type: "note",
+              title: "Note A",
+              href: "https://vault.example.test/app/notas?brain=x&slug=a",
+            },
+          ],
+        },
+        { text: "Visible shared", sources: [] },
+      ],
+    };
+
+    expect(documentToMarkdown(document, citations)).toBe(
+      "Alpha [1,2]\n\nBeta [2] [?]\n\n## Endnotes\n\n" +
+        "1. Visible A — [Note A](https://vault.example.test/app/notas?brain=x&slug=a)\n" +
+        "2. Visible shared\n",
+    );
+    expect(documentToMarkdown(document, { ...citations, mode: "inline" })).toBe(
+      "Alpha [1,2]\n\nBeta [2] [?]\n",
+    );
+    expect(documentToMarkdown(document, { ...citations, mode: "none" })).toBe(
+      "Alpha\n\nBeta\n",
+    );
+    expect(
+      documentToMarkdown({ blocks: null, legacyContent: "<p>Legacy body</p>" }, null),
+    ).toBe("Legacy body\n");
+  });
+
   it("declares the intended export formats for every standard output format", async () => {
     let expectedFormats: Record<string, string[]> = {
       "format.document": [
