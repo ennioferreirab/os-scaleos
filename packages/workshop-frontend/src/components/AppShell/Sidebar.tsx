@@ -5,6 +5,7 @@ import {
   Compass,
   Hexagon,
   House,
+  LockKey,
   MagnifyingGlass,
   SidebarSimple,
   SquaresFour,
@@ -146,7 +147,12 @@ export default function Sidebar({
               icon={<Stack size={14} weight="regular" />}
               collapsed={collapsed}
             />
-            {/* Gatekeeper management apps (e.g. the Context Library), listed dynamically. */}
+            <SidebarItem
+              to="/vault"
+              label={t('navigation.vault')}
+              icon={<LockKey size={14} weight="regular" />}
+              collapsed={collapsed}
+            />
             {gatekeeperApps.map((app) => {
               // Escape the icon URL for safe interpolation into a CSS url("…") string.
               const maskUrl = app.icon

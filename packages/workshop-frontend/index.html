@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
 
-    <!-- Prevents Gadget UI frames from navigating away from their srcdoc. DO NOT REMOVE. -->
-    <meta http-equiv="Content-Security-Policy" content="frame-src srcdoc:;">
+    <!-- Prevents Gadget UI frames from navigating away from their srcdoc while allowing first-party Vault embedding. -->
+    <meta http-equiv="Content-Security-Policy" content="frame-src srcdoc: http://127.0.0.1:18083 http://localhost:18083;">
 
     <link rel="icon" sizes="32x32" href="/assets/scaleos/brand/favicon-32.png" />
     <link rel="icon" href="/assets/scaleos/brand/favicon.ico" />
