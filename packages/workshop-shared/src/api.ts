@@ -2854,6 +2854,12 @@ export type Evidence = {
   text: string;
   kind: "fact" | "excerpt" | "synthesis" | "unknown";
   locator?: string;
+  /**
+   * Factual confidence score between 0 and 1 from the same execution.
+   * Only emitted and accepted for kind "fact" with finite numbers in [0, 1];
+   * omitted for excerpt, synthesis, or unknown kinds. Never inferred from text.
+   */
+  confidence?: number;
 };
 
 /** Claim-to-evidence association supplied by the provider for this execution. */

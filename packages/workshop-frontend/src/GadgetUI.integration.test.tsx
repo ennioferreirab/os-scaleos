@@ -24,7 +24,7 @@ vi.mock('@cloudflare/kumo', () => ({
   Text: ({ children }: { children: ReactNode }) => children,
 }))
 
-import GadgetUI, { validateCitationOpenMessage } from "./GadgetUI";
+import GadgetUI, { createSandboxedHtml, validateCitationOpenMessage } from "./GadgetUI";
 import { toDocumentCitationProjection } from "@gadgets/workshop-shared/citations";
 
 interface TestGadget {
@@ -260,6 +260,14 @@ describe("GadgetUI citation projection", () => {
         projection,
       ),
     ).toBeNull();
+  });
+  it("scopes citation projection handlers to avoid colliding with gadget declarations", () => {
+    const html = createSandboxedHtml("function validCitationProjection() {}");
+    const scriptMatch = html.match(/src="data:text\/javascript;charset=utf-8,([^"]+)"/);
+    expect(scriptMatch).not.toBeNull();
+    const decoded = decodeURIComponent(scriptMatch![1]);
+    expect(decoded).toMatch(/\{\s*\n\s*const validCitationStates = new Set/);
+    expect(decoded).toContain("function validCitationProjection(value)");
   });
 });
 

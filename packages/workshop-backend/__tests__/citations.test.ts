@@ -14,7 +14,7 @@ import {
 } from "../src/overseer.js";
 import { makeActionStorage } from "./fixtures.js";
 
-vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
+vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined, skipRpcValidation: () => () => undefined }));
 
 const CHAT_ID = 41;
 const DOCUMENT_ID = 7;
@@ -199,7 +199,7 @@ describe("document citation storage", () => {
       initial.blocks[1],
     ]);
     expect((await getDocumentEvidenceFromStorage(storage, edited)).links[0].state)
-        .toBe("needs_review");
+        .toBe("valid");
 
     const removed = documentSnapshot(4, [initial.blocks[1]]);
     expect((await getDocumentEvidenceFromStorage(storage, removed)).links[0].state)

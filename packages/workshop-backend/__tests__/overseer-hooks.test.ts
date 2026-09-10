@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { OverseerDurableObject } from "../src/overseer.js";
 import { openFakeOverseer } from "./fixtures.js";
 
-vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
+vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined, skipRpcValidation: () => () => undefined }));
 
 function makeOverseer(hook: {
   enabled: boolean;

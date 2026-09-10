@@ -7,12 +7,13 @@ import {
   sanitizeCapturedPayload,
   listReturnsFromStorage,
   getReturnFromStorage,
+  getEvidenceFromStorage,
   type ToolReturnRecord,
 } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
 import { makeActionStorage, openFakeOverseer } from "./fixtures.js";
 
-vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
+vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined, skipRpcValidation: () => () => undefined }));
 
 describe("Tool Return Capture (T01)", () => {
   it("an observation result with no console is retrievable after creating a fresh API/session view for the same chat", async () => {
@@ -515,6 +516,12 @@ describe("Tool Return Capture (T01)", () => {
   it("filters normalized Vault sources and returns evidence without inventing links (T02)", async () => {
     const storage = makeActionStorage();
     const chatId = 87;
+    storage.chatMeta.put({
+      id: chatId,
+      title: `Chat ${chatId}`,
+      started: new Date(1700000000000),
+      lastActive: new Date(1700000000000),
+    });
     const returnId = "ret_vault_sources";
     const sourceId = "src_contract";
     const evidenceId = "ev_contract";
@@ -564,6 +571,7 @@ describe("Tool Return Capture (T01)", () => {
         text: "A entrega foi acordada para 20 de outubro.",
         kind: "fact",
         locator: "00:12:04",
+        confidence: 0.45,
       }],
       answerLinks: [{ claimIndex: 0, evidenceIds: [evidenceId] }],
       normalizationState: "normalized",
@@ -599,9 +607,20 @@ describe("Tool Return Capture (T01)", () => {
         id: evidenceId,
         sourceIds: [sourceId],
         kind: "fact",
+        confidence: 0.45,
       })]);
       expect(detail.answerLinks).toEqual([{ claimIndex: 0, evidenceIds: [evidenceId] }]);
       expect(detail.return.vaultWebUrl).toBe("https://vault.example/");
+
+      const resolvedEvidence = getEvidenceFromStorage(storage, [{ returnId, evidenceId }]);
+      expect(resolvedEvidence).toEqual([expect.objectContaining({
+        status: "available",
+        evidence: expect.objectContaining({
+          id: evidenceId,
+          kind: "fact",
+          confidence: 0.45,
+        }),
+      })]);
     }
   });
 
@@ -734,6 +753,7 @@ describe("Tool Return Capture (T01)", () => {
       text: "The delivery date was agreed.",
       kind: "fact",
       locator: "p. 2",
+      confidence: 0.95,
       fingerprint: "fingerprint:evidence",
       occurrences: [{returnId, executionId: "exec-1", externalId: evidenceId, payloadPath: "items[0]"}],
     });
@@ -760,6 +780,7 @@ describe("Tool Return Capture (T01)", () => {
       text: "The delivery date was agreed.",
       kind: "fact",
       locator: "p. 2",
+      confidence: 0.95,
     }]);
     expect(migrated?.answerLinks).toEqual([{claimIndex: 0, evidenceIds: [evidenceId]}]);
     expect(migrated?.byteCount).toBe(41);

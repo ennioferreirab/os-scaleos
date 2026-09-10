@@ -121,4 +121,51 @@ describe("Vault evidence normalization", () => {
     expect(result.envelope.items[0].text)
       .toBe("A entrega foi acordada para 20 de outubro.");
   });
+
+  it("accepts and preserves finite confidence in [0, 1] on fact items", () => {
+    const withConfidence = structuredClone(response);
+    (withConfidence.evidence.items[0] as Record<string, unknown>).confidence = 0.45;
+
+    const result = normalizeVaultEvidence(withConfidence, [{
+      type: "text",
+      text: JSON.stringify(withConfidence),
+    }]);
+
+    expect(result.status).toBe("normalized");
+    if (result.status !== "normalized") return;
+    expect(result.envelope.items[0].confidence).toBe(0.45);
+  });
+
+  it("accepts items when confidence is omitted", () => {
+    const withoutConfidence = structuredClone(response);
+    delete (withoutConfidence.evidence.items[0] as Record<string, unknown>).confidence;
+
+    const result = normalizeVaultEvidence(withoutConfidence, []);
+    expect(result.status).toBe("normalized");
+    if (result.status !== "normalized") return;
+    expect(result.envelope.items[0].confidence).toBeUndefined();
+  });
+
+  it("rejects non-finite, out of bounds, or non-numeric confidence", () => {
+    for (const invalidValue of [-0.01, 1.01, NaN, Infinity, -Infinity, "0.45", null, {}]) {
+      const invalid = structuredClone(response);
+      (invalid.evidence.items[0] as Record<string, unknown>).confidence = invalidValue;
+      expect(normalizeVaultEvidence(invalid, [])).toEqual({
+        status: "invalid",
+        reason: "Vault evidence envelope contains an invalid evidence item.",
+      });
+    }
+  });
+
+  it("rejects confidence on non-fact kinds", () => {
+    for (const kind of ["excerpt", "synthesis", "unknown"] as const) {
+      const invalid = structuredClone(response);
+      invalid.evidence.items[0].kind = kind;
+      (invalid.evidence.items[0] as Record<string, unknown>).confidence = 0.45;
+      expect(normalizeVaultEvidence(invalid, [])).toEqual({
+        status: "invalid",
+        reason: "Vault evidence envelope contains an invalid evidence item.",
+      });
+    }
+  });
 });

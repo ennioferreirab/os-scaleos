@@ -17,6 +17,7 @@ export type VaultEvidenceItemEnvelope = {
   kind: "fact" | "excerpt" | "synthesis" | "unknown";
   text: string;
   locator?: string;
+  confidence?: number;
 };
 
 export type NormalizedVaultEnvelope = {
@@ -117,7 +118,13 @@ export function normalizeVaultEvidence(
         || (candidate.kind !== "fact" && candidate.kind !== "excerpt"
           && candidate.kind !== "synthesis" && candidate.kind !== "unknown")
         || typeof candidate.text !== "string"
-        || (candidate.locator !== undefined && typeof candidate.locator !== "string")) {
+        || (candidate.locator !== undefined && typeof candidate.locator !== "string")
+        || (candidate.confidence !== undefined
+          && (typeof candidate.confidence !== "number"
+            || !Number.isFinite(candidate.confidence)
+            || candidate.confidence < 0
+            || candidate.confidence > 1
+            || candidate.kind !== "fact"))) {
       return { status: "invalid", reason: "Vault evidence envelope contains an invalid evidence item." };
     }
     evidenceIds.add(candidate.id);
@@ -127,6 +134,7 @@ export function normalizeVaultEvidence(
       kind: candidate.kind,
       text: candidate.text,
       ...(candidate.locator !== undefined ? { locator: candidate.locator } : {}),
+      ...(candidate.confidence !== undefined ? { confidence: candidate.confidence } : {}),
     });
   }
 

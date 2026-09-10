@@ -1,5 +1,5 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { validateRpc } from "capnweb-validate";
+import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime, ToolReturn, ToolReturnSummary, ReturnPage, ListReturnsOptions, AuthorizedReturn } from '@gadgets/workshop-shared/api';
 import type {
   AuthorizedEvidence,
@@ -1167,6 +1167,7 @@ type LegacyEvidenceRecord = {
   text: string;
   kind: Evidence["kind"];
   locator?: string;
+  confidence?: number;
   fingerprint: string;
   occurrences: Array<{
     returnId: string;
@@ -1317,6 +1318,7 @@ function prepareEvidenceNormalization(
     text: item.text,
     kind: item.kind,
     ...(item.locator !== undefined ? { locator: item.locator } : {}),
+    ...(item.confidence !== undefined ? { confidence: item.confidence } : {}),
   }));
   const answerLinks = envelope.answerLinks.map(link => ({
     claimIndex: link.claimIndex,
@@ -1797,7 +1799,8 @@ export function migrateLegacyEvidence(storage: OverseerStorage): void {
           sourceIds: [...item.sourceIds],
           text: item.text,
           kind: item.kind,
-          ...(item.locator !== undefined ? {locator: item.locator} : {}),
+          ...(item.locator !== undefined ? { locator: item.locator } : {}),
+          ...(item.confidence !== undefined ? { confidence: item.confidence } : {}),
         });
         evidenceIdsPresent.add(evidenceId);
       }
@@ -13300,6 +13303,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
     return this.impl.bindHook(this.gatekeeperId, controller, callback, description, this.caller);
   }
 
+  @skipRpcValidation()
   prepareToolObservation(request: ToolObservationRequest): Promise<NativeRpcStub<ToolReturnCapture> | undefined> {
     return this.impl.prepareToolObservation(this.gatekeeperId, request, this.caller);
   }

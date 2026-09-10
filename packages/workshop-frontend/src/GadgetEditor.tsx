@@ -1180,13 +1180,13 @@ export default function GadgetEditor() {
       }
       return
     }
-
+    void refreshDocumentEvidence()
     let output = turnOutputRef.current
     turnOutputRef.current = null
     if (!output || output.chatId !== chatId || output.userSelectedTab) return
     if (output.wroteGadgetCode) setActiveTab('app')
     else if (output.wroteFile) setActiveTab('code')
-  }, [])
+  }, [refreshDocumentEvidence])
 
   const handleStreamingActiveFileChange = useCallback(
       (chatId: number, file: ActiveFileTarget | null | undefined) => {
@@ -1917,6 +1917,7 @@ export default function GadgetEditor() {
                   onSelectedChatHasProposedChangesChange={setSelectedChatHasProposedChanges}
                   onOpenGadget={handleSelectWorkpiece}
                   outputOfWorkpiece={outputOfWorkpiece}
+                  onOpenSources={openSources}
                 />
               </div>
 
@@ -2087,6 +2088,7 @@ export default function GadgetEditor() {
                   onOpenCitation={handleOpenCitation}
                   onConsoleLog={handleClientConsoleLog}
                   onIframeEscape={isGadgetFullscreen ? exitGadgetFullscreen : undefined}
+                  onRefreshCitationProjection={refreshDocumentEvidence}
                 />
               ) : !previewMode && (
                 <NoGadgetPlaceholder height="100%" />
@@ -2201,6 +2203,7 @@ export default function GadgetEditor() {
               focusCitation={citationFocus}
               onOpenCitation={handleOpenCitation}
               onConsoleLog={handleClientConsoleLog}
+              onRefreshCitationProjection={refreshDocumentEvidence}
             />
           )}
         </div>

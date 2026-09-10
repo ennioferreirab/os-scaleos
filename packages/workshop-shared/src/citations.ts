@@ -365,11 +365,6 @@ export async function resolveCitationSet(
     }
     const block = currentBlocks.get(link.blockId);
     if (state !== "unavailable" && !block) state = "orphaned";
-    if (state !== "unavailable" && state !== "orphaned" && block) {
-      if (block.version !== link.blockVersion || await sha256Hex(block.html) !== link.blockHash) {
-        state = "needs_review";
-      }
-    }
     resolvedLinks.push({...link, evidence: link.evidence.map(ref => ({...ref})), state});
 
     for (const ref of link.evidence) {

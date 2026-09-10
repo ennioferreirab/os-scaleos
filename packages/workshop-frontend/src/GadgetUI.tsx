@@ -77,37 +77,39 @@ let gadget;  // RPC stub to the gadget's server-side Durable Object.
 }
 // Citation projections and focus requests are accepted only from the embedding host. The opaque
 // sandbox origin is not an authentication boundary, so checking window.parent is essential.
-const validCitationStates = new Set(['valid', 'needs_review', 'orphaned', 'unavailable']);
-const validCitationModes = new Set(['inline', 'endnotes', 'none']);
-function validCitationProjection(value) {
-  if (value === null) return true;
-  if (!value || typeof value !== 'object' || !Number.isInteger(value.gadgetId) ||
-      !Number.isInteger(value.documentRevision) || !Number.isInteger(value.citationRevision) ||
-      !validCitationModes.has(value.mode) || !Array.isArray(value.links) ||
-      !Array.isArray(value.evidence)) return false;
-  return value.links.every((link) => link && typeof link.id === 'string' &&
-    typeof link.blockId === 'string' && Number.isInteger(link.blockVersion) &&
-    typeof link.blockHash === 'string' && validCitationStates.has(link.state) &&
-    Array.isArray(link.evidence) && link.evidence.every((ref) =>
-      ref && typeof ref.returnId === 'string' && typeof ref.evidenceId === 'string'));
-}
-function validFocusRequest(value) {
-  return value && typeof value === 'object' && Number.isInteger(value.gadgetId) &&
-    typeof value.blockId === 'string' && typeof value.citationId === 'string';
-}
-window.addEventListener('message', (event) => {
-  if (event.source !== window.parent) return;
-  const data = event.data;
-  if (data?.type === 'workshop-document-citation-projection') {
-    if (!validCitationProjection(data.projection)) return;
-    globalThis.__workshopDocumentCitationProjection = data.projection;
-    globalThis.dispatchEvent(new CustomEvent('workshop-document-citation-projection', {
-      detail: data.projection,
-    }));
-  } else if (data?.type === 'workshop-focus-citation' && validFocusRequest(data)) {
-    globalThis.dispatchEvent(new CustomEvent('workshop-focus-citation', {detail: data}));
+{
+  const validCitationStates = new Set(['valid', 'needs_review', 'orphaned', 'unavailable']);
+  const validCitationModes = new Set(['inline', 'endnotes', 'none']);
+  function validCitationProjection(value) {
+    if (value === null) return true;
+    if (!value || typeof value !== 'object' || !Number.isInteger(value.gadgetId) ||
+        !Number.isInteger(value.documentRevision) || !Number.isInteger(value.citationRevision) ||
+        !validCitationModes.has(value.mode) || !Array.isArray(value.links) ||
+        !Array.isArray(value.evidence)) return false;
+    return value.links.every((link) => link && typeof link.id === 'string' &&
+      typeof link.blockId === 'string' && Number.isInteger(link.blockVersion) &&
+      typeof link.blockHash === 'string' && validCitationStates.has(link.state) &&
+      Array.isArray(link.evidence) && link.evidence.every((ref) =>
+        ref && typeof ref.returnId === 'string' && typeof ref.evidenceId === 'string'));
   }
-});
+  function validFocusRequest(value) {
+    return value && typeof value === 'object' && Number.isInteger(value.gadgetId) &&
+      typeof value.blockId === 'string' && typeof value.citationId === 'string';
+  }
+  window.addEventListener('message', (event) => {
+    if (event.source !== window.parent) return;
+    const data = event.data;
+    if (data?.type === 'workshop-document-citation-projection') {
+      if (!validCitationProjection(data.projection)) return;
+      globalThis.__workshopDocumentCitationProjection = data.projection;
+      globalThis.dispatchEvent(new CustomEvent('workshop-document-citation-projection', {
+        detail: data.projection,
+      }));
+    } else if (data?.type === 'workshop-focus-citation' && validFocusRequest(data)) {
+      globalThis.dispatchEvent(new CustomEvent('workshop-focus-citation', {detail: data}));
+    }
+  });
+}
 
 
 // Monkey-patch console to forward logs to the parent frame.
@@ -126,16 +128,18 @@ for (let level of ['debug', 'info', 'log', 'warn', 'error']) {
   };
 }
 
-// Allow user-activated target=_blank links, but block programmatic popups.
-const blockedOpen = () => {
-  console.error('window.open() is disabled in Gadget UIs. Use a link with target="_blank" instead.');
-  return null;
-};
-window.open = blockedOpen;
-globalThis.open = blockedOpen;
-try {
-  Window.prototype.open = blockedOpen;
-} catch {}
+{
+  // Allow user-activated target=_blank links, but block programmatic popups.
+  const blockedOpen = () => {
+    console.error('window.open() is disabled in Gadget UIs. Use a link with target="_blank" instead.');
+    return null;
+  };
+  window.open = blockedOpen;
+  globalThis.open = blockedOpen;
+  try {
+    Window.prototype.open = blockedOpen;
+  } catch {}
+}
 
 // Forward Escape key presses to the parent frame. The sandboxed iframe captures keydown events
 // when it has focus, so the parent never sees them. The workshop UI uses Escape to exit fullscreen
@@ -179,7 +183,7 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 `);
 
-const createSandboxedHtml = (jsCode: string): string => {
+export const createSandboxedHtml = (jsCode: string): string => {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -205,6 +209,7 @@ interface GadgetUIProps {
   // Fires when the user presses Escape while the gadget iframe has focus. Sandboxed iframes
   // capture keydown events, so we forward Escape explicitly from inside the iframe.
   onIframeEscape?: () => void
+  onRefreshCitationProjection?: () => void;
 }
 
 // How long to wait for a UI bundle before offering a retry instead of a spinner. Not a latency
@@ -227,6 +232,7 @@ function GadgetUISession({
   onOpenCitation,
   onConsoleLog,
   onIframeEscape,
+  onRefreshCitationProjection,
 }: GadgetUIProps) {
   const { t } = useLocale()
   const [sandboxedHtml, setSandboxedHtml] = useState<string | null>(null)
@@ -258,6 +264,8 @@ function GadgetUISession({
   const onConsoleLogRef = useRef(onConsoleLog);
   const translateRef = useRef(t);
   onIframeEscapeRef.current = onIframeEscape;
+  const onRefreshCitationProjectionRef = useRef(onRefreshCitationProjection);
+  onRefreshCitationProjectionRef.current = onRefreshCitationProjection;
   const citationProjectionRef = useRef<DocumentCitationProjection | null>(
     citationProjection ?? null,
   );
@@ -498,6 +506,7 @@ function GadgetUISession({
           rpcSessionRef.current = newMessagePortRpcSession(port, forwardingTarget)
           sendCitationProjection()
           sendCitationFocus()
+          onRefreshCitationProjectionRef.current?.()
         } catch (caught) {
           gadgetStub?.[Symbol.dispose]?.()
           port.close()
@@ -510,6 +519,8 @@ function GadgetUISession({
       } else if (event.data?.type === 'open-citation') {
         const intent = validateCitationOpenMessage(event.data, citationProjectionRef.current)
         if (intent) onOpenCitationRef.current?.(intent.citationId)
+      } else if (event.data?.type === 'request-citation-projection') {
+        onRefreshCitationProjectionRef.current?.()
       } else if (event.data?.type === 'console' && onConsoleLogRef.current) {
         onConsoleLogRef.current({
           timestamp: new Date(),

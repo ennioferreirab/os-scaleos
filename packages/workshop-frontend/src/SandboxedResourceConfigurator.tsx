@@ -302,6 +302,18 @@ export default function SandboxedResourceConfigurator({
     lastClipRef.current = null
     setHeight(MIN_CONFIGURATOR_HEIGHT)
     setLayoutHeight(MIN_CONFIGURATOR_HEIGHT)
+    // Mount the portal synchronously after layout. Background tabs may throttle
+    // requestAnimationFrame, but the configurator handshake must not depend on it.
+    const rect = placeholderRef.current?.getBoundingClientRect()
+    if (rect) {
+      const nextRect = {
+        top: rect.top + topOffsetRef.current,
+        left: rect.left,
+        width: rect.width,
+      }
+      lastFrameRectRef.current = nextRect
+      setFrameRect(nextRect)
+    }
     updateFrameRect()
   }, [frame.iframeHtml])
 

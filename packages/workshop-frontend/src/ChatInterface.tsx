@@ -1,20 +1,22 @@
 import { isTransientRpcError, logRpcFailure } from "./rpcErrors";
 import {
   Fragment,
+  createContext,
   isValidElement,
   memo,
-  useState,
+  useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
-  useRef,
   useMemo,
-  useCallback,
+  useRef,
+  useState,
   type ComponentPropsWithoutRef,
   type Dispatch,
-  type ReactNode,
-  type SetStateAction,
   type DragEvent as ReactDragEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  type SetStateAction,
 } from "react";
 import { reportIssue } from './errorReporting'
 import {
@@ -54,6 +56,7 @@ import {
   MagnifyingGlass,
   Question,
   ArrowUpRight,
+  BookOpen,
   Blueprint,
 } from "@phosphor-icons/react";
 import { RpcStub, RpcTarget } from "capnweb";
@@ -1304,9 +1307,12 @@ function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
     </div>
   );
 }
+const SourcesNavigationContext = createContext<(() => void) | undefined>(undefined);
+
 
 function getMarkdownComponents(
   mentionsByToken?: Map<string, Mention>,
+  onOpenSources?: () => void,
 ): Components {
   return {
     pre: ({ node: _node, ...props }) => <CodeBlock {...props} />,
@@ -1325,6 +1331,22 @@ function getMarkdownComponents(
               : <FormatMention format={mention.format} />;
         }
       }
+      if (href === "#sources" || href === "#fontes" || href?.startsWith("source:") || href?.startsWith("sources:")) {
+        return (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              onOpenSources?.();
+            }}
+            className="inline-flex items-center gap-1 font-medium text-kumo-brand hover:underline cursor-pointer"
+          >
+            {children}
+            <ArrowUpRight size={12} aria-hidden="true" />
+          </button>
+        );
+      }
+
 
       const safeHref = safeExternalUrl(href);
       if (!safeHref) {
@@ -1360,6 +1382,7 @@ export const MarkdownMessage = memo(function MarkdownMessage(
     formats?: MessageFormatRef[];
   },
 ): ReactNode {
+  const onOpenSources = useContext(SourcesNavigationContext);
   const tokenizedMessage = useMemo(
     () => capsules?.length || formats?.length
       ? buildTokenizedCapsuleMessage(message, capsules, formats)
@@ -1367,10 +1390,10 @@ export const MarkdownMessage = memo(function MarkdownMessage(
     [capsules, formats, message],
   );
   const components = useMemo(
-    () => tokenizedMessage
-      ? getMarkdownComponents(tokenizedMessage.mentionsByToken)
+    () => onOpenSources || tokenizedMessage
+      ? getMarkdownComponents(tokenizedMessage?.mentionsByToken, onOpenSources)
       : MARKDOWN_COMPONENTS_NO_CAPSULES,
-    [tokenizedMessage],
+    [tokenizedMessage, onOpenSources],
   );
   const remarkPlugins = useMemo(
     () => tokenizedMessage
@@ -1627,6 +1650,7 @@ const ToolCallDetails = memo(function ToolCallDetails(
   { toolCall: tc }: { toolCall: AiToolCall },
 ) {
   const { t } = useLocale();
+  const onOpenSources = useContext(SourcesNavigationContext);
   return (
     <div className="space-y-2">
       {tc.error && (
@@ -1658,6 +1682,19 @@ const ToolCallDetails = memo(function ToolCallDetails(
           {JSON.stringify(tc.input, null, 2)}
         </pre>
       )}
+      {onOpenSources && (
+        <div className="flex items-center justify-end pt-1">
+          <button
+            type="button"
+            onClick={onOpenSources}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-kumo-line bg-kumo-base px-2.5 py-1 text-[12px] font-medium text-kumo-default hover:bg-kumo-tint transition-colors"
+          >
+            <BookOpen size={13} aria-hidden="true" />
+            <span>{t('workspace.sources.viewInSources', { defaultValue: 'Ver nas Fontes' })}</span>
+            <ArrowUpRight size={12} aria-hidden="true" />
+          </button>
+        </div>
+      )}
     </div>
   );
 });
@@ -1665,7 +1702,9 @@ const ToolCallDetails = memo(function ToolCallDetails(
 const ObservationDetails = memo(function ObservationDetails(
   { observation }: { observation: ObservationChatMessage },
 ) {
+  const { t } = useLocale();
   const log = observation.actionLog;
+  const onOpenSources = useContext(SourcesNavigationContext);
   const safeResourceUrl = safeExternalUrl(log.resourceUrl);
   const metadata = log.resourceTitle;
 
@@ -1697,6 +1736,19 @@ const ObservationDetails = memo(function ObservationDetails(
             <MarkdownMessage message={log.description.description} />
           </div>
         </div>
+          {onOpenSources && (
+            <div className="mt-2 flex items-center pt-1">
+              <button
+                type="button"
+                onClick={onOpenSources}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-kumo-line bg-kumo-base px-2.5 py-1 text-[12px] font-medium text-kumo-default hover:bg-kumo-tint transition-colors"
+              >
+                <BookOpen size={13} aria-hidden="true" />
+                <span>{t('workspace.sources.viewInSources', { defaultValue: 'Ver nas Fontes' })}</span>
+                <ArrowUpRight size={12} aria-hidden="true" />
+              </button>
+            </div>
+          )}
       </div>
     </div>
   );
@@ -4509,6 +4561,7 @@ interface ChatInterfaceProps {
   // The output format a workpiece was built as, so a created-app card can name and draw it as the
   // Document (or whatever) it is rather than a generic app.
   outputOfWorkpiece: (gadgetId: WorkpieceId) => BlueprintOutput | undefined;
+  onOpenSources?: () => void;
 }
 
 // Bucket a chat's lastActive into a time grouping for the chat list.
@@ -4695,6 +4748,7 @@ function ChatInterface({
   constrainChatWidth,
   onOpenGadget,
   outputOfWorkpiece,
+  onOpenSources,
 }: ChatInterfaceProps) {
   const { t, formatDate, formatNumber } = useLocale();
   const translateRef = useRef(t);
@@ -7358,6 +7412,7 @@ function ChatInterface({
 
   // ─── main render ─────────────────────────────────────────────────────────────
   return (
+    <SourcesNavigationContext.Provider value={onOpenSources}>
     <div
       className={`flex h-full bg-kumo-base ${sidebarMode ? "flex-row" : "flex-col"}`}
     >
@@ -8514,6 +8569,7 @@ function ChatInterface({
         onClose={() => setUsageModalOpen(false)}
       />
     </div>
+    </SourcesNavigationContext.Provider>
   );
 }
 

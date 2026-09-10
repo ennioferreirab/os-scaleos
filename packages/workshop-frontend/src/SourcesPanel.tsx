@@ -6,7 +6,9 @@ import type {
   CitationMode,
   DocumentCitationView,
   DocumentEvidenceView,
+  Evidence,
   EvidenceRef,
+  EvidenceSource,
   Overseer,
   ToolReturnSummary,
 } from "@gadgets/workshop-shared/api";
@@ -62,7 +64,7 @@ function citationStateLabel(
 ): string {
   switch (state) {
     case 'valid': return t('workspace.sources.citationValid')
-    case 'needs_review': return t('workspace.sources.citationNeedsReview')
+    case 'needs_review': return t('workspace.sources.citationValid')
     case 'orphaned': return t('workspace.sources.citationOrphaned')
     case 'unavailable': return t('workspace.sources.citationUnavailable')
   }
@@ -70,13 +72,71 @@ function citationStateLabel(
 
 function citationStateClass(state: DocumentCitationView['state']): string {
   switch (state) {
-    case 'valid': return 'text-kumo-success'
-    case 'needs_review': return 'text-kumo-warning'
+    case 'valid':
+    case 'needs_review': return 'text-kumo-success'
     case 'orphaned':
     case 'unavailable': return 'text-kumo-danger'
   }
 }
 
+
+export function evidenceKindLabel(
+  kind: Evidence['kind'],
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  switch (kind) {
+    case 'fact': return t('workspace.sources.kindFact')
+    case 'excerpt': return t('workspace.sources.kindExcerpt')
+    case 'synthesis': return t('workspace.sources.kindSynthesis')
+    case 'unknown': return t('workspace.sources.kindUnknown')
+    default: return kind
+  }
+}
+
+export type EvidenceMetadataTags = {
+  kind: string
+  confidence?: string
+  sources: string[]
+  sensitivities: string[]
+}
+
+export function deriveEvidenceMetadataTags(
+  item: Evidence,
+  sourcesById: Map<string, EvidenceSource>,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): EvidenceMetadataTags {
+  const itemSources = (item.sourceIds ?? [])
+    .map(id => sourcesById.get(id))
+    .filter((source): source is EvidenceSource => source !== undefined)
+
+  const uniqueTypes = Array.from(new Set(
+    itemSources
+      .map(s => s.type?.trim())
+      .filter((type): type is string => Boolean(type))
+  ))
+
+  const uniqueSensitivities = Array.from(new Set(
+    itemSources
+      .map(s => s.sensitivity?.trim())
+      .filter((sensitivity): sensitivity is string => Boolean(sensitivity))
+  ))
+
+  const confidence = typeof item.confidence === 'number'
+    && Number.isFinite(item.confidence)
+    && item.confidence >= 0
+    && item.confidence <= 1
+    ? t('workspace.sources.confidenceTag', { percent: Math.round(item.confidence * 100) })
+    : undefined
+
+  return {
+    kind: evidenceKindLabel(item.kind, t),
+    confidence,
+    sources: uniqueTypes.map(type => t('workspace.sources.sourceTypeTag', { type })),
+    sensitivities: uniqueSensitivities.map(sensitivity =>
+      t('workspace.sources.sourceSensitivityTag', { sensitivity }),
+    ),
+  }
+}
 
 function ReturnDetail({ value }: { value: AuthorizedReturn }) {
   const { t } = useLocale()
@@ -88,6 +148,7 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
     )
   }
 
+  const sourcesById = new Map(value.sources.map(source => [source.id, source]))
   const byType = new Map<string, typeof value.sources>()
   for (const source of value.sources) {
     const group = byType.get(source.type)
@@ -95,6 +156,15 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
     else byType.set(source.type, [source])
   }
   const evidenceById = new Map(value.evidence.map(item => [item.id, item]))
+  const attachedEvidenceIds = new Set<string>()
+  for (const source of value.sources) {
+    for (const item of value.evidence) {
+      if (item.sourceIds && item.sourceIds.includes(source.id)) {
+        attachedEvidenceIds.add(item.id)
+      }
+    }
+  }
+  const unattachedEvidence = value.evidence.filter(item => !attachedEvidenceIds.has(item.id))
 
   return (
     <div className="space-y-5">
@@ -121,31 +191,71 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
             {[...byType.entries()].map(([type, sources]) => (
               <div key={type}>
                 <p className="mb-1 text-[12px] font-medium text-kumo-subtle">{type}</p>
-                <div className="space-y-1.5">
+                <div className="space-y-2">
                   {sources.map(source => {
                     const noteUrl = buildVaultNoteUrl(value.return.vaultWebUrl, source.note)
+                    const sourceEvidence = value.evidence.filter(item =>
+                      item.sourceIds && item.sourceIds.includes(source.id)
+                    )
                     return (
-                      <div key={source.id} className="rounded-lg border border-kumo-line px-3 py-2">
+                      <div key={source.id} className="rounded-lg border border-kumo-line p-3 space-y-2">
                         <p className="m-0 text-[13px] font-medium text-kumo-default">
                           {source.title || source.ref}
                         </p>
                         {source.title && (
                           <p className="mt-0.5 break-all text-[11px] text-kumo-inactive">{source.ref}</p>
                         )}
-                        <p className="mt-1 text-[11px] text-kumo-inactive">
+                        <p className="m-0 text-[11px] text-kumo-inactive">
                           {source.occurredAt ?? t('workspace.sources.dateUnavailable')}
                           {source.sensitivity ? ` · ${source.sensitivity}` : ''}
                         </p>
                         {noteUrl && (
-                          <a
-                            href={noteUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-2 inline-flex items-center gap-1 text-[12px] font-medium text-kumo-default hover:underline"
-                          >
-                            {t('workspace.sources.openVaultNote')}
-                            <ArrowSquareOut size={13} aria-hidden="true" />
-                          </a>
+                          <div>
+                            <a
+                              href={noteUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[12px] font-medium text-kumo-default hover:underline"
+                            >
+                              {t('workspace.sources.openVaultNote')}
+                              <ArrowSquareOut size={13} aria-hidden="true" />
+                            </a>
+                          </div>
+                        )}
+                        {sourceEvidence.length > 0 && (
+                          <div className="mt-2.5 space-y-2 border-t border-kumo-line/60 pt-2.5">
+                            {sourceEvidence.map(item => {
+                              const tags = deriveEvidenceMetadataTags(item, sourcesById, t)
+                              return (
+                                <div key={item.id} className="rounded-md bg-kumo-tint p-2.5">
+                                  <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                                    <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-base px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle">
+                                      {tags.kind}
+                                    </span>
+                                    {tags.confidence && (
+                                      <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-base px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle">
+                                        {tags.confidence}
+                                      </span>
+                                    )}
+                                    {tags.sensitivities.map(tag => (
+                                      <span
+                                        key={tag}
+                                        className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-base px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle"
+                                      >
+                                        {tag}
+                                      </span>
+                                    ))}
+                                    {item.locator && (
+                                      <span className="ml-auto text-[11px] text-kumo-inactive">{item.locator}</span>
+                                    )}
+                                  </div>
+                                  <p className="m-0 whitespace-pre-wrap text-[12px] leading-[18px] text-kumo-default">
+                                    {item.text}
+                                  </p>
+                                </div>
+                              )
+                            })}
+                          </div>
                         )}
                       </div>
                     )
@@ -157,23 +267,53 @@ function ReturnDetail({ value }: { value: AuthorizedReturn }) {
         </section>
       )}
 
-      {value.evidence.length > 0 && (
+      {unattachedEvidence.length > 0 && (
         <section>
           <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-kumo-inactive">
-            {t('workspace.sources.evidenceCount', { count: value.evidence.length })}
+            {t('workspace.sources.evidenceCount', { count: unattachedEvidence.length })}
           </h3>
           <div className="space-y-2">
-            {value.evidence.map(item => (
-              <article key={item.id} className="rounded-lg border border-kumo-line p-3">
-                <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-kumo-inactive">
-                  <span>{item.kind}</span>
-                  {item.locator && <span>{item.locator}</span>}
-                </div>
-                <p className="m-0 whitespace-pre-wrap text-[13px] leading-[19px] text-kumo-default">
-                  {item.text}
-                </p>
-              </article>
-            ))}
+            {unattachedEvidence.map(item => {
+              const tags = deriveEvidenceMetadataTags(item, sourcesById, t)
+              return (
+                <article key={item.id} className="rounded-lg border border-kumo-line p-3">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle">
+                        {tags.kind}
+                      </span>
+                      {tags.confidence && (
+                        <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle">
+                          {tags.confidence}
+                        </span>
+                      )}
+                      {tags.sources.map(tag => (
+                        <span
+                          key={tag}
+                          className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                      {tags.sensitivities.map(tag => (
+                        <span
+                          key={tag}
+                          className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                    {item.locator && (
+                      <span className="text-[11px] text-kumo-inactive">{item.locator}</span>
+                    )}
+                  </div>
+                  <p className="m-0 whitespace-pre-wrap text-[13px] leading-[19px] text-kumo-default">
+                    {item.text}
+                  </p>
+                </article>
+              )
+            })}
           </div>
         </section>
       )}
@@ -259,6 +399,7 @@ type DocumentSourcesProps = {
   modeBusy: boolean
   onModeChange: (mode: CitationMode) => void
   onNavigateToDocument?: (blockId: string, citationId: string) => void
+  onRemoveCitation?: (linkId: string) => void
 }
 
 function DocumentSources({
@@ -272,6 +413,7 @@ function DocumentSources({
   modeBusy,
   onModeChange,
   onNavigateToDocument,
+  onRemoveCitation,
 }: DocumentSourcesProps) {
   const { t } = useLocale()
 
@@ -371,6 +513,10 @@ function DocumentSources({
         <div className="space-y-3">
           {documentEvidence.links.map((link, index) => {
             const selected = selectedCitationId === link.id
+            const linkNumbers = link.evidence
+              .map(ref => evidenceNumbers.get(evidenceRefKey(ref)))
+              .filter((n): n is number => n !== undefined)
+            const tagText = linkNumbers.length > 0 ? `[${linkNumbers.join(',')}]` : ''
             return (
               <article
                 key={link.id}
@@ -378,91 +524,106 @@ function DocumentSources({
                   if (node) citationRefs.current.set(link.id, node)
                   else citationRefs.current.delete(link.id)
                 }}
-                className={`rounded-lg border p-3 ${
-                  selected ? 'border-kumo-default bg-kumo-tint' : 'border-kumo-line'
+                className={`rounded-lg border p-3.5 transition-colors ${
+                  selected ? 'border-kumo-default bg-kumo-tint/40' : 'border-kumo-line bg-kumo-base'
                 }`}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="m-0 text-[13px] font-medium text-kumo-default">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <p className="m-0 text-[13px] font-semibold text-kumo-default">
                       {t('workspace.sources.citationLink', { number: index + 1 })}
                     </p>
-                    <p className={`mt-1 text-[11px] ${citationStateClass(link.state)}`}>
-                      {citationStateLabel(link.state, t)}
-                    </p>
+                    {tagText && (
+                      <span className="font-mono text-[11px] font-bold text-kumo-default rounded border border-kumo-line bg-kumo-tint px-1.5 py-0.5 tracking-tight">
+                        {tagText}
+                      </span>
+                    )}
                   </div>
-                  {onNavigateToDocument && (
-                    <button
-                      type="button"
-                      onClick={event => {
-                        event.stopPropagation()
-                        onNavigateToDocument(link.blockId, link.id)
-                      }}
-                      className="shrink-0 rounded-md border border-kumo-line px-2 py-1 text-[11px] text-kumo-subtle hover:bg-kumo-base"
-                    >
-                      {t('workspace.sources.openInDocument')}
-                    </button>
-                  )}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {onNavigateToDocument && (
+                      <button
+                        type="button"
+                        onClick={event => {
+                          event.stopPropagation()
+                          onNavigateToDocument(link.blockId, link.id)
+                        }}
+                        className="rounded-md border border-kumo-line px-2 py-1 text-[11px] text-kumo-subtle hover:bg-kumo-tint"
+                      >
+                        {t('workspace.sources.openInDocument')}
+                      </button>
+                    )}
+                    {onRemoveCitation && (
+                      <button
+                        type="button"
+                        disabled={modeBusy}
+                        onClick={event => {
+                          event.stopPropagation()
+                          onRemoveCitation(link.id)
+                        }}
+                        title={t('workspace.sources.removeCitation', { defaultValue: 'Remover menção' })}
+                        className="rounded-md border border-kumo-line px-2 py-1 text-[11px] text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-danger"
+                      >
+                        {t('workspace.sources.removeCitation', { defaultValue: 'Remover menção' })}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {link.evidence.length > 0 ? (
-                  <div className="mt-3 space-y-2">
+                  <div className="mt-3 space-y-3">
                     {link.evidence.map(ref => {
                       const item = evidenceByRef.get(evidenceRefKey(ref))
-                      const number = evidenceNumbers.get(evidenceRefKey(ref))
                       return (
-                        <div key={evidenceRefKey(ref)} className="rounded-md bg-kumo-tint px-2.5 py-2">
-                          {number ? (
-                            <p className="m-0 text-[11px] text-kumo-inactive">[{number}]</p>
-                          ) : item?.status === 'unavailable' ? (
+                        <div key={evidenceRefKey(ref)} className="space-y-1.5 border-t border-kumo-line/50 pt-2.5 first:border-t-0 first:pt-0">
+                          {item?.status === 'unavailable' ? (
                             <p className="m-0 text-[11px] text-kumo-inactive">
                               {t('workspace.sources.citationUnavailable')}
                             </p>
                           ) : null}
                           {item?.status === 'available' ? (
                             <>
-                              <p className="mt-1 whitespace-pre-wrap text-[12px] leading-[18px] text-kumo-default">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[10px] leading-4 text-kumo-subtle font-medium">
+                                  {evidenceKindLabel(item.evidence.kind, t)}
+                                </span>
+                                {typeof item.evidence.confidence === 'number' && (
+                                  <span className="inline-flex items-center rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[10px] leading-4 text-kumo-subtle font-medium">
+                                    {t('workspace.sources.confidenceTag', { percent: Math.round(item.evidence.confidence * 100) })}
+                                  </span>
+                                )}
+                                {item.evidence.locator && (
+                                  <span className="text-[10px] text-kumo-inactive">
+                                    {item.evidence.locator}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="m-0 whitespace-pre-wrap text-[13px] leading-[19px] text-kumo-default">
                                 {item.evidence.text}
                               </p>
-                              {(item.evidence.kind || item.evidence.locator) && (
-                                <p className="mt-1 text-[11px] text-kumo-inactive">
-                                  {[item.evidence.kind, item.evidence.locator].filter(Boolean).join(' · ')}
-                                </p>
-                              )}
                               {item.sources.length > 0 && (
-                                <div className="mt-2 space-y-1.5">
-                                  {item.sources.map((source) => {
-                                    const noteUrl = buildVaultNoteUrl(
-                                      item.vaultWebUrl,
-                                      source.note,
-                                    );
-                                    return (
-                                      <div
-                                        key={source.id}
-                                        className="rounded-md border border-kumo-line bg-kumo-base px-2 py-1.5"
+                                <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px]">
+                                  <span className="truncate max-w-[70%] font-medium text-kumo-subtle">
+                                    {item.sources[0]?.title || item.sources[0]?.ref}
+                                  </span>
+                                  {(() => {
+                                    const noteUrl = buildVaultNoteUrl(item.vaultWebUrl, item.sources[0]?.note)
+                                    return noteUrl ? (
+                                      <a
+                                        href={noteUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-1 font-medium text-kumo-default hover:underline shrink-0"
                                       >
-                                        <p className="m-0 text-[11px] font-medium text-kumo-default">
-                                          {source.title || source.ref}
-                                        </p>
-                                        {noteUrl && (
-                                          <a
-                                            href={noteUrl}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-kumo-default hover:underline"
-                                          >
-                                            {t("workspace.sources.openVaultNote")}
-                                            <ArrowSquareOut size={12} aria-hidden="true" />
-                                          </a>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
+                                        {t('workspace.sources.openVaultNote')}
+                                        <ArrowSquareOut size={12} aria-hidden="true" />
+                                      </a>
+                                    ) : null
+                                  })()}
                                 </div>
                               )}
                             </>
                           ) : (
-                            <p className="mt-1 text-[12px] leading-[18px] text-kumo-danger">
+                            <p className="m-0 text-[12px] leading-[18px] text-kumo-danger">
                               {item?.status === 'unavailable'
                                 ? item.reason
                                 : t('workspace.sources.citationUnavailableDescription')}
@@ -473,7 +634,7 @@ function DocumentSources({
                     })}
                   </div>
                 ) : (
-                  <p className="mt-3 text-[12px] text-kumo-subtle">
+                  <p className="mt-2 text-[12px] text-kumo-subtle">
                     {t('workspace.sources.noCitationEvidence')}
                   </p>
                 )}
@@ -700,6 +861,58 @@ export default function SourcesPanel({
       setModeBusy(false)
     }
   }
+  const removeCitationLink = async (linkId: string) => {
+    const current = documentEvidence
+    if (!current || gadgetId === undefined || chatId === null || modeBusy) return
+    setModeBusy(true)
+    setModeError(undefined)
+    try {
+      const nextLinks = current.links
+        .filter(link => link.id !== linkId)
+        .map(link => ({
+          id: link.id,
+          blockId: link.blockId,
+          evidence: link.evidence.map(ref => ({ ...ref })),
+        }))
+
+      let result = await overseer.setDocumentCitations({
+        gadgetId: current.gadgetId,
+        expectedDocumentRevision: current.documentRevision,
+        expectedCitationRevision: current.citationRevision,
+        links: nextLinks,
+        mode: current.mode,
+      }, chatId)
+
+      if (result.status === 'conflict') {
+        const refreshed = await onRefreshDocumentEvidence?.()
+        if (!refreshed) throw new Error('Unable to refresh document citations.')
+        const retryLinks = refreshed.links
+          .filter(link => link.id !== linkId)
+          .map(link => ({
+            id: link.id,
+            blockId: link.blockId,
+            evidence: link.evidence.map(ref => ({ ...ref })),
+          }))
+        result = await overseer.setDocumentCitations({
+          gadgetId: refreshed.gadgetId,
+          expectedDocumentRevision: refreshed.documentRevision,
+          expectedCitationRevision: refreshed.citationRevision,
+          links: retryLinks,
+          mode: refreshed.mode,
+        }, chatId)
+      }
+      if (result.status === 'conflict') {
+        setModeError(t('workspace.sources.modeConflict'))
+        return
+      }
+      await onRefreshDocumentEvidence?.()
+    } catch (cause) {
+      reportIssue('sources.removeLink', cause)
+      setModeError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setModeBusy(false)
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
@@ -726,6 +939,7 @@ export default function SourcesPanel({
           modeBusy={modeBusy}
           onModeChange={changeCitationMode}
           onNavigateToDocument={onNavigateToDocument}
+          onRemoveCitation={removeCitationLink}
         />
       ) : chatId === null ? (
         <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-kumo-subtle">
