@@ -21,14 +21,25 @@ type SourcesPanelProps = {
 
 type SourcesView = 'conversation' | 'document'
 
-function returnStatus(entry: ToolReturnSummary): string {
-  if (entry.captureState === 'deleted') return 'deleted'
-  if (entry.captureState === 'partial') return 'partial'
-  if (entry.captureState === 'failed') return 'failed'
-  if (entry.executionState === 'failed' || entry.executionState === 'unknown') {
-    return entry.executionState
-  }
-  return entry.normalizationState
+function returnStatus(
+  entry: ToolReturnSummary,
+  labels: {
+    deleted: string
+    partial: string
+    failed: string
+    unknown: string
+    awaiting: string
+    normalized: string
+    invalid: string
+    conflict: string
+    unsupported: string
+  },
+): string {
+  if (entry.captureState === 'deleted') return labels.deleted
+  if (entry.captureState === 'partial') return labels.partial
+  if (entry.captureState === 'failed' || entry.executionState === 'failed') return labels.failed
+  if (entry.executionState === 'unknown') return labels.unknown
+  return entry.observed ? labels[entry.normalizationState] : labels.awaiting
 }
 
 export function buildVaultNoteUrl(
@@ -313,8 +324,19 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
     return [...options.entries()]
   }, [entries])
   const sourceTypeOptions = useMemo(() =>
-    [...new Set(entries.flatMap(entry => entry.sourceTypes))].sort(), [entries])
+    [...new Set(entries.flatMap(entry => entry.observed ? entry.sourceTypes : []))].sort(), [entries])
 
+  const statusLabels = {
+    deleted: t('workspace.sources.statusDeleted'),
+    partial: t('workspace.sources.statusPartial'),
+    failed: t('workspace.sources.statusFailed'),
+    unknown: t('workspace.sources.statusUnknown'),
+    awaiting: t('workspace.sources.statusAwaiting'),
+    normalized: t('workspace.sources.statusNormalized'),
+    invalid: t('workspace.sources.statusInvalid'),
+    conflict: t('workspace.sources.statusConflict'),
+    unsupported: t('workspace.sources.statusUnsupported'),
+  }
   const loadMore = async () => {
     if (chatId === null || !nextBeforeId || loadingMore) return
     const generation = listGenerationRef.current
@@ -420,10 +442,12 @@ export default function SourcesPanel({ overseer, chatId, gadgetId, isVisible }: 
                       {entry.connectorTitle || `#${entry.gatekeeperId}`} · {formatDate(new Date(entry.calledAt), { dateStyle: 'medium', timeStyle: 'short' })}
                     </p>
                     <p className="mt-1 text-[11px] text-kumo-subtle">
-                      {returnStatus(entry)} · {t('workspace.sources.sourceEvidenceCounts', {
-                        sources: entry.sourceCount,
-                        evidence: entry.evidenceCount,
-                      })}
+                      {entry.observed
+                        ? <>{returnStatus(entry, statusLabels)} · {t('workspace.sources.sourceEvidenceCounts', {
+                          sources: entry.sourceCount,
+                          evidence: entry.evidenceCount,
+                        })}</>
+                        : returnStatus(entry, statusLabels)}
                     </p>
                   </div>
                   <CaretRight size={14} className="shrink-0 text-kumo-inactive" />

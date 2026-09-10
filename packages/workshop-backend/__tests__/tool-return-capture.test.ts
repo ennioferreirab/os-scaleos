@@ -5,8 +5,8 @@ import {
   PAYLOAD_CHUNK_BYTES,
   chunkUtf8String,
   sanitizeCapturedPayload,
-  getReturnFromStorage,
   listReturnsFromStorage,
+  getReturnFromStorage,
   type ToolReturnRecord,
 } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
@@ -638,5 +638,134 @@ describe("Tool Return Capture (T01)", () => {
     }
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/Invalid pagination cursor/);
+  });
+  it("masks unobserved action details and excludes them from evidence filters", () => {
+    const storage = makeActionStorage();
+    const chatId = 91;
+    storage.toolReturns.put({
+      id: "ret_unobserved_mask",
+      actionRecordId: 901,
+      chatId,
+      gatekeeperId: 4,
+      tool: "write_secret",
+      calledAt: new Date(1700000000000),
+      executionState: "applied",
+      captureState: "stored",
+      payloadRef: "ret_unobserved_mask",
+      byteCount: 123,
+      normalizationVersion: 1,
+      coverage: { complete: true, reasons: [] },
+      redacted: true,
+      observed: false,
+      sourceProvider: "vault",
+      sources: [{id: "hidden_source", ref: "hidden", type: "hidden_type"}],
+      evidence: [{id: "hidden_evidence", sourceIds: ["hidden_source"], text: "secret text", kind: "fact"}],
+      normalizationState: "normalized",
+      normalizationReason: "hidden",
+    });
+
+    const page = listReturnsFromStorage(storage, {chatId});
+    expect(page.entries).toHaveLength(1);
+    const summary = page.entries[0];
+    expect(summary.observed).toBe(false);
+    expect("byteCount" in summary).toBe(false);
+    expect("coverage" in summary).toBe(false);
+    expect("redacted" in summary).toBe(false);
+    expect("sourceProvider" in summary).toBe(false);
+    expect("sourceTypes" in summary).toBe(false);
+    expect("sourceCount" in summary).toBe(false);
+    expect("evidenceCount" in summary).toBe(false);
+    expect("normalizationState" in summary).toBe(false);
+    expect(listReturnsFromStorage(storage, {chatId, sourceType: "hidden_type"}).entries)
+      .toHaveLength(0);
+    expect(listReturnsFromStorage(storage, {chatId, query: "secret text"}).entries)
+      .toHaveLength(0);
+    expect(listReturnsFromStorage(storage, {chatId, query: "write_secret"}).entries)
+      .toHaveLength(1);
+  });
+
+  it("lazily migrates legacy shared evidence rows into per-return manifests atomically", () => {
+    const storage = makeActionStorage();
+    const chatId = 92;
+    const returnId = "ret_legacy_migration";
+    const sourceId = "legacy_source";
+    const evidenceId = "legacy_evidence";
+    const legacyReturn: ToolReturnRecord & {sourceIds: string[]; evidenceIds: string[]} = {
+      id: returnId,
+      actionRecordId: 902,
+      chatId,
+      gatekeeperId: 5,
+      tool: "vault_ask",
+      calledAt: new Date(1700000000000),
+      executionState: "applied",
+      captureState: "stored",
+      payloadRef: returnId,
+      byteCount: 41,
+      normalizationVersion: 1,
+      coverage: {complete: true, reasons: []},
+      redacted: false,
+      observed: true,
+      sourceIds: [sourceId],
+      evidenceIds: [evidenceId],
+      answerLinks: [{claimIndex: 0, evidenceIds: [evidenceId]}],
+      normalizationState: "normalized",
+      normalizationByteCount: 19,
+    };
+    storage.toolReturns.put(legacyReturn);
+    storage.chatPayloadBytes.put({chatId, bytes: 60});
+    storage.sourceSnapshots.put({
+      id: sourceId,
+      gatekeeperId: 5,
+      connectionGeneration: 3,
+      provider: "vault",
+      ref: "meeting-1",
+      type: "meeting",
+      title: "Meeting 1",
+      occurredAt: "2026-10-20T12:00:00Z",
+      observedAccess: {type: "meeting", tags: ["legal"], sensitivity: "internal"},
+      contentHash: "sha256:source",
+      fingerprint: "fingerprint:source",
+      occurrences: [{returnId, executionId: "exec-1", externalId: sourceId}],
+    });
+    storage.evidence.put({
+      id: evidenceId,
+      gatekeeperId: 5,
+      sourceIds: [sourceId],
+      text: "The delivery date was agreed.",
+      kind: "fact",
+      locator: "p. 2",
+      fingerprint: "fingerprint:evidence",
+      occurrences: [{returnId, executionId: "exec-1", externalId: evidenceId, payloadPath: "items[0]"}],
+    });
+
+    expect(listReturnsFromStorage(storage, {chatId}).entries).toHaveLength(1);
+
+    const migrated = storage.toolReturns.get(returnId) as
+      | (ToolReturnRecord & {sourceIds?: string[]; evidenceIds?: string[]})
+      | undefined;
+    expect(storage.evidenceStorageVersion.get()).toBe(1);
+    expect(migrated?.sourceIds).toBeUndefined();
+    expect(migrated?.evidenceIds).toBeUndefined();
+    expect(migrated?.sources).toEqual([{
+      id: sourceId,
+      ref: "meeting-1",
+      type: "meeting",
+      title: "Meeting 1",
+      occurredAt: "2026-10-20T12:00:00Z",
+      sensitivity: "internal",
+    }]);
+    expect(migrated?.evidence).toEqual([{
+      id: evidenceId,
+      sourceIds: [sourceId],
+      text: "The delivery date was agreed.",
+      kind: "fact",
+      locator: "p. 2",
+    }]);
+    expect(migrated?.answerLinks).toEqual([{claimIndex: 0, evidenceIds: [evidenceId]}]);
+    expect(migrated?.byteCount).toBe(41);
+    expect(migrated?.normalizationByteCount).toBe(19);
+    expect(storage.chatPayloadBytes.get(chatId)?.bytes).toBe(60);
+    expect(Array.from(storage.sourceSnapshots.list())).toHaveLength(0);
+    expect(Array.from(storage.evidence.list())).toHaveLength(0);
   });
 });

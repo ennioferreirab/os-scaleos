@@ -1,4 +1,8 @@
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import type {
+  AuthorizedEvidence, CitationMode, CitationMutationResult, DocumentEvidenceView,
+  EvidenceRef, SetCitationModeInput, SetDocumentCitationsInput,
+} from "@gadgets/workshop-shared/api";
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
@@ -280,24 +284,67 @@ async function resolveBindingDescription(
 }
 
 /**
- * A tool-call block as persisted in a StoredAssistantMessage: everything pi produced except the
- * arguments, which the step's AiToolCall record already stores (as `input`) and which replay
- * rehydrates by id (see rehydrateStoredAssistantMessage). Tool arguments are the one genuinely
- * large duplicate (writeFile/executeCode payloads are whole files); everything else is kept.
+ * A tool-call block as persisted in a StoredAssistantMessage. Large ordinary tool arguments stay
+ * in the public AiToolCall record for backwards-compatible replay; citation arguments are the
+ * exception because the public record is metadata-only. They are retained here, server-side only,
+ * so replay can ask the current authorization hooks for fresh read results.
  */
-export type StoredToolCall = Omit<ToolCall, "arguments">;
+export type StoredToolCall = Omit<ToolCall, "arguments"> & {
+  /** Full arguments for citation tools only; never sent through the client-visible chat record. */
+  arguments?: Record<string, unknown>;
+};
+
+function isCitationToolName(name: string): boolean {
+  return name === "getEvidence" || name === "getDocumentEvidence"
+      || name === "setDocumentCitations" || name === "setCitationMode";
+}
+
+function citationMode(value: unknown): CitationMode | undefined {
+  return value === "inline" || value === "endnotes" || value === "none"
+    ? value
+    : undefined;
+}
+
+/**
+ * Reduces a live provider tool call to the metadata-safe shape persisted in the public transcript.
+ * Citation reads deliberately have no output; their replay path re-reads current authorization.
+ */
+export function publicToolCallInput(block: ToolCall): Record<string, unknown> {
+  let args = block.arguments;
+  switch (block.name) {
+    case "getEvidence":
+      return {count: Array.isArray(args.refs) ? args.refs.length : 0};
+    case "getDocumentEvidence":
+      return {gadget: typeof args.gadget === "string" ? args.gadget : ""};
+    case "setDocumentCitations": {
+      let mode = citationMode(args.mode);
+      return {
+        gadget: typeof args.gadget === "string" ? args.gadget : "",
+        linkCount: Array.isArray(args.links) ? args.links.length : 0,
+        ...(mode === undefined ? {} : {mode}),
+      };
+    }
+    case "setCitationMode": {
+      let mode = citationMode(args.mode);
+      return {
+        gadget: typeof args.gadget === "string" ? args.gadget : "",
+        ...(mode === undefined ? {} : {mode}),
+      };
+    }
+    default:
+      return args;
+  }
+}
 
 /**
  * The AssistantMessage for one agent step, persisted exactly as pi produced it (except for
- * StoredToolCall's deliberate subtraction) so later turns can replay the step verbatim. This is
- * what preserves reasoning across turns and restarts: thinking blocks keep their provider
+ * StoredToolCall's deliberate argument policy) so later turns can replay the step verbatim.
+ * This is what preserves reasoning across turns and restarts: thinking blocks keep their provider
  * signatures (including encrypted/redacted payloads), and the message keeps its true
  * api/provider/model provenance, so pi's transformMessages can reflect same-model reasoning back
  * to the provider and apply its cross-model conversions when the user switches models. The
- * snapshot is subtractive on purpose -- copy everything, delete only what's provably redundant --
- * so fields pi adds in the future are retained by default (dropping them would silently reduce
- * fidelity and break prompt caching). Stored server-side only (see `chatModelData` in
- * overseer.ts); clients never receive these.
+ * snapshot is subtractive on purpose -- copy everything and retain only citation arguments in
+ * addition to the existing non-argument snapshot.
  */
 export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
   content: (TextContent | ThinkingContent | StoredToolCall)[];
@@ -313,16 +360,19 @@ export type AiChatMessageBodyWithModelData = AiChatMessageBody & {
 };
 
 /**
- * Snapshots a completed step's AssistantMessage for persistence. See StoredAssistantMessage for
- * why this copies everything and subtracts rather than picking fields. (Exported for tests.)
+ * Snapshots a completed step's AssistantMessage for persistence. Ordinary tool arguments remain
+ * omitted to avoid duplicating large file/code payloads; citation arguments are retained only in
+ * the private model snapshot so their public transcript record can stay metadata-safe.
  */
 export function makeStoredAssistantMessage(message: AssistantMessage): StoredAssistantMessage {
   return {
     ...message,
     content: message.content.map(block => {
       if (block.type !== "toolCall") return block;
-      let stored: StoredToolCall & {arguments?: Record<string, unknown>} = {...block};
-      delete stored.arguments;
+      let stored: StoredToolCall = {...block};
+      if (!isCitationToolName(block.name)) {
+        delete stored.arguments;
+      }
       return stored;
     }),
   };
@@ -455,6 +505,36 @@ export interface AgentHooks {
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void): Promise<string>;
+
+  /**
+   * Resolve evidence references retained by this workspace for an agent turn. The implementation
+   * rechecks owner identity, current-chat scope, and current source authorization.
+   */
+  getAgentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo, refs: EvidenceRef[]): Promise<AuthorizedEvidence[]>;
+
+  /**
+   * Read the citation projection for a document gadget visible in this agent's current chat.
+   */
+  getAgentDocumentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo,
+      gadgetId: WorkpieceId): Promise<DocumentEvidenceView>;
+
+  /**
+   * Replace citations for a document visible in this agent's current chat. Stale CAS checks return
+   * a normal conflict result so the agent can re-read without retrying an unsafe write.
+   */
+  setAgentDocumentCitations(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetDocumentCitationsInput): Promise<CitationMutationResult>;
+
+  /**
+   * Change citation presentation mode for a document visible in this agent's current chat.
+   */
+  setAgentCitationMode(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetCitationModeInput): Promise<CitationMutationResult>;
+
   activeAgentCallbackCount(chatId: number): number;
   rejectAllAgentCallbacks(chatId: number, error: string): void;
   consumeCapturedActions(chatId: number)
@@ -812,6 +892,31 @@ let EDIT_FILE_TOOL_DESCRIPTION = `
 Edit content of a file. If you need to edit multiple places in a file or across multiple files, you should issue multiple tool calls simultaneously, rather than in series.
 `.trim();
 
+let GET_EVIDENCE_TOOL_DESCRIPTION = `
+Resolve one or more retained evidence references from this conversation. Each reference must use a
+return ID and evidence ID that came from this chat's captured tool returns. Unavailable evidence is
+reported without returning its private text.
+`.trim();
+
+let GET_DOCUMENT_EVIDENCE_TOOL_DESCRIPTION = `
+Read the current citation links and authorized evidence for a document Gadget in this conversation.
+Pass the Gadget's env binding name. The result includes document and citation revisions; read it
+before writing citations.
+`.trim();
+
+let SET_DOCUMENT_CITATIONS_TOOL_DESCRIPTION = `
+Replace the citation links for a document Gadget in this conversation. Pass the document and
+citation revisions returned by getDocumentEvidence and the block IDs plus evidence references to
+save. A stale revision returns a conflict with current revisions and does not change anything;
+re-read before retrying.
+`.trim();
+
+let SET_CITATION_MODE_TOOL_DESCRIPTION = `
+Change whether a document Gadget presents citations inline, as endnotes, or not at all. Pass the
+citation revision returned by getDocumentEvidence. A stale revision returns a conflict without
+changing the document or its citation links.
+`.trim();
+
 let WEBFETCH_TOOL_DESCRIPTION = `
 Fetch the contents of a public web URL via HTTPS GET. Use this to look up documentation, fetch API references, or read pages the user has linked, when doing so would help you answer accurately. Prefer it over guessing when you're unsure about an API or library.
 
@@ -924,9 +1029,6 @@ function applyPendingEditToText(content: string | null, edit: ReplayPendingEdit)
       throw new Error("Unknown edit.");
   }
 }
-
-// Locates `textToReplace` in `content`, enforcing editFile's exactly-one-match contract. The
-// returned position is also where the live tool anchors its exact-span change.
 function findEditPos(content: string, textToReplace: string): number {
   let pos = content.indexOf(textToReplace);
   if (pos < 0) {
@@ -945,11 +1047,10 @@ function jsonToolResultText(value: unknown): string {
 }
 
 /**
- * Rebuilds the model-facing assistant message for one agent step from its persisted snapshot,
- * verbatim except that each tool-call block's arguments are rehydrated from the step's AiToolCall
- * record (see StoredToolCall). Returns undefined -- the caller then falls back to reconstructing
- * the message from the display record -- if a block references a tool call the display record
- * doesn't have, which indicates a bug (the two are written together) or corrupted storage.
+ * Rebuilds the model-facing assistant message for one agent step from its persisted snapshot.
+ * Citation arguments come from that private snapshot; ordinary arguments come from the step's
+ * metadata-safe AiToolCall display record. Returns undefined if a block references a tool call the
+ * display record does not have, which indicates a bug or corrupted storage.
  * (Exported for tests.)
  */
 export function rehydrateStoredAssistantMessage(
@@ -970,7 +1071,9 @@ export function rehydrateStoredAssistantMessage(
       });
       return undefined;
     }
-    content.push({...block, arguments: record.input as Record<string, unknown>});
+    // Citation calls carry their full arguments in this private snapshot. Ordinary calls keep
+    // using the public record, avoiding another copy of large file/code arguments.
+    content.push({...block, arguments: block.arguments ?? record.input as Record<string, unknown>});
   }
   return {...stored, content};
 }
@@ -1508,6 +1611,15 @@ export async function runAgent(
         }
 
         modelMessages.push(modelMessage);
+        let privateToolCallArguments = new Map<string, Record<string, unknown>>();
+        if (modelMessage.role === "assistant") {
+          for (let block of modelMessage.content) {
+            if (block.type === "toolCall") {
+              privateToolCallArguments.set(block.id, block.arguments);
+            }
+          }
+        }
+
 
         if (msg.toolCalls) {
           let modelToolCalls: ToolCall[] = [];
@@ -1693,6 +1805,41 @@ export async function runAgent(
                   // if it did, replay the same brush-off the live tool returns.
                   toolOutput = {text: OBSERVE_USER_CHANGES_NOOP_RESULT};
                   break;
+                case "getEvidence": {
+                  let input = privateToolCallArguments.get(toolCall.toolCallId)
+                      ?? (toolCall.input as unknown as Record<string, unknown>);
+                  if (!Array.isArray(input.refs)) {
+                    throw new Error("getEvidence tool call is missing its private evidence references");
+                  }
+                  toolOutput = {
+                    text: jsonToolResultText(await hooks.getAgentEvidence(
+                        chatId, initiator, input.refs as EvidenceRef[])),
+                  };
+                  break;
+                }
+                case "getDocumentEvidence": {
+                  let input = privateToolCallArguments.get(toolCall.toolCallId)
+                      ?? (toolCall.input as unknown as Record<string, unknown>);
+                  if (typeof input.gadget !== "string") {
+                    throw new Error(
+                        "getDocumentEvidence tool call is missing its private gadget binding");
+                  }
+                  let gadgetId = hooks.resolveWorkpieceRoot(
+                      resolveToolWorkpieceId(input.gadget), true, chatId).workpieceId;
+                  let output = await hooks.getAgentDocumentEvidence(chatId, initiator, gadgetId);
+                  toolOutput = {text: jsonToolResultText(output)};
+                  break;
+                }
+                case "setDocumentCitations":
+                case "setCitationMode":
+                  if (toolCall.output === undefined) {
+                    throw new Error(`${toolCall.toolName} tool call in log is missing its result`);
+                  }
+                  // Mutation results contain only CAS metadata, so replaying the recorded result
+                  // is safe and avoids applying a citation write a second time.
+                  toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  break;
+
                 case "listBlueprints":
                 case "listConnectableResources":
                 case "requestConnection":
@@ -2551,6 +2698,133 @@ export async function runAgent(
         }
       }
     }),
+    getEvidence: defineTool({
+      name: "getEvidence",
+      label: "Get evidence",
+      description: GET_EVIDENCE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        refs: Type.Array(Type.Object({
+          returnId: Type.String({description: "Captured return ID from this conversation."}),
+          evidenceId: Type.String({description: "Evidence ID within that captured return."}),
+        })),
+      }),
+      execute: async (toolCallId, {refs}) => {
+        try {
+          let output = await hooks.getAgentEvidence(chatId, initiator, refs);
+          // Read results are revalidated during replay; never persist them in the public
+          // transcript or its per-call details.
+          return toolResult(jsonToolResultText(output));
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
+    }),
+
+    getDocumentEvidence: defineTool({
+      name: "getDocumentEvidence",
+      label: "Get document citations",
+      description: GET_DOCUMENT_EVIDENCE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        gadget: Type.String({
+          description: "Env binding name of the document Gadget in this conversation.",
+        }),
+      }),
+      execute: async (toolCallId, {gadget}) => {
+        try {
+          let gadgetId = hooks.resolveWorkpieceRoot(
+              resolveToolWorkpieceId(gadget), true, chatId).workpieceId;
+          let output = await hooks.getAgentDocumentEvidence(chatId, initiator, gadgetId);
+          // Read results are revalidated during replay; never persist them in the public
+          // transcript or its per-call details.
+          return toolResult(jsonToolResultText(output));
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
+    }),
+
+    setDocumentCitations: defineTool({
+      name: "setDocumentCitations",
+      label: "Set document citations",
+      description: SET_DOCUMENT_CITATIONS_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        gadget: Type.String({
+          description: "Env binding name of the document Gadget in this conversation.",
+        }),
+        expectedDocumentRevision: Type.Integer({
+          description: "Document revision returned by getDocumentEvidence.",
+        }),
+        expectedCitationRevision: Type.Integer({
+          description: "Citation revision returned by getDocumentEvidence.",
+        }),
+        links: Type.Array(Type.Object({
+          id: Type.Optional(Type.String({
+            description: "Stable citation ID; omit when creating a new citation link.",
+          })),
+          blockId: Type.String({description: "Stable document block ID for the marker."}),
+          evidence: Type.Array(Type.Object({
+            returnId: Type.String({description: "Captured return ID from this conversation."}),
+            evidenceId: Type.String({description: "Evidence ID within that captured return."}),
+          })),
+        })),
+        mode: Type.Optional(Type.Union([
+          Type.Literal("inline"),
+          Type.Literal("endnotes"),
+          Type.Literal("none"),
+        ])),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let gadgetId = hooks.resolveWorkpieceRoot(
+              resolveToolWorkpieceId(input.gadget), true, chatId).workpieceId;
+          let output = await hooks.setAgentDocumentCitations(chatId, initiator, {
+            gadgetId,
+            expectedDocumentRevision: input.expectedDocumentRevision,
+            expectedCitationRevision: input.expectedCitationRevision,
+            links: input.links,
+            ...(input.mode === undefined ? {} : {mode: input.mode}),
+          });
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
+    }),
+
+    setCitationMode: defineTool({
+      name: "setCitationMode",
+      label: "Set citation mode",
+      description: SET_CITATION_MODE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        gadget: Type.String({
+          description: "Env binding name of the document Gadget in this conversation.",
+        }),
+        expectedCitationRevision: Type.Integer({
+          description: "Citation revision returned by getDocumentEvidence.",
+        }),
+        mode: Type.Union([
+          Type.Literal("inline"),
+          Type.Literal("endnotes"),
+          Type.Literal("none"),
+        ]),
+      }),
+      execute: async (toolCallId, {gadget, expectedCitationRevision, mode}) => {
+        try {
+          let gadgetId = hooks.resolveWorkpieceRoot(
+              resolveToolWorkpieceId(gadget), true, chatId).workpieceId;
+          let output = await hooks.setAgentCitationMode(chatId, initiator, {
+            gadgetId, expectedCitationRevision, mode,
+          });
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      },
+    }),
 
     setGadgetBinding: defineTool({
       name: "setGadgetBinding",
@@ -3001,7 +3275,7 @@ export async function runAgent(
               let result = <AiToolCall>{
                 toolCallId: block.id,
                 toolName: block.name as AiToolCall["toolName"],
-                input: block.arguments,
+                input: publicToolCallInput(block),
               };
               let toolResultMsg = resultsById.get(block.id);
               if (!toolResultMsg) {

@@ -809,6 +809,13 @@ function getToolCallSummary(
       return { verb: i18n.t('workspace.chat.tool.listedResources'), target: tc.input.vendorId };
     case "requestConnection":
       return { verb: i18n.t('workspace.chat.tool.requestedConnection'), target: tc.input.vendorId };
+    case "getEvidence":
+      return { verb: i18n.t('workspace.chat.tool.read') };
+    case "getDocumentEvidence":
+      return { verb: i18n.t('workspace.chat.tool.inspected'), target: tc.input.gadget };
+    case "setDocumentCitations":
+    case "setCitationMode":
+      return { verb: i18n.t('workspace.chat.tool.edited'), target: tc.input.gadget };
   }
   // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
@@ -888,6 +895,11 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
       return count === 1
         ? i18n.t('workspace.chat.tool.requestingConnection')
         : i18n.t('workspace.chat.tool.requestedConnections', { count });
+    case "getEvidence":
+    case "getDocumentEvidence":
+    case "setDocumentCitations":
+    case "setCitationMode":
+      return i18n.t('workspace.chat.tool.toolCalls', { count });
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -981,6 +993,11 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
     case "listBlueprints": return i18n.t('workspace.chat.tool.listingBlueprints');
     case "listConnectableResources": return i18n.t('workspace.chat.tool.listingResources');
     case "requestConnection": return i18n.t('workspace.chat.tool.requestingConnection');
+    case "getEvidence":
+    case "getDocumentEvidence":
+    case "setDocumentCitations":
+    case "setCitationMode":
+      return i18n.t('workspace.chat.tool.usingTool');
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -1005,6 +1022,11 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
     case "listBlueprints": return i18n.t('workspace.chat.tool.listingBlueprints');
     case "listConnectableResources": return i18n.t('workspace.chat.tool.listingResources');
     case "requestConnection": return i18n.t('workspace.chat.tool.requestedConnections', { count });
+    case "getEvidence":
+    case "getDocumentEvidence":
+    case "setDocumentCitations":
+    case "setCitationMode":
+      return i18n.t('workspace.chat.tool.toolCalls', { count });
   }
   const _exhaustive: never = toolName;
   return _exhaustive;

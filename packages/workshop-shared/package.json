@@ -31,6 +31,10 @@
       "types": "./src/evidence.ts",
       "import": "./src/evidence.ts"
     },
+    "./citations": {
+      "types": "./src/citations.ts",
+      "import": "./src/citations.ts"
+    },
     "./code-change": {
       "types": "./src/code-change.ts",
       "import": "./src/code-change.ts"

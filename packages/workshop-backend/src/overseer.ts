@@ -1,7 +1,29 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime, ToolReturn, ToolReturnSummary, ReturnPage, ListReturnsOptions, AuthorizedReturn } from '@gadgets/workshop-shared/api';
-import type { Evidence, EvidenceSource, ReturnAnswerLink } from "@gadgets/workshop-shared/api";
+import type {
+  AuthorizedEvidence,
+  CitationMutationResult,
+  CitationSet,
+  DocumentCitation,
+  DocumentCitationInput,
+  DocumentEvidenceView,
+  Evidence,
+  EvidenceRef,
+  EvidenceSource,
+  ReturnAnswerLink,
+  SetCitationModeInput,
+  SetDocumentCitationsInput,
+  CitationMode,
+} from "@gadgets/workshop-shared/api";
+import {
+  evidenceRefKey,
+  resolveCitationSet,
+  sha256Hex,
+  validateCitationLinks,
+  validateEvidenceRefs,
+  type CitationDocumentSnapshot,
+} from "@gadgets/workshop-shared/citations";
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -994,8 +1016,63 @@ export type ToolReturnChunkRecord = {
   /** Chat ID owning the return. */
   chatId: number;
   /** Chunk payload UTF-8 string. */
+
   data: string;
 };
+/** Legacy source snapshot row retained only as input to the per-return evidence migration. */
+type LegacySourceSnapshotRecord = {
+  id: string;
+  gatekeeperId: WorkpieceId;
+  connectionGeneration?: number;
+  provider: string;
+  ref: string;
+  type: string;
+  title?: string;
+  occurredAt?: string;
+  observedAccess: {
+    type: string;
+    tags: string[];
+    sensitivity: string;
+  };
+  contentHash: string;
+  fingerprint: string;
+  occurrences: Array<{
+    returnId: string;
+    executionId: string;
+    externalId: string;
+  }>;
+};
+
+/** Legacy evidence row retained only as input to the per-return evidence migration. */
+type LegacyEvidenceRecord = {
+  id: string;
+  gatekeeperId: WorkpieceId;
+  sourceIds: string[];
+  text: string;
+  kind: Evidence["kind"];
+  locator?: string;
+  fingerprint: string;
+  occurrences: Array<{
+    returnId: string;
+    executionId: string;
+    externalId: string;
+    payloadPath: string;
+  }>;
+};
+
+/** Legacy fields that may still exist on a return written before evidence became per-return. */
+type LegacyToolReturnRecord = ToolReturnRecord & {
+  sourceIds?: string[];
+  evidenceIds?: string[];
+};
+
+/** Private citation metadata stored separately from document content and captured payloads. */
+type StoredCitationSet = CitationSet & {
+  chatId?: number;
+};
+
+/** Current version of the one-time legacy evidence migration. */
+const LEGACY_EVIDENCE_MIGRATION_VERSION = 1;
 type PreparedEvidenceNormalization = {
   sources: EvidenceSource[];
   evidence: Evidence[];
@@ -1232,6 +1309,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // True if any past observation was authorized that had the `prohibitAllSharing` flag set
       // in its `ObservationDescription`.
       prohibitAllSharing: false,
+      // Version of the one-time migration from shared source/evidence rows to per-return arrays.
+      // The stamp is written in the same transaction as all copied return manifests and retired
+      // row deletion, so a crash retries the whole migration without losing evidence.
+      evidenceStorageVersion: 0,
     },
 
     collections: {
@@ -1346,11 +1427,28 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           },
         },
       }),
+      // READ-ONLY LEGACY: normalized source snapshots from the pre per-return evidence schema.
+      // These rows are migration input only and are deleted after their return manifests are
+      // rewritten atomically.
+      sourceSnapshots: collection<LegacySourceSnapshotRecord>()({
+        primaryKey: "id",
+      }),
+
+      // READ-ONLY LEGACY: normalized evidence rows from the pre per-return evidence schema.
+      evidence: collection<LegacyEvidenceRecord>()({
+        primaryKey: "id",
+      }),
+
+      // Private citation metadata, separate from document content and captured returns.
+      citationSets: collection<StoredCitationSet>()({
+        primaryKey: "gadgetId",
+      }),
 
       // Tracks total application payload bytes per chat (up to 50 MiB).
       chatPayloadBytes: collection<{ chatId: number; bytes: number }>()({
         primaryKey: "chatId",
       }),
+
 
       boundHooks: collection<BoundHookRecord>()({
         primaryKey: "id",
@@ -1527,11 +1625,88 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
 
+/**
+ * Migrate legacy shared source/evidence rows into the per-return manifests.
+ *
+ * The migration is deliberately lazy for storage-only callers (including tests): the first
+ * return/evidence read or delete invokes it. All manifests, retired rows, and the version stamp
+ * are committed in one transaction, so a retry after a failed transaction is deterministic.
+ */
+export function migrateLegacyEvidence(storage: OverseerStorage): void {
+  if (storage.evidenceStorageVersion.get() >= LEGACY_EVIDENCE_MIGRATION_VERSION) return;
+
+  storage.transaction(() => {
+    if (storage.evidenceStorageVersion.get() >= LEGACY_EVIDENCE_MIGRATION_VERSION) return;
+
+    const sourceRows = Array.from(storage.sourceSnapshots.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const evidenceRows = Array.from(storage.evidence.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const sourcesById = new Map(sourceRows.map(source => [source.id, source]));
+    const evidenceById = new Map(evidenceRows.map(item => [item.id, item]));
+
+    const returns = Array.from(storage.toolReturns.list())
+      .sort((left, right) => left.id.localeCompare(right.id));
+    for (const stored of returns) {
+      const record = stored as LegacyToolReturnRecord;
+      const sourceIds = record.sourceIds ?? [];
+      const evidenceIds = record.evidenceIds ?? [];
+      if (sourceIds.length === 0 && evidenceIds.length === 0) continue;
+
+      const sources = [...(record.sources ?? [])];
+      const sourceIdsPresent = new Set(sources.map(source => source.id));
+      for (const sourceId of sourceIds) {
+        if (sourceIdsPresent.has(sourceId)) continue;
+        const source = sourcesById.get(sourceId);
+        if (!source) continue;
+        sources.push({
+          id: source.id,
+          ref: source.ref,
+          type: source.type,
+          ...(source.title !== undefined ? {title: source.title} : {}),
+          ...(source.occurredAt !== undefined ? {occurredAt: source.occurredAt} : {}),
+          sensitivity: source.observedAccess.sensitivity,
+        });
+        sourceIdsPresent.add(sourceId);
+      }
+
+      const evidence = [...(record.evidence ?? [])];
+      const evidenceIdsPresent = new Set(evidence.map(item => item.id));
+      for (const evidenceId of evidenceIds) {
+        if (evidenceIdsPresent.has(evidenceId)) continue;
+        const item = evidenceById.get(evidenceId);
+        if (!item) continue;
+        evidence.push({
+          id: item.id,
+          sourceIds: [...item.sourceIds],
+          text: item.text,
+          kind: item.kind,
+          ...(item.locator !== undefined ? {locator: item.locator} : {}),
+        });
+        evidenceIdsPresent.add(evidenceId);
+      }
+
+      // Delete the retired fields from the serialized row after copying them. This makes a
+      // successful migration observable and prevents a later reader from treating the old schema
+      // as another source of truth.
+      delete record.sourceIds;
+      delete record.evidenceIds;
+      record.sources = sources;
+      record.evidence = evidence;
+      storage.toolReturns.put(record);
+    }
+
+    for (const source of sourceRows) storage.sourceSnapshots.delete(source.id);
+    for (const item of evidenceRows) storage.evidence.delete(item.id);
+    storage.evidenceStorageVersion.put(LEGACY_EVIDENCE_MIGRATION_VERSION);
+  });
+}
 
 export function listReturnsFromStorage(
   storage: OverseerStorage,
   options: ListReturnsOptions,
 ): ReturnPage {
+  migrateLegacyEvidence(storage);
   const { chatId, beforeId, limit = 25, query, connectorId, sourceType } = options;
   const clampedLimit = Math.min(Math.max(1, limit), 100);
   const normalizedQuery = query?.trim();
@@ -1546,12 +1721,14 @@ export function listReturnsFromStorage(
     entries = entries.filter(entry => entry.gatekeeperId === connectorId);
   }
   if (sourceType !== undefined) {
-    entries = entries.filter(entry => (entry.sources ?? []).some(source =>
-      source.type === sourceType));
+    entries = entries.filter(entry => entry.observed !== false
+      && (entry.sources ?? []).some(source => source.type === sourceType));
   }
   if (normalizedQuery) {
     const needle = normalizedQuery.toLocaleLowerCase();
     entries = entries.filter(entry => {
+      const observed = entry.observed !== false;
+      if (!observed) return entry.tool.toLocaleLowerCase().includes(needle);
       const sourceText = (entry.sources ?? []).flatMap(source => [
         source.ref,
         source.type,
@@ -1581,8 +1758,7 @@ export function listReturnsFromStorage(
 
   return {
     entries: paged.map(entry => {
-      const sourceTypes = [...new Set((entry.sources ?? []).map(source => source.type))];
-      return {
+      const operational = {
         id: entry.id,
         actionRecordId: entry.actionRecordId,
         chatId: entry.chatId,
@@ -1591,17 +1767,27 @@ export function listReturnsFromStorage(
         calledAt: entry.calledAt,
         executionState: entry.executionState,
         captureState: entry.captureState,
+        connectorTitle: storage.gatekeepers.get(entry.gatekeeperId)?.resourceTitle,
+      };
+      if (entry.observed === false) {
+        return {
+          ...operational,
+          observed: false as const,
+        };
+      }
+      const sourceTypes = [...new Set((entry.sources ?? []).map(source => source.type))];
+      return {
+        ...operational,
+        observed: true as const,
         byteCount: entry.byteCount,
         coverage: entry.coverage,
         redacted: entry.redacted ?? false,
-        observed: entry.observed ?? true,
         sourceProvider: entry.sourceProvider,
         sourceTypes,
         sourceCount: entry.sources?.length ?? 0,
         evidenceCount: entry.evidence?.length ?? 0,
         normalizationState: entry.normalizationState ?? "unsupported",
         normalizationReason: entry.normalizationReason,
-        connectorTitle: storage.gatekeepers.get(entry.gatekeeperId)?.resourceTitle,
       };
     }),
     nextBeforeId,
@@ -1612,6 +1798,7 @@ export function getReturnFromStorage(
   storage: OverseerStorage,
   returnId: string,
 ): AuthorizedReturn {
+  migrateLegacyEvidence(storage);
   const record = storage.toolReturns.get(returnId);
   if (!record) {
     return {
@@ -1696,6 +1883,7 @@ export function deleteReturnFromStorage(
   _ctx: unknown,
   returnId: string,
 ): void {
+  migrateLegacyEvidence(storage);
   const record = storage.toolReturns.get(returnId);
   if (!record || record.captureState === "deleted") return;
 
@@ -1718,6 +1906,232 @@ export function deleteReturnFromStorage(
     record.normalizationByteCount = 0;
     record.captureState = "deleted";
     storage.toolReturns.put(record);
+  });
+}
+function unavailableEvidence(ref: EvidenceRef, reason: string): AuthorizedEvidence {
+  return {
+    status: "unavailable",
+    ref: {...ref},
+    reason,
+  };
+}
+
+/** Resolve captured evidence references without exposing data from unavailable returns. */
+export function getEvidenceFromStorage(
+  storage: OverseerStorage,
+  refs: readonly EvidenceRef[],
+): AuthorizedEvidence[] {
+  migrateLegacyEvidence(storage);
+  const result: AuthorizedEvidence[] = [];
+  for (const ref of refs) {
+    const record = storage.toolReturns.get(ref.returnId);
+    if (!record) {
+      result.push(unavailableEvidence(ref, "The captured return is no longer available."));
+      continue;
+    }
+    if (record.observed === false) {
+      result.push(unavailableEvidence(ref, "The return has not been authorized as an observation."));
+      continue;
+    }
+    if (record.captureState !== "stored") {
+      result.push(unavailableEvidence(ref, "The captured return is not available."));
+      continue;
+    }
+    if (record.chatId === undefined || storage.chatMeta.get(record.chatId) === undefined) {
+      result.push(unavailableEvidence(ref, "The conversation containing this return is no longer available."));
+      continue;
+    }
+    const item = (record.evidence ?? []).find(candidate => candidate.id === ref.evidenceId);
+    if (!item) {
+      result.push(unavailableEvidence(ref, "The requested evidence is no longer available."));
+      continue;
+    }
+    const sourcesById = new Map((record.sources ?? []).map(source => [source.id, source]));
+    const sources: EvidenceSource[] = [];
+    let missingSource = false;
+    for (const sourceId of item.sourceIds) {
+      const source = sourcesById.get(sourceId);
+      if (!source) {
+        missingSource = true;
+        break;
+      }
+      sources.push(source);
+    }
+    if (missingSource) {
+      result.push(unavailableEvidence(ref, "The evidence's source is no longer available."));
+      continue;
+    }
+    result.push({
+      status: "available",
+      ref: {...ref},
+      returnId: record.id,
+      evidence: {...item, sourceIds: [...item.sourceIds]},
+      sources,
+    });
+  }
+  return result;
+}
+
+function citationRefsForSet(set: CitationSet | undefined): EvidenceRef[] {
+  if (!set) return [];
+  return set.links.flatMap(link => link.evidence);
+}
+
+function currentCitationSet(
+  storage: OverseerStorage,
+  gadgetId: WorkpieceId,
+): StoredCitationSet | undefined {
+  return storage.citationSets.get(gadgetId);
+}
+
+
+
+
+/** Read a document's citation metadata and resolve all of its referenced evidence. */
+export async function getDocumentEvidenceFromStorage(
+  storage: OverseerStorage,
+  document: CitationDocumentSnapshot,
+): Promise<DocumentEvidenceView> {
+  migrateLegacyEvidence(storage);
+  const set = currentCitationSet(storage, document.gadgetId);
+  const refs = citationRefsForSet(set);
+  const evidence = getEvidenceFromStorage(storage, refs);
+  return resolveCitationSet(document, set, evidence);
+}
+
+function citationConflict(
+  set: StoredCitationSet | undefined,
+  documentRevision: number,
+): CitationMutationResult {
+  return {
+    status: "conflict",
+    citationRevision: set?.citationRevision ?? 0,
+    documentRevision,
+    mode: set?.mode ?? "inline",
+  };
+}
+
+/** Replace a document's citation set after host-side document and evidence validation. */
+export async function setDocumentCitationsInStorage(
+  storage: OverseerStorage,
+  input: SetDocumentCitationsInput,
+  document: CitationDocumentSnapshot,
+): Promise<CitationMutationResult> {
+  migrateLegacyEvidence(storage);
+  validateCitationLinks(input.links);
+  if (input.gadgetId !== document.gadgetId) {
+    throw new Error("Citation input does not match the document gadget.");
+  }
+  if (!Number.isInteger(input.expectedDocumentRevision) || input.expectedDocumentRevision < 0) {
+    throw new Error("Invalid expected document revision.");
+  }
+  if (!Number.isInteger(input.expectedCitationRevision) || input.expectedCitationRevision < 0) {
+    throw new Error("Invalid expected citation revision.");
+  }
+
+  const existing = currentCitationSet(storage, input.gadgetId);
+  const mode: CitationMode = input.mode ?? existing?.mode ?? "inline";
+  if (mode !== "inline" && mode !== "endnotes" && mode !== "none") {
+    throw new Error("Invalid citation presentation mode.");
+  }
+  if (input.expectedDocumentRevision !== document.revision
+      || input.expectedCitationRevision !== (existing?.citationRevision ?? 0)) {
+    return citationConflict(existing, document.revision);
+  }
+
+  const refs = input.links.flatMap(link => link.evidence);
+  validateEvidenceRefs(refs);
+  const authorized = getEvidenceFromStorage(storage, refs);
+  if (authorized.some(item => item.status !== "available")) {
+    throw new Error("One or more cited evidence items are unavailable.");
+  }
+
+  const chatIds = new Set<number>();
+  for (const ref of refs) {
+    const record = storage.toolReturns.get(ref.returnId);
+    if (record?.chatId !== undefined) chatIds.add(record.chatId);
+  }
+  if (chatIds.size > 1) {
+    throw new Error("Citations must reference one conversation.");
+  }
+  if (existing?.chatId !== undefined
+      && [...chatIds].some(chatId => chatId !== existing.chatId)) {
+    throw new Error("Citations must remain within their original conversation.");
+  }
+
+  const blocksById = new Map(document.blocks.map(block => [block.id, block]));
+  const linkIds = new Set<string>();
+  const links: DocumentCitation[] = [];
+  for (const inputLink of input.links) {
+    const block = blocksById.get(inputLink.blockId);
+    if (!block) throw new Error(`No document block named "${inputLink.blockId}".`);
+    const id = inputLink.id ?? crypto.randomUUID();
+    if (linkIds.has(id)) throw new Error("Citation IDs must be unique.");
+    linkIds.add(id);
+    links.push({
+      id,
+      blockId: block.id,
+      blockVersion: block.version,
+      blockHash: await sha256Hex(block.html),
+      evidence: inputLink.evidence.map(ref => ({...ref})),
+    });
+  }
+
+  const chatId = existing?.chatId ?? [...chatIds][0];
+  return storage.transaction(() => {
+    const fresh = currentCitationSet(storage, input.gadgetId);
+    if ((fresh?.citationRevision ?? 0) !== input.expectedCitationRevision) {
+      return citationConflict(fresh, document.revision);
+    }
+    const citationRevision = input.expectedCitationRevision + 1;
+    storage.citationSets.put({
+      gadgetId: input.gadgetId,
+      citationRevision,
+      mode,
+      links,
+      ...(chatId !== undefined ? {chatId} : {}),
+    });
+    return {
+      status: "applied",
+      citationRevision,
+      documentRevision: document.revision,
+      mode,
+    };
+  });
+}
+
+/** Change a document's citation presentation mode with a citation metadata CAS check. */
+export function setCitationModeInStorage(
+  storage: OverseerStorage,
+  input: SetCitationModeInput,
+  documentRevision: number,
+): CitationMutationResult {
+  migrateLegacyEvidence(storage);
+  if (!Number.isInteger(input.expectedCitationRevision) || input.expectedCitationRevision < 0) {
+    throw new Error("Invalid expected citation revision.");
+  }
+  if (input.mode !== "inline" && input.mode !== "endnotes" && input.mode !== "none") {
+    throw new Error("Invalid citation presentation mode.");
+  }
+  return storage.transaction(() => {
+    const existing = currentCitationSet(storage, input.gadgetId);
+    if ((existing?.citationRevision ?? 0) !== input.expectedCitationRevision) {
+      return citationConflict(existing, documentRevision);
+    }
+    const citationRevision = input.expectedCitationRevision + 1;
+    storage.citationSets.put({
+      gadgetId: input.gadgetId,
+      citationRevision,
+      mode: input.mode,
+      links: existing?.links ?? [],
+      ...(existing?.chatId !== undefined ? {chatId: existing.chatId} : {}),
+    });
+    return {
+      status: "applied",
+      citationRevision,
+      documentRevision,
+      mode: input.mode,
+    };
   });
 }
 
@@ -2568,9 +2982,6 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // Auto-create the workspace's single gadget and record it as the default gadget. New workspaces
-  // normally start with zero gadgets and the agent creates gadgets explicitly (never assigning
-  // `defaultGadgetId`); the exceptions are blueprint instantiation, which still creates a fresh
   // workspace containing one gadget, and the git-storage migration, which recovers the implicit
   // gadget of a legacy workspace whose only code was chat-proposed (see migrateCodeLogToGit).
   // `commitId` is the gadget's initial commit, written by the caller beforehand: every permanent
@@ -2723,6 +3134,7 @@ class OverseerImpl implements AgentHooks {
 
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
+    this.storage.citationSets.delete(id);
     this.#runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
   }
@@ -5501,6 +5913,170 @@ class OverseerImpl implements AgentHooks {
 
   getReturn(returnId: string): Promise<AuthorizedReturn> {
     return Promise.resolve(getReturnFromStorage(this.storage, returnId));
+  }
+
+  async getEvidence(refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    validateEvidenceRefs(refs);
+    return getEvidenceFromStorage(this.storage, refs);
+  }
+
+  /**
+   * Agent-only citation access. The persisted turn initiator is checked against the current owner
+   * profile on every call: collaborators and gadget-originated turns never receive this capability.
+   */
+  async #assertAgentCitationOwner(
+      chatId: number, initiator: AiChatAuthorInfo, gadgetId?: WorkpieceId): Promise<void> {
+    let ownerProfileId = await this.getOwnerProfileId();
+    let activeInitiator = this.storage.activeAgents.get(chatId)?.initiator;
+    if (activeInitiator === undefined
+        || activeInitiator.type !== "user"
+        || activeInitiator.id !== ownerProfileId
+        || initiator.type !== activeInitiator.type
+        || initiator.id !== activeInitiator.id) {
+      throw new Error("Unauthorized: citation tools are only available to the workspace owner.");
+    }
+    this.getChatMetaOrThrow(chatId);
+    if (gadgetId !== undefined) this.resolveWorkpieceRoot(gadgetId, true, chatId);
+  }
+
+  /**
+   * Keep agent citation references within the turn's chat. Missing/deleted returns are handled by
+   * the ordinary unavailable result; a known return in another chat is rejected without revealing
+   * any of its contents.
+   */
+  #assertEvidenceChat(chatId: number, refs: EvidenceRef[]): void {
+    for (let ref of refs) {
+      let record = this.storage.toolReturns.get(ref.returnId);
+      if (record !== undefined && record.chatId !== chatId) {
+        throw new Error("Evidence references must belong to the current chat.");
+      }
+    }
+  }
+
+  #assertDocumentCitationChat(chatId: number, gadgetId: WorkpieceId): void {
+    let set = currentCitationSet(this.storage, gadgetId);
+    if (set?.chatId !== undefined && set.chatId !== chatId) {
+      throw new Error("Document citations are not available outside their original chat.");
+    }
+  }
+
+  async getAgentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo, refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    await this.#assertAgentCitationOwner(chatId, initiator);
+    this.#assertEvidenceChat(chatId, refs);
+    return this.getEvidence(refs);
+  }
+
+  async getAgentDocumentEvidence(
+      chatId: number, initiator: AiChatAuthorInfo,
+      gadgetId: WorkpieceId): Promise<DocumentEvidenceView> {
+    await this.#assertAgentCitationOwner(chatId, initiator, gadgetId);
+    this.#assertDocumentCitationChat(chatId, gadgetId);
+    let document = await this.#readCitationDocument(gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, gadgetId);
+    return getDocumentEvidenceFromStorage(this.storage, document);
+  }
+
+  async setAgentDocumentCitations(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetDocumentCitationsInput): Promise<CitationMutationResult> {
+    await this.#assertAgentCitationOwner(chatId, initiator, input.gadgetId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    validateCitationLinks(input.links);
+    let refs = input.links.flatMap(link => link.evidence);
+    this.#assertEvidenceChat(chatId, refs);
+    let document = await this.#readCitationDocument(input.gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    return setDocumentCitationsInStorage(this.storage, input, document);
+  }
+
+  async setAgentCitationMode(
+      chatId: number, initiator: AiChatAuthorInfo,
+      input: SetCitationModeInput): Promise<CitationMutationResult> {
+    await this.#assertAgentCitationOwner(chatId, initiator, input.gadgetId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    let document = await this.#readCitationDocument(input.gadgetId, chatId);
+    this.#assertDocumentCitationChat(chatId, input.gadgetId);
+    return setCitationModeInStorage(this.storage, input, document.revision);
+  }
+
+
+  async #readCitationDocument(
+      gadgetId: WorkpieceId, chatId?: number): Promise<CitationDocumentSnapshot> {
+    if (chatId === undefined) {
+      this.getGadgetRecord(gadgetId);
+    } else {
+      this.resolveWorkpieceRoot(gadgetId, true, chatId);
+    }
+    const facet = await this.getGadgetFacet(gadgetId, chatId) as unknown as {
+      getDocumentCapabilities?: () => Promise<unknown>;
+      getDocument?: () => Promise<unknown>;
+      [Symbol.dispose]?: () => void;
+    };
+    try {
+      if (typeof facet.getDocumentCapabilities !== "function"
+          || typeof facet.getDocument !== "function") {
+        throw new Error("This gadget does not support document citations.");
+      }
+      const capabilities = await facet.getDocumentCapabilities();
+      if (capabilities === null || typeof capabilities !== "object"
+          || !("documentVersion" in capabilities) || !("citationsVersion" in capabilities)
+          || capabilities.documentVersion !== 2 || capabilities.citationsVersion !== 1) {
+        throw new Error("This gadget does not support document citations.");
+      }
+      const document = await facet.getDocument();
+      if (document === null || typeof document !== "object"
+          || !("revision" in document) || typeof document.revision !== "number"
+          || !Number.isInteger(document.revision) || document.revision < 0
+          || !("blocks" in document) || !Array.isArray(document.blocks)
+          || document.blocks.length > 10_000) {
+        throw new Error("The document gadget returned an invalid document.");
+      }
+      const blockIds = new Set<string>();
+      let htmlLength = 0;
+      const blocks = document.blocks.map(block => {
+        if (block === null || typeof block !== "object"
+            || !("id" in block) || typeof block.id !== "string"
+            || block.id.length === 0 || block.id.length > 256 || blockIds.has(block.id)
+            || !("html" in block) || typeof block.html !== "string"
+            || block.html.length > 1_000_000
+            || !("version" in block) || typeof block.version !== "number"
+            || !Number.isInteger(block.version) || block.version < 0) {
+          throw new Error("The document gadget returned an invalid block.");
+        }
+        blockIds.add(block.id);
+        htmlLength += block.html.length;
+        if (htmlLength > 10_000_000) {
+          throw new Error("The document gadget returned an oversized document.");
+        }
+        return {id: block.id, html: block.html, version: block.version};
+      });
+      return {gadgetId, revision: document.revision, blocks};
+    } finally {
+      facet[Symbol.dispose]?.();
+    }
+  }
+
+  async getDocumentEvidence(
+      gadgetId: WorkpieceId, chatId?: number): Promise<DocumentEvidenceView> {
+    const document = await this.#readCitationDocument(gadgetId, chatId);
+    return getDocumentEvidenceFromStorage(this.storage, document);
+  }
+
+  async setDocumentCitations(
+      input: SetDocumentCitationsInput, chatId?: number): Promise<CitationMutationResult> {
+    if (chatId !== undefined) {
+      validateCitationLinks(input.links);
+      this.#assertEvidenceChat(chatId, input.links.flatMap(link => link.evidence));
+    }
+    const document = await this.#readCitationDocument(input.gadgetId, chatId);
+    return setDocumentCitationsInStorage(this.storage, input, document);
+  }
+
+  async setCitationMode(
+      input: SetCitationModeInput, chatId?: number): Promise<CitationMutationResult> {
+    const document = await this.#readCitationDocument(input.gadgetId, chatId);
+    return setCitationModeInStorage(this.storage, input, document.revision);
   }
 
   async deleteReturn(returnId: string): Promise<void> {
@@ -11414,6 +11990,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Clean up every live payload copy before removing the Workshop manifests. Applied action
     // tombstones remain in the gatekeeper so deleting a chat can never make a write replayable.
+    migrateLegacyEvidence(this.impl.storage);
     const retainedReturns = Array.from(this.impl.storage.toolReturns.byChatId.get(chatId));
     for (const retained of retainedReturns) {
       await this.impl.clearRetainedActionPayload(retained);
@@ -11753,6 +12330,37 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     return this.impl.getReturn(returnId);
   }
+  async getEvidence(refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Tool returns are only accessible by the workspace owner.");
+    }
+    return this.impl.getEvidence(refs);
+  }
+
+  async getDocumentEvidence(
+      gadgetId: WorkpieceId, chatId?: number): Promise<DocumentEvidenceView> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.getDocumentEvidence(gadgetId, chatId);
+  }
+
+  async setDocumentCitations(
+      input: SetDocumentCitationsInput, chatId?: number): Promise<CitationMutationResult> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.setDocumentCitations(input, chatId);
+  }
+
+  async setCitationMode(
+      input: SetCitationModeInput, chatId?: number): Promise<CitationMutationResult> {
+    if (!this.isOwner) {
+      throw new Error("Unauthorized: Document citations are only accessible by the workspace owner.");
+    }
+    return this.impl.setCitationMode(input, chatId);
+  }
+
 
   async deleteReturn(returnId: string): Promise<void> {
     if (!this.isOwner) {
@@ -12021,6 +12629,19 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     return { entries: [] };
   }
   async getReturn(_returnId: string): Promise<AuthorizedReturn> { this.#deny(); }
+  async getEvidence(_refs: EvidenceRef[]): Promise<AuthorizedEvidence[]> { this.#deny(); }
+  async getDocumentEvidence(
+      _gadgetId: WorkpieceId, _chatId?: number): Promise<DocumentEvidenceView> {
+    this.#deny();
+  }
+  async setDocumentCitations(
+      _input: SetDocumentCitationsInput, _chatId?: number): Promise<CitationMutationResult> {
+    this.#deny();
+  }
+  async setCitationMode(
+      _input: SetCitationModeInput, _chatId?: number): Promise<CitationMutationResult> {
+    this.#deny();
+  }
   async deleteReturn(_returnId: string): Promise<void> { this.#deny(); }
   async listObserverRequirements(
       _role: CollaboratorRole): Promise<ObserverBindingNeed[]> { this.#deny(); }

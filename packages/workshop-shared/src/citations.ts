@@ -1,0 +1,161 @@
+import type {
+  AuthorizedEvidence,
+  CitationMode,
+  CitationSet,
+  CitationState,
+  DocumentCitationInput,
+  DocumentEvidenceView,
+  EvidenceRef,
+  WorkpieceId,
+} from "./api";
+
+const MAX_CITATION_LINKS = 1_000;
+const MAX_EVIDENCE_REFS = 5_000;
+const MAX_EVIDENCE_REFS_PER_LINK = 100;
+const MAX_REFERENCE_ID_LENGTH = 256;
+
+/** A document block snapshot used to resolve citation anchors. */
+export type CitationDocumentBlock = {
+  /** Stable document block ID. */
+  id: string;
+  /** Current block HTML. */
+  html: string;
+  /** Current block version. */
+  version: number;
+};
+
+/** The document state against which citation anchors are resolved. */
+export type CitationDocumentSnapshot = {
+  /** Document gadget owning the blocks. */
+  gadgetId: WorkpieceId;
+  /** Current document content revision. */
+  revision: number;
+  /** Current document blocks. */
+  blocks: readonly CitationDocumentBlock[];
+};
+
+/** Return a stable key for an evidence reference without conflating either component. */
+export function evidenceRefKey(ref: EvidenceRef): string {
+  return JSON.stringify([ref.returnId, ref.evidenceId]);
+}
+
+/** Validate bounded evidence references before storage lookup or persistence. */
+export function validateEvidenceRefs(refs: readonly EvidenceRef[]): void {
+  if (!Array.isArray(refs)) throw new Error("Evidence references must be an array.");
+  if (refs.length > MAX_EVIDENCE_REFS) {
+    throw new Error(`A citation request may contain at most ${MAX_EVIDENCE_REFS} evidence references.`);
+  }
+  for (const ref of refs) {
+    if (typeof ref !== "object" || ref === null
+        || typeof ref.returnId !== "string" || ref.returnId.length === 0
+        || ref.returnId.length > MAX_REFERENCE_ID_LENGTH
+        || typeof ref.evidenceId !== "string" || ref.evidenceId.length === 0
+        || ref.evidenceId.length > MAX_REFERENCE_ID_LENGTH) {
+      throw new Error("Citation evidence references must contain bounded return and evidence IDs.");
+    }
+  }
+}
+
+/** Validate the shape of citation links before reading or mutating document state. */
+export function validateCitationLinks(links: readonly DocumentCitationInput[]): void {
+  if (!Array.isArray(links)) throw new Error("Citation links must be an array.");
+  if (links.length > MAX_CITATION_LINKS) {
+    throw new Error(`A document may contain at most ${MAX_CITATION_LINKS} citation links.`);
+  }
+  const linkIds = new Set<string>();
+  for (const link of links) {
+    if (typeof link !== "object" || link === null) {
+      throw new Error("Each citation link must be an object.");
+    }
+    if (typeof link.blockId !== "string" || link.blockId.length === 0
+        || link.blockId.length > MAX_REFERENCE_ID_LENGTH) {
+      throw new Error(
+        `Citation block IDs must be non-empty strings of at most ${MAX_REFERENCE_ID_LENGTH} characters.`,
+      );
+    }
+    if (link.id !== undefined) {
+      if (typeof link.id !== "string" || link.id.length === 0
+          || link.id.length > MAX_REFERENCE_ID_LENGTH) {
+        throw new Error(
+          `Citation IDs must be non-empty strings of at most ${MAX_REFERENCE_ID_LENGTH} characters.`,
+        );
+      }
+      if (linkIds.has(link.id)) throw new Error("Citation IDs must be unique.");
+      linkIds.add(link.id);
+    }
+    if (!Array.isArray(link.evidence) || link.evidence.length === 0) {
+      throw new Error("Each citation link must reference at least one evidence item.");
+    }
+    if (link.evidence.length > MAX_EVIDENCE_REFS_PER_LINK) {
+      throw new Error(
+        `Each citation link may reference at most ${MAX_EVIDENCE_REFS_PER_LINK} evidence items.`,
+      );
+    }
+    validateEvidenceRefs(link.evidence);
+    const refs = new Set<string>();
+    for (const ref of link.evidence) {
+      const key = evidenceRefKey(ref);
+      if (refs.has(key)) throw new Error("Citation evidence references must be unique per link.");
+      refs.add(key);
+    }
+  }
+}
+
+/** Compute the lowercase SHA-256 digest used for document block anchors. */
+export async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Resolve saved citation anchors and evidence under the current document and access state. */
+export async function resolveCitationSet(
+  document: CitationDocumentSnapshot,
+  set: CitationSet | undefined,
+  evidence: readonly AuthorizedEvidence[],
+): Promise<DocumentEvidenceView> {
+  const currentBlocks = new Map(document.blocks.map(block => [block.id, block]));
+  const evidenceByRef = new Map(evidence.map(item => [evidenceRefKey(item.ref), item]));
+  const links = set?.links ?? [];
+  const resolvedLinks = [];
+  const resolvedEvidence: AuthorizedEvidence[] = [];
+  const seenEvidence = new Set<string>();
+
+  for (const link of links) {
+    let state: CitationState = "valid";
+    for (const ref of link.evidence) {
+      const resolved = evidenceByRef.get(evidenceRefKey(ref));
+      if (resolved?.status !== "available") {
+        state = "unavailable";
+        break;
+      }
+    }
+    const block = currentBlocks.get(link.blockId);
+    if (state !== "unavailable" && !block) state = "orphaned";
+    if (state !== "unavailable" && state !== "orphaned" && block) {
+      if (block.version !== link.blockVersion || await sha256Hex(block.html) !== link.blockHash) {
+        state = "needs_review";
+      }
+    }
+    resolvedLinks.push({...link, evidence: link.evidence.map(ref => ({...ref})), state});
+
+    for (const ref of link.evidence) {
+      const key = evidenceRefKey(ref);
+      if (seenEvidence.has(key)) continue;
+      seenEvidence.add(key);
+      resolvedEvidence.push(evidenceByRef.get(key) ?? {
+        status: "unavailable",
+        ref: {...ref},
+        reason: "Evidence is no longer available.",
+      });
+    }
+  }
+
+  return {
+    gadgetId: document.gadgetId,
+    documentRevision: document.revision,
+    citationRevision: set?.citationRevision ?? 0,
+    mode: set?.mode ?? ("inline" satisfies CitationMode),
+    links: resolvedLinks,
+    evidence: resolvedEvidence,
+  };
+}
