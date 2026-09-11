@@ -118,6 +118,13 @@ stay inert. Re-enabling resumes only for the current audience; removing a direct
 never reversed implicitly. The Admin **Gatekeepers** panel exposes the single mode plus
 everyone/user/group audience controls and a server-computed preview with additive sources.
 
+The Context & Skills management app lists collections only through its Subject-bound
+`ContextApi`; registry discovery does not authorize a row. Its collection list distinguishes an
+in-flight request, a successful empty result, and a failed request. A failure clears previously
+rendered rows and shows a generic error rather than treating the response as empty or leaving the
+loading indicator active. Reloading the app may issue the same authorized RPC again. None of these
+UI states bypasses `resolveAppAccess()`, `ContextAuthority`, or a collection's live ACL checks.
+
 ## Invitations, roles, and lifecycle
 
 An active administrator uses the **Users** tab or `AdminApi` to list users, invite by e-mail and

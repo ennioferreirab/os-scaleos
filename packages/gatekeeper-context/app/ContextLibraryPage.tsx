@@ -447,7 +447,7 @@ function CollectionRow({
 
 function CollectionsSkeleton() {
   return (
-    <div className="flex flex-col gap-0.5">
+    <div role="status" aria-label="Loading collections" className="flex flex-col gap-0.5">
       {[1, 2, 3, 4, 5].map((i) => (
         <div
           key={i}
@@ -926,15 +926,23 @@ export default function ContextLibraryPage() {
   const [creating, setCreating] = useState(false);
 
   const [enabled, setEnabled] = useState<EnabledCollectionInfo[]>([]);
-  const [enabledLoaded, setEnabledLoaded] = useState(false);
+  const [collectionLoadState, setCollectionLoadState] = useState<
+    "loading" | "loaded" | "failed"
+  >("loading");
+  const collectionLoadGeneration = useRef(0);
 
   const loadAll = useCallback(async () => {
-    const enabledResult = await context
-      .listEnabledContextCollections()
-      .catch(() => null);
-    if (enabledResult) {
+    const generation = ++collectionLoadGeneration.current;
+    setCollectionLoadState("loading");
+    try {
+      const enabledResult = await context.listEnabledContextCollections();
+      if (generation !== collectionLoadGeneration.current) return;
       setEnabled(enabledResult);
-      setEnabledLoaded(true);
+      setCollectionLoadState("loaded");
+    } catch {
+      if (generation !== collectionLoadGeneration.current) return;
+      setEnabled([]);
+      setCollectionLoadState("failed");
     }
   }, [context]);
 
@@ -961,7 +969,6 @@ export default function ContextLibraryPage() {
     [enabled, searchLower],
   );
 
-  const initialLoading = !enabledLoaded && enabled.length === 0;
 
   // On success, land inside the new collection rather than back on the list.
   if (creating) {
@@ -1035,8 +1042,25 @@ export default function ContextLibraryPage() {
       )}
 
       <div className="ctx-scroll min-h-0 flex-1 overflow-y-auto pb-8 pt-1">
-        {initialLoading ? (
+        {collectionLoadState === "loading" ? (
           <CollectionsSkeleton />
+        ) : collectionLoadState === "failed" ? (
+          <div
+            role="alert"
+            className="flex flex-col items-center gap-3 px-3 py-20 text-center"
+          >
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-fill text-kumo-subtle">
+              <BookOpen size={18} />
+            </div>
+            <div>
+              <p className="text-sm font-medium text-kumo-default">
+                Collections couldn't be loaded
+              </p>
+              <p className="mx-auto mt-1 max-w-sm text-[13px] leading-[18px] text-kumo-subtle">
+                Reload Context &amp; Skills to try again.
+              </p>
+            </div>
+          </div>
         ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-3 px-3 py-20 text-center">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-fill text-kumo-subtle">
